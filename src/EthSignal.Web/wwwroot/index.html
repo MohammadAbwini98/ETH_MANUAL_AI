@@ -1,0 +1,1470 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ETHUSD Signal Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>
+        :root {
+            --bg-body: #0d1117;
+            --bg-card: #161b22;
+            --bg-header: #21262d;
+            --border: #30363d;
+            --text: #f0f6fc;
+            --text-main: #f0f6fc;
+            --text-dim: #8cb4d4;
+            --text-sub: #c9d5e0;
+            --blue: #58a6ff;
+            --green: #3fb950;
+            --red: #f85149;
+            --yellow: #e3b341;
+            --purple: #bc8cff;
+            --accent: #58a6ff;
+        }
+
+        body {
+            background: var(--bg-body);
+            color: var(--text);
+            font-family: 'Segoe UI', system-ui, sans-serif;
+        }
+
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+        }
+
+        .card-header {
+            background: var(--bg-header);
+            font-weight: 600;
+            color: var(--text);
+            border-bottom: 1px solid var(--border);
+            font-size: .85rem;
+            padding: .5rem .75rem;
+        }
+
+        .card-body {
+            padding: .75rem;
+        }
+
+        .buy {
+            color: var(--green);
+            font-weight: 600;
+        }
+
+        .sell {
+            color: var(--red);
+            font-weight: 600;
+        }
+
+        .neutral {
+            color: #58a6ff;
+        }
+
+        .badge-buy {
+            background: #238636;
+        }
+
+        .badge-sell {
+            background: #da3633;
+        }
+
+        .badge-neutral {
+            background: #1f6feb;
+        }
+
+        .badge-win {
+            background: #238636;
+        }
+
+        .badge-loss {
+            background: #da3633;
+        }
+
+        .badge-expired {
+            background: #6e40c9;
+        }
+
+        .badge-pending {
+            background: #1f6feb;
+        }
+
+        .badge-ambiguous {
+            background: var(--yellow);
+            color: #000;
+        }
+
+        .stat-val {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--text);
+        }
+
+        .stat-label {
+            font-size: .75rem;
+            color: var(--text-sub);
+            text-transform: uppercase;
+            letter-spacing: .05em;
+        }
+
+        .ml-diag-card .diag-note {
+            margin-bottom: 12px;
+            padding: 9px 11px;
+            border-radius: 8px;
+            border: 1px solid rgba(88, 166, 255, .20);
+            background: rgba(88, 166, 255, .08);
+            color: #ddeaf7;
+            font-size: .79rem;
+            line-height: 1.45;
+        }
+
+        .ml-diag-card .diag-section-title {
+            font-size: .72rem;
+            font-weight: 700;
+            letter-spacing: .05em;
+            text-transform: uppercase;
+            margin-bottom: 6px;
+            color: #dce7f3;
+        }
+
+        .ml-diag-card .diag-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            gap: 10px;
+            font-size: .8rem;
+            line-height: 1.7;
+        }
+
+        .ml-diag-card .diag-label {
+            color: #a9bfd5;
+            white-space: nowrap;
+        }
+
+        .ml-diag-card .diag-value {
+            color: var(--text-main);
+            font-weight: 700;
+            text-align: right;
+        }
+
+        #quote-panel .price {
+            font-size: 2rem;
+            font-weight: 700;
+            color: var(--blue);
+        }
+
+        table {
+            font-size: .82rem;
+        }
+
+        .table-dark {
+            --bs-table-bg: var(--bg-card);
+            --bs-table-color: var(--text);
+            --bs-table-border-color: var(--border);
+        }
+
+        .table-dark thead th {
+            color: #58a6ff;
+            font-weight: 600;
+            font-size: .75rem;
+            text-transform: uppercase;
+            cursor: pointer;
+            user-select: none;
+            white-space: nowrap;
+        }
+
+        .table-dark thead th:hover {
+            color: var(--blue);
+        }
+
+        .table-dark thead th .sort-icon {
+            font-size: .65rem;
+            margin-left: 2px;
+        }
+
+        .table-dark td {
+            color: var(--text);
+            vertical-align: middle;
+        }
+
+        .spread-ok {
+            color: var(--green);
+            font-weight: 600;
+        }
+
+        .spread-warn {
+            color: var(--yellow);
+            font-weight: 600;
+        }
+
+        .spread-bad {
+            color: var(--red);
+            font-weight: 600;
+        }
+
+        .chart-container {
+            height: 320px;
+        }
+
+        #regime-label {
+            font-size: 1.6rem;
+        }
+
+        #sig-direction {
+            font-size: 1.4rem;
+        }
+
+        .filter-input {
+            background: var(--bg-header);
+            border: 1px solid var(--border);
+            color: var(--text);
+            font-size: .75rem;
+            padding: 2px 6px;
+            border-radius: 4px;
+            width: 100%;
+        }
+
+        .filter-input::placeholder {
+            color: var(--text-dim);
+        }
+
+        input[type="date"].filter-input {
+            color-scheme: dark;
+        }
+
+        .pagination-controls {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            padding: 8px;
+        }
+
+        .pagination-controls button {
+            background: var(--bg-header);
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 4px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: .8rem;
+        }
+
+        .pagination-controls button:hover {
+            border-color: var(--blue);
+            color: var(--blue);
+        }
+
+        .pagination-controls button:disabled {
+            opacity: .4;
+            cursor: not-allowed;
+        }
+
+        .pagination-controls span {
+            color: var(--text-sub);
+            font-size: .8rem;
+        }
+
+        .expiry-timer {
+            font-family: 'Courier New', monospace;
+            font-size: .75rem;
+            color: var(--yellow);
+        }
+
+        .expiry-timer.expired {
+            color: var(--text-dim);
+        }
+
+        .signal-tbl-wrap {
+            max-height: 500px;
+            overflow-y: auto;
+        }
+
+        .signal-tbl-wrap::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .signal-tbl-wrap::-webkit-scrollbar-track {
+            background: var(--bg-card);
+        }
+
+        .signal-tbl-wrap::-webkit-scrollbar-thumb {
+            background: var(--border);
+            border-radius: 3px;
+        }
+
+        nav.navbar {
+            background: var(--bg-card);
+            border-bottom: 1px solid var(--border);
+        }
+
+        .row-equal>[class*=col] {
+            display: flex;
+        }
+
+        .row-equal>[class*=col]>.card {
+            flex: 1;
+        }
+
+        .ml-mode-btn.active-mode {
+            font-weight: 700;
+        }
+
+        .ml-mode-btn[data-mode="DISABLED"].active-mode {
+            background: var(--text-dim) !important;
+            border-color: var(--text-dim) !important;
+            color: #000 !important;
+        }
+
+        .ml-mode-btn[data-mode="SHADOW"].active-mode {
+            background: var(--yellow) !important;
+            border-color: var(--yellow) !important;
+            color: #000 !important;
+        }
+
+        .ml-mode-btn[data-mode="ACTIVE"].active-mode {
+            background: var(--green) !important;
+            border-color: var(--green) !important;
+            color: #000 !important;
+        }
+
+        .prob-bar {
+            display: inline-block;
+            height: 14px;
+            border-radius: 3px;
+            min-width: 2px;
+        }
+
+        .prob-bar-bg {
+            display: inline-block;
+            width: 80px;
+            height: 14px;
+            background: var(--bg-header);
+            border-radius: 3px;
+            overflow: hidden;
+        }
+    </style>
+</head>
+
+<body>
+    <nav class="navbar navbar-dark px-3">
+        <a class="navbar-brand" href="/" style="color:var(--blue);font-weight:700;font-size:1rem">ETHUSD Platform</a>
+        <div class="d-flex gap-2 align-items-center">
+            <small id="clock" style="font-family:monospace;color:var(--text-sub)"></small>
+            <a href="/" class="btn btn-sm btn-outline-primary active">Dashboard</a>
+            <a href="/data.html" class="btn btn-sm btn-outline-secondary">Data Explorer</a>
+        </div>
+    </nav>
+    <div class="container-fluid py-2">
+
+        <!-- Row 1: Quote + Regime + Latest Signal + Performance -->
+        <div class="row g-2 mb-2 row-equal">
+            <div class="col-lg-3 col-md-6">
+                <div class="card" id="quote-panel">
+                    <div class="card-header">Live Quote</div>
+                    <div class="card-body text-center py-2">
+                        <div class="price" id="mid-price">--</div>
+                        <div class="d-flex justify-content-center gap-4 mt-1">
+                            <div><span class="stat-label">Bid</span><br><span id="bid-price" class="buy"
+                                    style="font-size:1rem">--</span></div>
+                            <div><span class="stat-label">Ask</span><br><span id="ask-price" class="sell"
+                                    style="font-size:1rem">--</span></div>
+                        </div>
+                        <div class="mt-1" style="font-size:.85rem;color:var(--text)">Spread: <span id="spread-val"
+                                style="color:var(--text)">--</span></div>
+                        <div><small id="quote-time" style="font-size:.72rem;color:var(--text)">--</small></div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-lg-2 col-md-6">
+                <div class="card">
+                    <div class="card-header">Regimes</div>
+                    <div class="card-body py-2">
+                        <div class="row g-1 text-center" style="font-size:.78rem">
+                            <div class="col-6">
+                                <div class="stat-label">1m</div>
+                                <div id="regime-1m-label" class="stat-val" style="font-size:.95rem">--</div>
+                                <small style="color:var(--text-sub)">Score: <span id="regime-1m-score">--</span></small>
+                            </div>
+                            <div class="col-6">
+                                <div class="stat-label">5m</div>
+                                <div id="regime-5m-label" class="stat-val" style="font-size:.95rem">--</div>
+                                <small style="color:var(--text-sub)">Score: <span id="regime-5m-score">--</span></small>
+                            </div>
+                            <div class="col-6">
+                                <div class="stat-label">30m</div>
+                                <div id="regime-30m-label" class="stat-val" style="font-size:.95rem">--</div>
+                                <small style="color:var(--text-sub)">Score: <span
+                                        id="regime-30m-score">--</span></small>
+                            </div>
+                            <div class="col-6">
+                                <div class="stat-label">1h</div>
+                                <div id="regime-1h-label" class="stat-val" style="font-size:.95rem">--</div>
+                                <small style="color:var(--text-sub)">Score: <span id="regime-1h-score">--</span></small>
+                            </div>
+                        </div>
+                        <div class="mt-1 text-center" style="border-top:1px solid var(--border);padding-top:6px">
+                            <small class="stat-label">Primary 15m: <span id="regime-label"
+                                    style="font-size:.82rem;font-weight:700;color:var(--text)">--</span> · Score: <span
+                                    id="regime-score"
+                                    style="font-size:.82rem;font-weight:700;color:var(--text)">--</span></small>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-lg-4 col-md-6">
+                <div class="card" id="signal-card">
+                    <div class="card-header">Latest Recommendation</div>
+                    <div class="card-body py-2">
+                        <div class="d-flex align-items-center gap-2 mb-1">
+                            <span class="stat-val" id="sig-direction">--</span>
+                            <span class="badge" id="sig-badge"></span>
+                            <span class="badge badge-neutral ms-auto" id="sig-tf" style="font-size:.7rem"></span>
+                        </div>
+                        <div class="row" style="font-size:.82rem">
+                            <div class="col-4"><span class="stat-label">Entry</span><br><span id="sig-entry"
+                                    style="color:var(--text)">--</span>
+                            </div>
+                            <div class="col-4"><span class="stat-label">TP</span><br><span id="sig-tp"
+                                    class="buy">--</span></div>
+                            <div class="col-4"><span class="stat-label">SL</span><br><span id="sig-sl"
+                                    class="sell">--</span></div>
+                        </div>
+                        <div class="row mt-1" style="font-size:.82rem">
+                            <div class="col-4"><span class="stat-label">Score</span><br><span id="sig-score"
+                                    style="color:var(--text)">--</span>
+                            </div>
+                            <div class="col-4"><span class="stat-label">Risk</span><br><span id="sig-risk"
+                                    style="color:var(--text)">--</span>
+                            </div>
+                            <div class="col-4"><span class="stat-label">Time</span><br><span id="sig-time"
+                                    style="font-size:.72rem;color:var(--text)">--</span></div>
+                        </div>
+                        <div class="row mt-1"
+                            style="font-size:.8rem;border-top:1px solid var(--border);padding-top:4px">
+                            <div class="col-4"><span class="stat-label">ML Prob</span><br><span id="sig-ml-prob"
+                                    style="color:var(--text)">--</span></div>
+                            <div class="col-4"><span class="stat-label">ML Conf</span><br><span id="sig-ml-conf"
+                                    style="color:var(--text)">--</span></div>
+                            <div class="col-4"><span class="stat-label">ML Mode</span><br><span id="sig-ml-mode"
+                                    style="font-size:.7rem;color:var(--text-dim)">--</span></div>
+                        </div>
+                        <div class="row mt-1"
+                            style="font-size:.78rem;border-top:1px solid var(--border);padding-top:4px">
+                            <div class="col-4"><span class="stat-label">Outcome</span><br><span id="sig-outcome"
+                                    style="color:var(--text)">--</span></div>
+                            <div class="col-4"><span class="stat-label">Reason</span><br><span id="sig-reason-code"
+                                    style="color:var(--text)">--</span></div>
+                            <div class="col-4"><span class="stat-label">Blended</span><br><span id="sig-blended-score"
+                                    style="color:var(--text)">--</span></div>
+                        </div>
+                        <div class="row mt-1" style="font-size:.72rem">
+                            <div class="col-8"><span class="stat-label">Reason Detail</span><br><span
+                                    id="sig-reason-detail" style="color:var(--text-dim);word-break:break-word">--</span>
+                            </div>
+                            <div class="col-4"><span class="stat-label">Threshold</span><br><span
+                                    id="sig-effective-threshold" style="color:var(--text)">--</span></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-lg-3 col-md-6">
+                <div class="card">
+                    <div class="card-header">Performance (30d)</div>
+                    <div class="card-body py-2">
+                        <div class="row text-center">
+                            <div class="col-4"><span class="stat-label">Win Rate</span><br><span class="stat-val"
+                                    id="perf-wr" style="font-size:1.2rem">--</span></div>
+                            <div class="col-4"><span class="stat-label">Avg R</span><br><span class="stat-val"
+                                    id="perf-avgr" style="font-size:1.2rem">--</span></div>
+                            <div class="col-4"><span class="stat-label">PF</span><br><span class="stat-val" id="perf-pf"
+                                    style="font-size:1.2rem">--</span></div>
+                        </div>
+                        <div class="text-center mt-1"><small style="color:var(--text-sub)">W:<span
+                                    id="perf-wins">0</span> L:<span id="perf-losses">0</span> T:<span
+                                    id="perf-total">0</span></small></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Row 1b: Decision Summary -->
+        <div class="row g-2 mb-2">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header">Decision Summary (24h)</div>
+                    <div class="card-body py-2" style="font-size:.82rem">
+                        <div class="row text-center mb-2">
+                            <div class="col-2"><span class="stat-label">Evaluated</span><br><span class="stat-val"
+                                    id="dec-total" style="color:var(--text)">--</span></div>
+                            <div class="col-2"><span class="stat-label">No Trade</span><br><span class="stat-val"
+                                    id="dec-notrade" style="color:var(--text)">--</span></div>
+                            <div class="col-2"><span class="stat-label">Generated</span><br><span class="stat-val"
+                                    id="dec-generated" style="color:var(--green)">--</span></div>
+                            <div class="col-2"><span class="stat-label">Blocked</span><br><span class="stat-val"
+                                    id="dec-blocked" style="color:var(--red)">--</span></div>
+                            <div class="col-4"><span class="stat-label">Context</span><br><span id="dec-context"
+                                    style="color:var(--text)">--</span></div>
+                        </div>
+                        <div class="row">
+                            <div class="col-12">
+                                <table class="table table-sm table-dark mb-0" style="font-size:.78rem">
+                                    <thead>
+                                        <tr>
+                                            <th>Top Reject Reasons</th>
+                                            <th class="text-end">Count</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="dec-reject-reasons">
+                                        <tr>
+                                            <td colspan="2" class="text-center" style="color:var(--text)">--</td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Row 1c: Startup Historical Candle Sync -->
+        <div class="row g-2 mb-2">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header">
+                        History Sync
+                        <span id="hsync-status-badge" class="badge badge-neutral ms-2" style="font-size:.7rem">--</span>
+                    </div>
+                    <div class="card-body py-2" style="font-size:.82rem">
+                        <div class="row text-center mb-2">
+                            <div class="col-3"><span class="stat-label">Ready</span><br><span class="stat-val"
+                                    id="hsync-ready" style="color:var(--green)">--</span></div>
+                            <div class="col-3"><span class="stat-label">Running</span><br><span class="stat-val"
+                                    id="hsync-running" style="color:var(--text)">--</span></div>
+                            <div class="col-3"><span class="stat-label">Failed</span><br><span class="stat-val"
+                                    id="hsync-failed" style="color:var(--red)">--</span></div>
+                            <div class="col-3"><span class="stat-label">Last Run</span><br><span id="hsync-last-run"
+                                    style="font-size:.72rem;color:var(--text)">--</span></div>
+                        </div>
+                        <table class="table table-sm table-dark mb-0" style="font-size:.78rem">
+                            <thead>
+                                <tr>
+                                    <th>TF</th>
+                                    <th>Status</th>
+                                    <th>Mode</th>
+                                    <th>Last Synced</th>
+                                    <th>Offline</th>
+                                    <th>Chunks</th>
+                                    <th>Error</th>
+                                </tr>
+                            </thead>
+                            <tbody id="hsync-rows">
+                                <tr>
+                                    <td colspan="7" class="text-center" style="color:var(--text)">--</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Row 2: Indicators across all TFs -->
+        <div class="row g-2 mb-2">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header">Indicators</div>
+                    <div class="card-body p-2" style="font-size:.8rem">
+                        <table class="table table-sm table-dark mb-0">
+                            <thead>
+                                <tr>
+                                    <th></th>
+                                    <th>1m</th>
+                                    <th>5m</th>
+                                    <th>15m</th>
+                                    <th>30m</th>
+                                    <th>1h</th>
+                                    <th>4h</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td>EMA20</td>
+                                    <td id="ema20-1m">--</td>
+                                    <td id="ema20-5m">--</td>
+                                    <td id="ema20-15m">--</td>
+                                    <td id="ema20-30m">--</td>
+                                    <td id="ema20-1h">--</td>
+                                    <td id="ema20-4h">--</td>
+                                </tr>
+                                <tr>
+                                    <td>EMA50</td>
+                                    <td id="ema50-1m">--</td>
+                                    <td id="ema50-5m">--</td>
+                                    <td id="ema50-15m">--</td>
+                                    <td id="ema50-30m">--</td>
+                                    <td id="ema50-1h">--</td>
+                                    <td id="ema50-4h">--</td>
+                                </tr>
+                                <tr>
+                                    <td>RSI</td>
+                                    <td id="rsi-1m">--</td>
+                                    <td id="rsi-5m">--</td>
+                                    <td id="rsi-15m">--</td>
+                                    <td id="rsi-30m">--</td>
+                                    <td id="rsi-1h">--</td>
+                                    <td id="rsi-4h">--</td>
+                                </tr>
+                                <tr>
+                                    <td>MACD</td>
+                                    <td id="macd-1m">--</td>
+                                    <td id="macd-5m">--</td>
+                                    <td id="macd-15m">--</td>
+                                    <td id="macd-30m">--</td>
+                                    <td id="macd-1h">--</td>
+                                    <td id="macd-4h">--</td>
+                                </tr>
+                                <tr>
+                                    <td>ATR</td>
+                                    <td id="atr-1m">--</td>
+                                    <td id="atr-5m">--</td>
+                                    <td id="atr-15m">--</td>
+                                    <td id="atr-30m">--</td>
+                                    <td id="atr-1h">--</td>
+                                    <td id="atr-4h">--</td>
+                                </tr>
+                                <tr>
+                                    <td>ADX</td>
+                                    <td id="adx-1m">--</td>
+                                    <td id="adx-5m">--</td>
+                                    <td id="adx-15m">--</td>
+                                    <td id="adx-30m">--</td>
+                                    <td id="adx-1h">--</td>
+                                    <td id="adx-4h">--</td>
+                                </tr>
+                                <tr>
+                                    <td>VWAP</td>
+                                    <td id="vwap-1m">--</td>
+                                    <td id="vwap-5m">--</td>
+                                    <td id="vwap-15m">--</td>
+                                    <td id="vwap-30m">--</td>
+                                    <td id="vwap-1h">--</td>
+                                    <td id="vwap-4h">--</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Row 3: Charts -->
+        <div class="row g-2 mb-2">
+            <div class="col-md-4">
+                <div class="card">
+                    <div class="card-header">1m Chart</div>
+                    <div class="card-body p-1">
+                        <div id="chart-1m" class="chart-container"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="card">
+                    <div class="card-header">5m Chart</div>
+                    <div class="card-body p-1">
+                        <div id="chart-5m" class="chart-container"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="card">
+                    <div class="card-header">15m Chart</div>
+                    <div class="card-body p-1">
+                        <div id="chart-15m" class="chart-container"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Row 4: ML System -->
+        <div class="row g-2 mb-2 row-equal">
+            <!-- ML Mode Control -->
+            <div class="col-lg-3 col-md-6">
+                <div class="card">
+                    <div class="card-header">ML Mode</div>
+                    <div class="card-body text-center py-3">
+                        <div id="ml-current-mode" class="stat-val mb-2" style="font-size:1.3rem">--</div>
+                        <div class="d-flex justify-content-center gap-2">
+                            <button class="btn btn-sm btn-outline-secondary ml-mode-btn" data-mode="DISABLED"
+                                onclick="switchMlMode('DISABLED')">DISABLED</button>
+                            <button class="btn btn-sm btn-outline-warning ml-mode-btn" data-mode="SHADOW"
+                                onclick="switchMlMode('SHADOW')">SHADOW</button>
+                            <button class="btn btn-sm btn-outline-success ml-mode-btn" data-mode="ACTIVE"
+                                onclick="switchMlMode('ACTIVE')">ACTIVE</button>
+                        </div>
+                        <div class="mt-2 d-flex justify-content-center gap-2 flex-wrap">
+                            <button id="ml-activate-28-btn" class="btn btn-sm btn-outline-info"
+                                onclick="activateModel28()">Activate Model 28</button>
+                            <button id="ml-activate-latest-btn" class="btn btn-sm btn-outline-primary"
+                                onclick="activateLatestCandidate()">Activate Latest Candidate</button>
+                        </div>
+                        <div id="ml-latest-candidate-hint"
+                            style="margin-top:6px;font-size:.68rem;color:var(--text-sub)">
+                            Latest: --
+                        </div>
+                        <div class="mt-2" style="font-size:.75rem;color:var(--text-sub)">
+                            Model: <span id="ml-model-version">--</span>
+                            <br>Status: <span id="ml-model-loaded">--</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <!-- ML Health & Drift -->
+            <div class="col-lg-4 col-md-6">
+                <div class="card">
+                    <div class="card-header">ML Health & Drift</div>
+                    <div class="card-body py-2">
+                        <div class="row text-center mb-2">
+                            <div class="col-3">
+                                <span class="stat-label">AUC</span><br>
+                                <span class="stat-val" id="ml-auc" style="font-size:1.1rem">--</span>
+                            </div>
+                            <div class="col-3">
+                                <span class="stat-label">Brier</span><br>
+                                <span class="stat-val" id="ml-brier" style="font-size:1.1rem">--</span>
+                            </div>
+                            <div class="col-3">
+                                <span class="stat-label">Win Rate</span><br>
+                                <span class="stat-val" id="ml-actual-wr" style="font-size:1.1rem">--</span>
+                            </div>
+                            <div class="col-3">
+                                <span class="stat-label">Pred Win</span><br>
+                                <span class="stat-val" id="ml-pred-wr" style="font-size:1.1rem">--</span>
+                            </div>
+                        </div>
+                        <div class="text-center">
+                            <span class="badge" id="ml-drift-badge" style="font-size:.75rem">--</span>
+                            <span style="font-size:.72rem;color:var(--text-sub);margin-left:6px">Window: <span
+                                    id="ml-window-size">--</span></span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <!-- ML Predictions Chart (win probability over time) -->
+            <div class="col-lg-5 col-md-12">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <span>ML Predictions (Win Probability)</span>
+                        <select class="filter-input" id="ml-pred-hours" style="width:80px"
+                            onchange="refreshMlPredictions()">
+                            <option value="6">6h</option>
+                            <option value="12">12h</option>
+                            <option value="24" selected>24h</option>
+                            <option value="72">3d</option>
+                            <option value="168">7d</option>
+                            <option value="720">30d</option>
+                        </select>
+                    </div>
+                    <div class="card-body p-2">
+                        <canvas id="ml-pred-chart" height="130"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Row 5: ML Predictions Table -->
+        <div class="row g-2 mb-2">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <span>Recent ML Predictions</span>
+                        <div class="d-flex gap-2 align-items-center">
+                            <label
+                                style="color:var(--text-sub);font-size:.72rem;display:flex;align-items:center;gap:6px">
+                                <input type="checkbox" id="ml-pred-show-all" onchange="refreshMlPredictions()">
+                                All evals
+                            </label>
+                            <small style="color:var(--text-sub)" id="ml-pred-count">0 predictions</small>
+                        </div>
+                    </div>
+                    <div class="card-body p-0">
+                        <div class="signal-tbl-wrap" style="max-height:250px">
+                            <table class="table table-sm table-dark table-hover mb-0">
+                                <thead>
+                                    <tr>
+                                        <th>Time</th>
+                                        <th>Signal</th>
+                                        <th>Raw / Cal</th>
+                                        <th>Confidence</th>
+                                        <th>Threshold</th>
+                                        <th>Gate</th>
+                                        <th>Prob Bar</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="ml-pred-tbody"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="row g-2 mb-2">
+            <div class="col-12">
+                <div class="card ml-diag-card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <span>Latest Market Context</span>
+                        <div class="d-flex align-items-center gap-2">
+                            <span class="badge badge-neutral" id="ml-feature-version-badge">--</span>
+                            <small style="color:var(--text-sub)">Link: <span
+                                    id="ml-feature-link-status">--</span></small>
+                            <small style="color:var(--text-sub)">At: <span id="ml-feature-timestamp">--</span></small>
+                        </div>
+                    </div>
+                    <div class="card-body py-2">
+                        <div class="diag-note" id="ml-feature-note">Loading latest market-context snapshot...</div>
+                        <div class="row g-3 mt-1">
+                            <div class="col-lg-3 col-md-6">
+                                <div class="diag-section-title">Market Structure</div>
+                                <div id="ml-market-structure-rows"></div>
+                            </div>
+                            <div class="col-lg-3 col-md-6">
+                                <div class="diag-section-title">Volatility Regime</div>
+                                <div id="ml-volatility-regime-rows"></div>
+                            </div>
+                            <div class="col-lg-3 col-md-6">
+                                <div class="diag-section-title">Signal Saturation</div>
+                                <div id="ml-signal-saturation-rows"></div>
+                            </div>
+                            <div class="col-lg-3 col-md-6">
+                                <div class="diag-section-title">BTC Context</div>
+                                <div id="ml-btc-context-rows"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Row 6: ML Trainer Status -->
+        <div class="row g-2 mb-2">
+            <div class="col-12">
+                <div class="card ml-diag-card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <span>ML Data Quality</span>
+                        <div class="d-flex align-items-center gap-2">
+                            <span class="badge badge-neutral" id="ml-diag-overall-badge">--</span>
+                            <small style="color:var(--text-sub)">TF: <span id="ml-diag-timeframe">--</span></small>
+                        </div>
+                    </div>
+                    <div class="card-body py-2">
+                        <div class="row text-center mb-3">
+                            <div class="col-3 col-md-3">
+                                <span class="stat-label">Labeled</span><br>
+                                <span class="stat-val" id="ml-diag-labeled" style="font-size:1.1rem">--</span>
+                            </div>
+                            <div class="col-3 col-md-3">
+                                <span class="stat-label">Win Rate</span><br>
+                                <span class="stat-val" id="ml-diag-winrate" style="font-size:1.1rem">--</span>
+                            </div>
+                            <div class="col-3 col-md-3">
+                                <span class="stat-label">Cal Gap</span><br>
+                                <span class="stat-val" id="ml-diag-cal-gap" style="font-size:1.1rem">--</span>
+                            </div>
+                            <div class="col-3 col-md-3">
+                                <span class="stat-label">Max PSI</span><br>
+                                <span class="stat-val" id="ml-diag-max-psi" style="font-size:1.1rem">--</span>
+                            </div>
+                        </div>
+                        <div class="diag-note" id="ml-diag-practical-note">Loading latest ML data quality
+                            interpretation...</div>
+                        <div class="row g-3">
+                            <div class="col-lg-4">
+                                <div class="diag-section-title" id="ml-diag-label-title">Label Quality</div>
+                                <div>
+                                    <div class="diag-row"><span class="diag-label">Status</span><span class="diag-value"
+                                            id="ml-diag-label-status">--</span></div>
+                                    <div class="diag-row"><span class="diag-label">Pending / Expired /
+                                            Ambiguous</span><span class="diag-value" id="ml-diag-outcome-mix">--</span>
+                                    </div>
+                                    <div class="diag-row"><span class="diag-label">Conflicting TP/SL</span><span
+                                            class="diag-value" id="ml-diag-conflicts">--</span></div>
+                                    <div class="diag-row"><span class="diag-label">PnL-label mismatches</span><span
+                                            class="diag-value" id="ml-diag-pnl-mismatch">--</span></div>
+                                    <div class="diag-row"><span class="diag-label">Signal link coverage</span><span
+                                            class="diag-value" id="ml-diag-link-coverage">--</span></div>
+                                    <div class="diag-row"><span class="diag-label">Pending / stale links</span><span
+                                            class="diag-value" id="ml-diag-pending-links">--</span></div>
+                                    <div class="diag-row"><span class="diag-label">No-signal / blocked evals</span><span
+                                            class="diag-value" id="ml-diag-terminal-evals">--</span></div>
+                                </div>
+                            </div>
+                            <div class="col-lg-4">
+                                <div class="diag-section-title" id="ml-diag-cal-title">Calibration & Threshold</div>
+                                <div>
+                                    <div class="diag-row"><span class="diag-label">Status</span><span class="diag-value"
+                                            id="ml-diag-cal-status">--</span></div>
+                                    <div class="diag-row"><span class="diag-label">Samples / Model</span><span
+                                            class="diag-value" id="ml-diag-cal-model">--</span></div>
+                                    <div class="diag-row"><span class="diag-label">Predicted vs actual</span><span
+                                            class="diag-value" id="ml-diag-cal-rates">--</span></div>
+                                    <div class="diag-row"><span class="diag-label">Brier / ECE / LogLoss</span><span
+                                            class="diag-value" id="ml-diag-cal-metrics">--</span></div>
+                                    <div class="diag-row"><span class="diag-label">Pass / Fail win rate</span><span
+                                            class="diag-value" id="ml-diag-pass-fail">--</span></div>
+                                    <div class="diag-row"><span class="diag-label">Threshold lift</span><span
+                                            class="diag-value" id="ml-diag-threshold-lift">--</span></div>
+                                </div>
+                            </div>
+                            <div class="col-lg-4">
+                                <div class="diag-section-title" id="ml-diag-drift-title">Feature Drift</div>
+                                <div>
+                                    <div class="diag-row"><span class="diag-label">Status</span><span class="diag-value"
+                                            id="ml-diag-drift-status">--</span></div>
+                                    <div class="diag-row"><span class="diag-label">Training / Live samples</span><span
+                                            class="diag-value" id="ml-diag-drift-counts">--</span></div>
+                                    <div class="diag-row"><span class="diag-label">Avg PSI / Avg sigma shift</span><span
+                                            class="diag-value" id="ml-diag-drift-summary">--</span></div>
+                                </div>
+                                <table class="table table-sm table-dark table-hover mb-0 mt-2" style="font-size:.72rem">
+                                    <thead>
+                                        <tr>
+                                            <th>Feature</th>
+                                            <th>Train</th>
+                                            <th>Live</th>
+                                            <th>PSI</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="ml-diag-drift-tbody">
+                                        <tr>
+                                            <td colspan="4" style="color:var(--text-dim);text-align:center">Loading...
+                                            </td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Row 8: ML Trainer Status -->
+        <div class="row g-2">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <span>ML Auto-Trainer</span>
+                        <div class="d-flex gap-2 align-items-center">
+                            <span id="trainer-status-badge" class="badge badge-neutral"
+                                style="font-size:.72rem">Idle</span>
+                            <button onclick="triggerTraining()" id="trainer-trigger-btn"
+                                style="font-size:.72rem;padding:2px 10px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer">
+                                Run Now
+                            </button>
+                        </div>
+                    </div>
+                    <div class="card-body" style="padding:.75rem">
+                        <div class="row g-2 mb-2">
+                            <!-- Readiness -->
+                            <div class="col-md-5">
+                                <div style="font-size:.72rem;color:var(--text-sub);margin-bottom:4px">Sample Readiness
+                                    <span id="trainer-sample-count" style="color:var(--text-main);font-weight:600">0 /
+                                        200</span>
+                                </div>
+                                <div style="background:var(--bg-card);border-radius:4px;height:8px;overflow:hidden">
+                                    <div id="trainer-progress-bar"
+                                        style="height:100%;width:0%;background:var(--accent);transition:width .4s ease;border-radius:4px">
+                                    </div>
+                                </div>
+                                <div style="font-size:.68rem;color:var(--text-sub);margin-top:4px">
+                                    WIN: <span id="trainer-wins" style="color:var(--green)">0</span> &nbsp;
+                                    LOSS: <span id="trainer-losses" style="color:var(--red)">0</span> &nbsp;
+                                    <span id="trainer-balance-warn" style="color:var(--yellow);display:none">⚠ Need 30+
+                                        per class</span>
+                                </div>
+                            </div>
+                            <!-- Last / Next run -->
+                            <div class="col-md-4">
+                                <div style="font-size:.72rem;color:var(--text-sub)">Last Run</div>
+                                <div id="trainer-last-run" style="font-size:.78rem;color:var(--text-main)">--</div>
+                                <div style="font-size:.72rem;color:var(--text-sub);margin-top:4px">Next Scheduled</div>
+                                <div id="trainer-next-run" style="font-size:.78rem;color:var(--text-main)">--</div>
+                            </div>
+                            <!-- Triggers -->
+                            <div class="col-md-3">
+                                <div style="font-size:.72rem;color:var(--text-sub)">Auto-trigger when</div>
+                                <div style="font-size:.72rem;color:var(--text);line-height:1.6">
+                                    200+ labeled samples<br>
+                                    30+ WIN &amp; 30+ LOSS<br>
+                                    <span id="trainer-threshold-info">100 new outcomes OR 7d elapsed</span>
+                                </div>
+                            </div>
+                        </div>
+                        <!-- Recent runs table -->
+                        <table class="table table-sm table-dark table-hover mb-0" style="font-size:.72rem">
+                            <thead>
+                                <tr>
+                                    <th>Run ID</th>
+                                    <th>Trigger</th>
+                                    <th>Status</th>
+                                    <th>Samples</th>
+                                    <th>Started</th>
+                                    <th>Duration</th>
+                                    <th>Error</th>
+                                </tr>
+                            </thead>
+                            <tbody id="trainer-runs-tbody">
+                                <tr>
+                                    <td colspan="7" style="color:var(--text-dim);text-align:center">Loading...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Row 9: Adaptive Strategy & Active Parameters -->
+        <div class="row g-2">
+            <!-- Adaptive Strategy Status -->
+            <div class="col-md-5">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <span>Adaptive Strategy</span>
+                        <span id="adaptive-status-badge" class="badge badge-neutral" style="font-size:.7rem">--</span>
+                    </div>
+                    <div class="card-body">
+                        <div class="d-flex flex-wrap gap-3 mb-2" style="font-size:.8rem">
+                            <div><span style="color:var(--text-dim)">Intensity:</span> <strong
+                                    id="adaptive-intensity">--</strong></div>
+                            <div><span style="color:var(--text-dim)">Override:</span> <span
+                                    id="adaptive-intensity-override">--</span></div>
+                            <div><span style="color:var(--text-dim)">Retrospective:</span> <span
+                                    id="adaptive-retro-enabled">--</span></div>
+                            <div><span style="color:var(--text-dim)">Current Condition:</span> <span
+                                    id="adaptive-current-condition">--</span></div>
+                            <div><span style="color:var(--text-dim)">Tracked:</span> <span
+                                    id="adaptive-tracked-count">--</span></div>
+                            <div><span style="color:var(--text-dim)">Retro Overlays:</span> <span
+                                    id="adaptive-retro-count">--</span></div>
+                        </div>
+                        <div style="font-size:.75rem;color:var(--text-sub);margin-bottom:.3rem;font-weight:600">
+                            Condition Outcomes</div>
+                        <div style="max-height:220px;overflow-y:auto">
+                            <table class="table table-sm table-dark table-hover mb-0" style="font-size:.75rem">
+                                <thead>
+                                    <tr>
+                                        <th>Condition</th>
+                                        <th>Outcomes</th>
+                                        <th>Win Rate</th>
+                                        <th>Expectancy (R)</th>
+                                        <th>Retro?</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="adaptive-conditions-body">
+                                    <tr>
+                                        <td colspan="5" style="color:var(--text-dim);text-align:center">Loading...</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <!-- Active Strategy Parameters -->
+            <div class="col-md-7">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <span>Active Parameter Set</span>
+                        <span id="param-set-meta" style="font-size:.7rem;color:var(--text-dim)">--</span>
+                    </div>
+                    <div class="card-body">
+                        <div class="d-flex flex-wrap gap-3 mb-2" style="font-size:.8rem">
+                            <div><span style="color:var(--text-dim)">ID:</span> <strong id="ps-id">--</strong></div>
+                            <div><span style="color:var(--text-dim)">Version:</span> <span id="ps-version">--</span>
+                            </div>
+                            <div><span style="color:var(--text-dim)">Hash:</span> <code id="ps-hash"
+                                    style="font-size:.7rem">--</code></div>
+                            <div><span style="color:var(--text-dim)">Created By:</span> <span
+                                    id="ps-created-by">--</span></div>
+                            <div><span style="color:var(--text-dim)">Activated:</span> <span id="ps-activated">--</span>
+                            </div>
+                        </div>
+                        <div id="ps-notes"
+                            style="font-size:.72rem;color:var(--text-sub);margin-bottom:.4rem;font-style:italic"></div>
+                        <div class="row g-2">
+                            <div class="col-md-4">
+                                <div style="font-size:.72rem;color:var(--blue);font-weight:600;margin-bottom:.2rem">
+                                    Signal Thresholds</div>
+                                <table class="table table-sm table-dark mb-0" style="font-size:.73rem"
+                                    id="ps-signal-table">
+                                    <tbody>
+                                        <tr>
+                                            <td style="color:var(--text-dim)">Confidence Buy</td>
+                                            <td id="ps-conf-buy">--</td>
+                                        </tr>
+                                        <tr>
+                                            <td style="color:var(--text-dim)">Confidence Sell</td>
+                                            <td id="ps-conf-sell">--</td>
+                                        </tr>
+                                        <tr>
+                                            <td style="color:var(--text-dim)">Pullback Zone</td>
+                                            <td id="ps-pullback">--</td>
+                                        </tr>
+                                        <tr>
+                                            <td style="color:var(--text-dim)">Min ATR</td>
+                                            <td id="ps-min-atr">--</td>
+                                        </tr>
+                                        <tr>
+                                            <td style="color:var(--text-dim)">ADX Threshold</td>
+                                            <td id="ps-adx">--</td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                            <div class="col-md-4">
+                                <div style="font-size:.72rem;color:var(--purple);font-weight:600;margin-bottom:.2rem">ML
+                                    Configuration</div>
+                                <table class="table table-sm table-dark mb-0" style="font-size:.73rem">
+                                    <tbody>
+                                        <tr>
+                                            <td style="color:var(--text-dim)">ML Mode</td>
+                                            <td id="ps-ml-mode">--</td>
+                                        </tr>
+                                        <tr>
+                                            <td style="color:var(--text-dim)">Accuracy-First</td>
+                                            <td id="ps-acc-first">--</td>
+                                        </tr>
+                                        <tr>
+                                            <td style="color:var(--text-dim)">Min Win Prob</td>
+                                            <td id="ps-min-win-prob">--</td>
+                                        </tr>
+                                        <tr>
+                                            <td style="color:var(--text-dim)">Neutral Policy</td>
+                                            <td id="ps-neutral-policy">--</td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                            <div class="col-md-4">
+                                <div style="font-size:.72rem;color:var(--green);font-weight:600;margin-bottom:.2rem">
+                                    Adaptive Settings</div>
+                                <table class="table table-sm table-dark mb-0" style="font-size:.73rem">
+                                    <tbody>
+                                        <tr>
+                                            <td style="color:var(--text-dim)">Enabled</td>
+                                            <td id="ps-adaptive-enabled">--</td>
+                                        </tr>
+                                        <tr>
+                                            <td style="color:var(--text-dim)">Retrospective</td>
+                                            <td id="ps-adaptive-retro">--</td>
+                                        </tr>
+                                        <tr>
+                                            <td style="color:var(--text-dim)">Intensity</td>
+                                            <td id="ps-adaptive-intensity">--</td>
+                                        </tr>
+                                        <tr>
+                                            <td style="color:var(--text-dim)">Min Outcomes</td>
+                                            <td id="ps-adaptive-min-outcomes">--</td>
+                                        </tr>
+                                        <tr>
+                                            <td style="color:var(--text-dim)">Window Size</td>
+                                            <td id="ps-adaptive-window">--</td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Row 8: Signal History (full width) -->
+        <div class="row g-2">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <span>Signal History</span>
+                        <div class="d-flex gap-2 align-items-center">
+                            <label style="font-size:.75rem;color:var(--text-sub);white-space:nowrap">From</label>
+                            <input type="date" class="filter-input" id="filter-date-from" style="width:130px"
+                                onchange="onFilterChange()">
+                            <label style="font-size:.75rem;color:var(--text-sub);white-space:nowrap">To</label>
+                            <input type="date" class="filter-input" id="filter-date-to" style="width:130px"
+                                onchange="onFilterChange()">
+                            <select class="filter-input" id="filter-tf" style="width:70px" onchange="onFilterChange()">
+                                <option value="">All TF</option>
+                                <option value="1m">1m</option>
+                                <option value="5m">5m</option>
+                                <option value="15m">15m</option>
+                                <option value="30m">30m</option>
+                                <option value="1h">1h</option>
+                                <option value="4h">4h</option>
+                            </select>
+                            <select class="filter-input" id="filter-dir" style="width:70px" onchange="onFilterChange()">
+                                <option value="">All Dir</option>
+                                <option value="BUY">BUY</option>
+                                <option value="SELL">SELL</option>
+                            </select>
+                            <select class="filter-input" id="filter-outcome" style="width:80px"
+                                onchange="onFilterChange()">
+                                <option value="">All</option>
+                                <option value="WIN">WIN</option>
+                                <option value="LOSS">LOSS</option>
+                                <option value="OPEN">OPEN</option>
+                                <option value="EXPIRED">EXPIRED</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="card-body p-0">
+                        <div class="signal-tbl-wrap">
+                            <table class="table table-sm table-dark table-hover mb-0" id="history-table">
+                                <thead>
+                                    <tr>
+                                        <th>Signal ID</th>
+                                        <th data-col="time" onclick="sortHistory('time')">Time (Amman) <span
+                                                class="sort-icon"></span></th>
+                                        <th data-col="tf" onclick="sortHistory('tf')">TF <span class="sort-icon"></span>
+                                        </th>
+                                        <th data-col="dir" onclick="sortHistory('dir')">Dir <span
+                                                class="sort-icon"></span></th>
+                                        <th data-col="entry" onclick="sortHistory('entry')">Entry <span
+                                                class="sort-icon"></span></th>
+                                        <th data-col="tp" onclick="sortHistory('tp')">TP <span class="sort-icon"></span>
+                                        </th>
+                                        <th data-col="sl" onclick="sortHistory('sl')">SL <span class="sort-icon"></span>
+                                        </th>
+                                        <th data-col="score" onclick="sortHistory('score')">Score <span
+                                                class="sort-icon"></span></th>
+                                        <th data-col="outcome" onclick="sortHistory('outcome')">Result <span
+                                                class="sort-icon"></span></th>
+                                        <th data-col="pnl" onclick="sortHistory('pnl')">PnL (R) <span
+                                                class="sort-icon"></span></th>
+                                        <th>Expiry</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="signal-history"></tbody>
+                            </table>
+                        </div>
+                        <div class="pagination-controls">
+                            <button id="prev-page" onclick="changePage(-1)" disabled>&laquo; Prev</button>
+                            <span id="page-info">Page 1</span>
+                            <button id="next-page" onclick="changePage(1)">Next &raquo;</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Row 9: Blocked Signals History (full width) -->
+        <div class="row g-2 mt-1">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <span>Blocked Signals History</span>
+                        <small style="color:var(--text-sub)">Hypothetical recommendation levels reconstructed from blocked directional decisions</small>
+                    </div>
+                    <div class="card-body py-2" style="border-bottom:1px solid var(--border);font-size:.8rem">
+                        <div class="row text-center">
+                            <div class="col-2"><span class="stat-label">Total</span><br><span class="stat-val"
+                                    id="blocked-total" style="color:var(--text)">--</span></div>
+                            <div class="col-2"><span class="stat-label">Wins</span><br><span class="stat-val"
+                                    id="blocked-wins" style="color:var(--green)">--</span></div>
+                            <div class="col-2"><span class="stat-label">Losses</span><br><span class="stat-val"
+                                    id="blocked-losses" style="color:var(--red)">--</span></div>
+                            <div class="col-2"><span class="stat-label">Win Rate</span><br><span class="stat-val"
+                                    id="blocked-winrate" style="color:var(--text)">--</span></div>
+                            <div class="col-2"><span class="stat-label">Avg R</span><br><span class="stat-val"
+                                    id="blocked-avgr" style="color:var(--text)">--</span></div>
+                            <div class="col-2"><span class="stat-label">PF</span><br><span class="stat-val"
+                                    id="blocked-pf" style="color:var(--text)">--</span></div>
+                        </div>
+                    </div>
+                    <div class="card-header d-flex justify-content-between align-items-center" style="border-top:none">
+                        <span style="font-size:.78rem;color:var(--text-sub)">Blocked Recommendation Records</span>
+                        <div class="d-flex gap-2 align-items-center">
+                            <label style="font-size:.75rem;color:var(--text-sub);white-space:nowrap">From</label>
+                            <input type="date" class="filter-input" id="blocked-filter-date-from" style="width:130px"
+                                onchange="onBlockedFilterChange()">
+                            <label style="font-size:.75rem;color:var(--text-sub);white-space:nowrap">To</label>
+                            <input type="date" class="filter-input" id="blocked-filter-date-to" style="width:130px"
+                                onchange="onBlockedFilterChange()">
+                            <select class="filter-input" id="blocked-filter-tf" style="width:70px"
+                                onchange="onBlockedFilterChange()">
+                                <option value="">All TF</option>
+                                <option value="1m">1m</option>
+                                <option value="5m">5m</option>
+                                <option value="15m">15m</option>
+                                <option value="30m">30m</option>
+                                <option value="1h">1h</option>
+                                <option value="4h">4h</option>
+                            </select>
+                            <select class="filter-input" id="blocked-filter-dir" style="width:70px"
+                                onchange="onBlockedFilterChange()">
+                                <option value="">All Dir</option>
+                                <option value="BUY">BUY</option>
+                                <option value="SELL">SELL</option>
+                            </select>
+                            <select class="filter-input" id="blocked-filter-outcome" style="width:80px"
+                                onchange="onBlockedFilterChange()">
+                                <option value="">All</option>
+                                <option value="WIN">WIN</option>
+                                <option value="LOSS">LOSS</option>
+                                <option value="PENDING">PENDING</option>
+                                <option value="EXPIRED">EXPIRED</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="card-body p-0">
+                        <div class="signal-tbl-wrap">
+                            <table class="table table-sm table-dark table-hover mb-0" id="blocked-history-table">
+                                <thead>
+                                    <tr>
+                                        <th>Signal ID</th>
+                                        <th data-col="time" onclick="sortBlockedHistory('time')">Time (Amman) <span
+                                                class="sort-icon"></span></th>
+                                        <th data-col="tf" onclick="sortBlockedHistory('tf')">TF <span
+                                                class="sort-icon"></span></th>
+                                        <th data-col="dir" onclick="sortBlockedHistory('dir')">Dir <span
+                                                class="sort-icon"></span></th>
+                                        <th data-col="entry" onclick="sortBlockedHistory('entry')">Entry <span
+                                                class="sort-icon"></span></th>
+                                        <th data-col="tp" onclick="sortBlockedHistory('tp')">TP <span
+                                                class="sort-icon"></span></th>
+                                        <th data-col="sl" onclick="sortBlockedHistory('sl')">SL <span
+                                                class="sort-icon"></span></th>
+                                        <th data-col="score" onclick="sortBlockedHistory('score')">Score <span
+                                                class="sort-icon"></span></th>
+                                        <th>Block Reason</th>
+                                        <th data-col="outcome" onclick="sortBlockedHistory('outcome')">Result <span
+                                                class="sort-icon"></span></th>
+                                        <th data-col="pnl" onclick="sortBlockedHistory('pnl')">PnL (R) <span
+                                                class="sort-icon"></span></th>
+                                        <th>Expiry</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="blocked-signal-history"></tbody>
+                            </table>
+                        </div>
+                        <div class="pagination-controls">
+                            <button id="blocked-prev-page" onclick="changeBlockedPage(-1)" disabled>&laquo; Prev</button>
+                            <span id="blocked-page-info">Page 1</span>
+                            <button id="blocked-next-page" onclick="changeBlockedPage(1)">Next &raquo;</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Row 10: Generated Signals History (full width) -->
+        <div class="row g-2 mt-1">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <span>Generated Signals History</span>
+                        <small style="color:var(--text-sub)">Last 24h directional decision outcomes, aligned to Decision Summary &gt; Generated</small>
+                    </div>
+                    <div class="card-body py-2" style="border-bottom:1px solid var(--border);font-size:.8rem">
+                        <div class="row text-center">
+                            <div class="col-2"><span class="stat-label">Total</span><br><span class="stat-val"
+                                    id="generated-total" style="color:var(--text)">--</span></div>
+                            <div class="col-2"><span class="stat-label">Wins</span><br><span class="stat-val"
+                                    id="generated-wins" style="color:var(--green)">--</span></div>
+                            <div class="col-2"><span class="stat-label">Losses</span><br><span class="stat-val"
+                                    id="generated-losses" style="color:var(--red)">--</span></div>
+                            <div class="col-2"><span class="stat-label">Win Rate</span><br><span class="stat-val"
+                                    id="generated-winrate" style="color:var(--text)">--</span></div>
+                            <div class="col-2"><span class="stat-label">Avg R</span><br><span class="stat-val"
+                                    id="generated-avgr" style="color:var(--text)">--</span></div>
+                            <div class="col-2"><span class="stat-label">PF</span><br><span class="stat-val"
+                                    id="generated-pf" style="color:var(--text)">--</span></div>
+                        </div>
+                    </div>
+                    <div class="card-header d-flex justify-content-between align-items-center" style="border-top:none">
+                        <span style="font-size:.78rem;color:var(--text-sub)">Generated Recommendation Records (24h)</span>
+                        <div class="d-flex gap-2 align-items-center">
+                            <label style="font-size:.75rem;color:var(--text-sub);white-space:nowrap">From</label>
+                            <input type="date" class="filter-input" id="generated-filter-date-from" style="width:130px"
+                                onchange="onGeneratedFilterChange()">
+                            <label style="font-size:.75rem;color:var(--text-sub);white-space:nowrap">To</label>
+                            <input type="date" class="filter-input" id="generated-filter-date-to" style="width:130px"
+                                onchange="onGeneratedFilterChange()">
+                            <select class="filter-input" id="generated-filter-tf" style="width:70px"
+                                onchange="onGeneratedFilterChange()">
+                                <option value="">All TF</option>
+                                <option value="1m">1m</option>
+                                <option value="5m">5m</option>
+                                <option value="15m">15m</option>
+                                <option value="30m">30m</option>
+                                <option value="1h">1h</option>
+                                <option value="4h">4h</option>
+                            </select>
+                            <select class="filter-input" id="generated-filter-dir" style="width:70px"
+                                onchange="onGeneratedFilterChange()">
+                                <option value="">All Dir</option>
+                                <option value="BUY">BUY</option>
+                                <option value="SELL">SELL</option>
+                            </select>
+                            <select class="filter-input" id="generated-filter-outcome" style="width:80px"
+                                onchange="onGeneratedFilterChange()">
+                                <option value="">All</option>
+                                <option value="WIN">WIN</option>
+                                <option value="LOSS">LOSS</option>
+                                <option value="PENDING">PENDING</option>
+                                <option value="EXPIRED">EXPIRED</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="card-body p-0">
+                        <div class="signal-tbl-wrap">
+                            <table class="table table-sm table-dark table-hover mb-0" id="generated-history-table">
+                                <thead>
+                                    <tr>
+                                        <th>Signal ID</th>
+                                        <th data-col="time" onclick="sortGeneratedHistory('time')">Time (Amman) <span
+                                                class="sort-icon"></span></th>
+                                        <th data-col="tf" onclick="sortGeneratedHistory('tf')">TF <span
+                                                class="sort-icon"></span></th>
+                                        <th data-col="dir" onclick="sortGeneratedHistory('dir')">Dir <span
+                                                class="sort-icon"></span></th>
+                                        <th data-col="entry" onclick="sortGeneratedHistory('entry')">Entry <span
+                                                class="sort-icon"></span></th>
+                                        <th data-col="tp" onclick="sortGeneratedHistory('tp')">TP <span
+                                                class="sort-icon"></span></th>
+                                        <th data-col="sl" onclick="sortGeneratedHistory('sl')">SL <span
+                                                class="sort-icon"></span></th>
+                                        <th data-col="score" onclick="sortGeneratedHistory('score')">Score <span
+                                                class="sort-icon"></span></th>
+                                        <th>Exit Model</th>
+                                        <th data-col="outcome" onclick="sortGeneratedHistory('outcome')">Result <span
+                                                class="sort-icon"></span></th>
+                                        <th data-col="pnl" onclick="sortGeneratedHistory('pnl')">PnL (R) <span
+                                                class="sort-icon"></span></th>
+                                        <th>Expiry</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="generated-signal-history"></tbody>
+                            </table>
+                        </div>
+                        <div class="pagination-controls">
+                            <button id="generated-prev-page" onclick="changeGeneratedPage(-1)" disabled>&laquo; Prev</button>
+                            <span id="generated-page-info">Page 1</span>
+                            <button id="generated-next-page" onclick="changeGeneratedPage(1)">Next &raquo;</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="js/dashboard.js?v=13"></script>
+</body>
+
+</html>

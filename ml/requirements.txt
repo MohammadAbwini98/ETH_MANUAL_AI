@@ -1,0 +1,26 @@
+# ML Training Pipeline — ETH/USD Signal Enhancement
+# Python requirements for offline model training
+
+# Core ML
+lightgbm>=4.0.0
+xgboost>=2.0.0
+scikit-learn>=1.3.0
+numpy>=1.24.0
+pandas>=2.0.0
+
+# ONNX export
+onnx>=1.14.0
+onnxmltools>=1.12.0
+skl2onnx>=1.16.0
+onnxruntime>=1.16.0
+
+# Data & DB
+psycopg2-binary>=2.9.9
+sqlalchemy>=2.0.0
+
+# Visualization (optional)
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Calibration
+scipy>=1.11.0

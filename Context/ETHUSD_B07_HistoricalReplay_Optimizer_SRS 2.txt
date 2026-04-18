@@ -1,0 +1,1333 @@
+ETHUSD SCALPING SYSTEM
+B-07 REMEDIATION SRS
+Historical Replay + Runtime Optimizer Integration
+Document Version: 1.0
+Prepared For: Implementation after V2.0 audit fixes
+Format Target: Plain Text (.txt)
+
+======================================================================
+1. PURPOSE
+======================================================================
+
+This document defines the remaining implementation required to complete
+item B-07 from the audit trail:
+
+    "Wire historical replay and optimizer into runtime."
+
+The purpose of B-07 is to make the system capable of:
+1) replaying historical 1m / 5m / 15m market data through the exact same
+   regime, indicator, signal, and outcome logic used in live trading,
+2) producing deterministic historical signals, outcomes, and feature
+   snapshots for training and validation,
+3) running parameter optimization on top of those replayed results,
+4) activating a selected parameter set safely in runtime,
+5) preserving reproducibility, auditability, and rollback.
+
+This is not a cosmetic enhancement. It is the missing mechanism that
+turns the application from a live rule engine into an adaptive trading
+system with measurable improvement over time.
+
+======================================================================
+2. SCOPE
+======================================================================
+
+This SRS covers the following deliverables:
+
+A. Historical Replay Engine
+   - Replays historical candles through the same business logic used in
+     live mode.
+   - Reconstructs regime snapshots, indicator snapshots, signals,
+     signal_features, and signal_outcomes.
+
+B. Optimizer
+   - Evaluates candidate strategy parameter sets against replay results.
+   - Uses walk-forward validation rather than naive in-sample fitting.
+   - Produces ranked parameter sets with metrics and artifacts.
+
+C. Runtime Integration
+   - Adds job orchestration, configuration, persistence, versioning, and
+     controlled activation of optimized parameter sets.
+   - Enables scheduled and manual optimization runs.
+
+D. Observability + Safety Controls
+   - Makes every replay and optimization run reproducible and traceable.
+   - Prevents unsafe auto-deploy of overfit or degraded parameter sets.
+
+This SRS does NOT require:
+- machine-learning prediction models,
+- broker-side auto-order execution,
+- multi-symbol portfolio optimization,
+- reinforcement learning.
+
+Those may be added later, but they are out of scope for B-07.
+
+======================================================================
+3. PROBLEM STATEMENT
+======================================================================
+
+The current system generates live signals using a fixed strategy version
+and fixed thresholds. Even if all V2.0 bug fixes were applied, the
+system still lacks a closed feedback loop.
+
+Without B-07:
+- historical candles exist but are not replayed through runtime logic,
+- strategy performance cannot be recomputed deterministically,
+- feature importance cannot be updated using actual outcomes,
+- thresholds and weights remain static,
+- there is no formal mechanism to promote improved parameter sets.
+
+Therefore, B-07 must establish an offline-to-online feedback pipeline.
+
+======================================================================
+4. HIGH-LEVEL GOALS
+======================================================================
+
+G1. Replay historical data through the SAME domain services used by live
+    processing, not through an alternate simplified code path.
+
+G2. Ensure deterministic results:
+    same historical input + same parameter set + same code version
+    => same signals, same outcomes, same metrics.
+
+G3. Persist all artifacts needed for audit and later analysis:
+    parameter sets, run definitions, metrics, folds, candidate rankings.
+
+G4. Use walk-forward validation so the optimizer does not merely fit the
+    past.
+
+G5. Allow manual approval OR rule-based guarded activation of a new
+    parameter set.
+
+G6. Make the system safe:
+    no active parameter set may be replaced unless promotion criteria are
+    satisfied.
+
+======================================================================
+5. ARCHITECTURAL PRINCIPLES
+======================================================================
+
+P1. Single Source of Trading Logic
+    RegimeAnalyzer, IndicatorService, SignalEngine, RiskManager, and
+    OutcomeEvaluator must be reused by replay. Do NOT duplicate rules.
+
+P2. Separation of Concerns
+    Replay, optimization, runtime activation, and reporting must be
+    separate modules communicating through explicit contracts.
+
+P3. Idempotence
+    The same replay window for the same symbol, strategy version, and
+    parameter set may be rerun safely without corrupting state.
+
+P4. Reproducibility
+    Every replay/optimizer result must be tied to:
+      - code version / git hash if available,
+      - strategy version,
+      - parameter set id,
+      - data window,
+      - data checksum or row counts,
+      - objective function version.
+
+P5. Promotion Safety
+    A candidate must not auto-replace the current parameter set if:
+      - out-of-sample performance is worse than baseline,
+      - sample size is insufficient,
+      - drawdown exceeds cap,
+      - parameter drift exceeds allowed bounds,
+      - recent live degradation is unresolved.
+
+======================================================================
+6. TARGET OPERATING MODEL
+======================================================================
+
+The finished system must support three modes:
+
+6.1 Live Mode
+    Existing runtime processing generates current signals using the
+    active strategy parameter set.
+
+6.2 Replay Mode
+    Historical data in a specified date range is replayed through the
+    exact same core logic, generating historical artifacts.
+
+6.3 Optimization Mode
+    Candidate parameter sets are evaluated by repeated replay across
+    train/validation folds; best candidates are ranked and optionally
+    promoted.
+
+======================================================================
+7. FUNCTIONAL REQUIREMENTS
+======================================================================
+
+----------------------------------------------------------------------
+7.1 Parameterization of Strategy Logic
+----------------------------------------------------------------------
+
+REQ-B07-001
+All configurable strategy thresholds and weights must be externalized
+into a versioned parameter object.
+
+Minimum required fields:
+- StrategyVersion
+- TimeframePrimary = 5m
+- TimeframeBias = 15m
+- EmaFastPeriod
+- EmaSlowPeriod
+- RsiPeriod
+- RsiPullbackMin
+- RsiPullbackMax
+- MacdFast
+- MacdSlow
+- MacdSignal
+- AtrPeriod
+- AdxPeriod
+- AdxTrendThreshold
+- VolumeLookback
+- VolumeMultiplierMin
+- VwapEnabled
+- MarketStructureLookback
+- StopAtrMultiplier
+- TargetRMultiple
+- BreakevenAtR
+- MaxSpreadPct
+- DailyLossCapR
+- DailyLossCapPercent
+- RiskPerTradePercent
+- HardMaxRiskPercent
+- ConfidenceBuyThreshold
+- ConfidenceSellThreshold
+- NoTradeThreshold
+- GapBlockLookbackBars
+- OutcomeTimeoutBars
+- ObjectiveFunctionVersion
+
+Implementation note:
+There must be no hidden thresholds left inside the code. If a threshold
+affects trading decisions, it must be parameterized or explicitly
+documented as constant by design.
+
+----------------------------------------------------------------------
+7.2 Parameter Set Persistence
+----------------------------------------------------------------------
+
+REQ-B07-002
+A new table must store strategy parameter sets.
+
+Suggested table: strategy_parameter_sets
+
+Minimum fields:
+- id (uuid or bigint)
+- strategy_version (text)
+- parameter_hash (text unique)
+- parameters_json (jsonb)
+- status (draft / candidate / active / retired / rejected)
+- created_utc
+- created_by
+- activated_utc nullable
+- retired_utc nullable
+- notes
+- parent_parameter_set_id nullable
+- objective_function_version
+- code_version nullable
+
+Rules:
+- Only one parameter set may be ACTIVE per symbol + strategy_version.
+- Historical runs must reference the exact parameter_set_id used.
+
+----------------------------------------------------------------------
+7.3 Historical Replay Run Definition
+----------------------------------------------------------------------
+
+REQ-B07-003
+The system must support a replay run entity.
+
+Suggested table: replay_runs
+
+Fields:
+- id
+- symbol
+- timeframe_base (1m)
+- timeframe_primary (5m)
+- timeframe_bias (15m)
+- start_utc
+- end_utc
+- parameter_set_id
+- strategy_version
+- mode (historical_rebuild / optimization_train / optimization_val /
+        backfill_outcomes / diagnostics)
+- status (queued / running / completed / failed / cancelled)
+- started_utc
+- finished_utc
+- candles_read_count
+- signals_generated_count
+- outcomes_finalized_count
+- gap_event_count
+- warnings_json
+- error_text
+- code_version
+- trigger_source (manual / scheduled / startup_catchup / api)
+
+Behavior:
+- A replay run must be resumable if safe.
+- A replay run must write progress checkpoints.
+
+----------------------------------------------------------------------
+7.4 Historical Replay Engine
+----------------------------------------------------------------------
+
+REQ-B07-004
+Implement a HistoricalReplayService that replays historical data in
+time order.
+
+Required inputs:
+- symbol
+- start_utc
+- end_utc
+- parameter_set_id
+- replay mode
+- overwrite policy
+
+Required outputs:
+- regime_snapshots
+- indicator_snapshots
+- signals
+- signal_features
+- signal_outcomes (where finalizable)
+- replay_runs progress and summary
+
+Replay algorithm requirements:
+1) Load closed 1m candles ordered by open_time ascending.
+2) Aggregate or read 5m and 15m data consistently from closed 1m candles.
+3) Advance a simulated clock candle-by-candle.
+4) On each 1m close:
+   - update internal bar state,
+   - detect completed 5m / 15m closes,
+   - run regime first on 15m close,
+   - run signal logic on 5m close,
+   - use only data available up to that point.
+5) When a signal is emitted:
+   - persist signal,
+   - persist full feature vector,
+   - record provisional outcome status if future bars are insufficient.
+6) Finalize outcomes only when enough future candles exist.
+7) Never use future data in decision computation.
+
+Critical rule:
+Replay must be "causally correct". At bar t, the engine may only inspect
+bars <= t.
+
+----------------------------------------------------------------------
+7.5 Backfill and Rebuild Behavior
+----------------------------------------------------------------------
+
+REQ-B07-005
+The system must support three replay scopes:
+
+A. Full Rebuild
+   Reconstruct artifacts for an entire historical window.
+
+B. Incremental Catch-up
+   Recompute only missing artifacts after a live outage or code upgrade.
+
+C. Targeted Rebuild
+   Recompute artifacts for a specific date range, replay run, or
+   parameter set.
+
+Overwrite policies:
+- skip_existing
+- replace_generated_only
+- full_replace_in_range
+
+Safety:
+- full_replace_in_range must require explicit confirmation in config/API.
+
+----------------------------------------------------------------------
+7.6 Outcome Reconstruction
+----------------------------------------------------------------------
+
+REQ-B07-006
+Historical replay must reconstruct signal outcomes using the same
+OutcomeEvaluator rules used live.
+
+For each signal s generated at time t0:
+- entry price = signal.entry_price
+- SL = signal.sl
+- TP = signal.tp
+- future bars = all closed 5m bars after t0 up to timeout horizon
+
+The engine must determine:
+- whether TP was hit first,
+- whether SL was hit first,
+- whether timeout was reached,
+- MFE (maximum favorable excursion),
+- MAE (maximum adverse excursion),
+- pnl_r,
+- status = WIN / LOSS / EXPIRED / PENDING
+
+Definitions:
+
+For BUY:
+  favorable_move_i = High_i - Entry
+  adverse_move_i   = Entry - Low_i
+
+For SELL:
+  favorable_move_i = Entry - Low_i
+  adverse_move_i   = High_i - Entry
+
+Then:
+  MFE = max(favorable_move_i)
+  MAE = max(adverse_move_i)
+
+R multiple:
+  risk_per_unit = abs(Entry - SL)
+  pnl_r =
+    +TargetRMultiple if TP hit first
+    -1.0             if SL hit first
+    ((Close_timeout - Entry) / risk_per_unit) for timed exit BUY
+    ((Entry - Close_timeout) / risk_per_unit) for timed exit SELL
+
+If futureCandles.Count < TimeoutBars:
+  outcome MUST remain PENDING
+
+This requirement must exactly align with the V2.0 audit fix for B-02.
+
+----------------------------------------------------------------------
+7.7 signal_features Population
+----------------------------------------------------------------------
+
+REQ-B07-007
+Replay must populate signal_features for every replay-generated signal.
+
+Minimum feature groups:
+- regime features
+  - bias direction
+  - adx
+  - ema alignment
+  - market structure flags
+  - vwap relation
+- entry features
+  - rsi
+  - macd
+  - macd signal
+  - macd histogram
+  - atr
+  - pullback distance to ema
+  - pullback distance to vwap
+  - volume ratio
+  - spread pct
+- risk features
+  - stop distance
+  - target distance
+  - risk_percent
+  - estimated_rr
+- quality features
+  - unresolved_gap_count
+  - candle_integrity flags
+  - warmup completeness flags
+
+signal_features may be stored as:
+Option A: key-value rows
+Option B: jsonb snapshot + indexed selected columns
+
+Recommendation:
+Store both:
+- features_jsonb for completeness
+- selected scalar columns in signal_features_flat for analytics speed
+
+----------------------------------------------------------------------
+7.8 Optimizer Run Definition
+----------------------------------------------------------------------
+
+REQ-B07-008
+Create an optimizer_runs table.
+
+Fields:
+- id
+- symbol
+- strategy_version
+- baseline_parameter_set_id
+- search_space_json
+- objective_function_version
+- start_utc
+- end_utc
+- status
+- run_mode (manual / scheduled)
+- train_window_definition
+- validation_window_definition
+- fold_count
+- candidate_count
+- best_candidate_parameter_set_id nullable
+- best_score nullable
+- started_utc
+- finished_utc
+- summary_json
+- error_text
+
+Each optimizer run must reference one or more replay_runs.
+
+----------------------------------------------------------------------
+7.9 Search Space Definition
+----------------------------------------------------------------------
+
+REQ-B07-009
+The optimizer must evaluate a bounded search space.
+
+Initial implementation may use:
+- grid search,
+- randomized search,
+- Latin hypercube sampling.
+
+Future-compatible extension:
+- Bayesian optimization.
+
+Recommended candidate ranges:
+- AdxTrendThreshold: [15, 18, 20, 22, 25]
+- VolumeMultiplierMin: [1.0, 1.1, 1.2, 1.3, 1.5]
+- StopAtrMultiplier: [0.6, 0.8, 1.0, 1.2]
+- TargetRMultiple: [1.0, 1.25, 1.5, 2.0]
+- RsiPullbackMin: [35, 40, 45]
+- RsiPullbackMax: [50, 55, 60]
+- ConfidenceBuyThreshold: [60, 65, 70, 75]
+- ConfidenceSellThreshold: [60, 65, 70, 75]
+- NoTradeThreshold: [45, 50, 55]
+- MarketStructureLookback: [3, 5, 7, 9]
+- MaxSpreadPct: [0.03, 0.05, 0.08, 0.10]
+
+Constraints:
+- RsiPullbackMin < RsiPullbackMax
+- EmaFastPeriod < EmaSlowPeriod
+- HardMaxRiskPercent >= RiskPerTradePercent
+- NoTradeThreshold < ConfidenceBuyThreshold
+- NoTradeThreshold < ConfidenceSellThreshold
+- StopAtrMultiplier > 0
+- TargetRMultiple > 0
+
+Invalid candidate sets must be rejected before replay begins.
+
+----------------------------------------------------------------------
+7.10 Walk-Forward Validation
+----------------------------------------------------------------------
+
+REQ-B07-010
+The optimizer MUST NOT evaluate candidates on a single in-sample period
+only. It must use walk-forward validation.
+
+Required minimum design:
+- Split the historical window into K ordered folds.
+- For each fold k:
+  train on window T_k
+  validate on immediate future window V_k
+- Aggregate out-of-sample metrics across validation folds.
+
+Example:
+- 180 days total data
+- Fold 1: train days 1-90, validate days 91-120
+- Fold 2: train days 31-120, validate days 121-150
+- Fold 3: train days 61-150, validate days 151-180
+
+Candidate score must be computed from validation metrics, not train
+metrics.
+
+----------------------------------------------------------------------
+7.11 Objective Function
+----------------------------------------------------------------------
+
+REQ-B07-011
+The optimizer must compute an explicit objective score for each candidate.
+
+Minimum metrics to compute:
+- trade_count
+- win_rate
+- avg_pnl_r
+- total_pnl_r
+- profit_factor
+- max_drawdown_r
+- expectancy_r
+- sharpe_like_r (optional initial version)
+- exposure_days
+- signal_density
+- timeout_rate
+- no_trade_rate
+
+Definitions:
+
+win_rate = wins / max(1, completed_trades)
+
+expectancy_r = (win_rate * avg_win_r) - ((1 - win_rate) * avg_loss_r_abs)
+
+profit_factor = gross_win_r / max(epsilon, gross_loss_r_abs)
+
+max_drawdown_r:
+  Let E_t = cumulative pnl_r after trade t
+  peak_t = max(E_1 ... E_t)
+  drawdown_t = peak_t - E_t
+  max_drawdown_r = max(drawdown_t)
+
+Suggested objective score:
+  Score(theta) =
+      w1 * Normalize(total_pnl_r)
+    + w2 * Normalize(expectancy_r)
+    + w3 * Normalize(profit_factor)
+    + w4 * Normalize(win_rate)
+    - w5 * Normalize(max_drawdown_r)
+    - w6 * Normalize(timeout_rate)
+    - w7 * OverfitPenalty(theta)
+    - w8 * SparsityPenalty(theta)
+
+Where:
+- Normalize(x) rescales metric x to comparable range across candidates.
+- OverfitPenalty(theta) = max(0, train_score - val_score)
+- SparsityPenalty(theta) applies when trade_count is too low.
+
+Recommended initial hard filters before scoring:
+- validation completed trades >= 30
+- profit_factor >= 1.05
+- expectancy_r > 0
+- max_drawdown_r <= configured limit
+- signal density within reasonable band
+
+If a candidate fails hard filters, mark as REJECTED.
+
+----------------------------------------------------------------------
+7.12 Baseline Comparison
+----------------------------------------------------------------------
+
+REQ-B07-012
+Every optimizer run must compare candidates against the currently active
+baseline parameter set.
+
+A candidate may only be marked promotable if:
+- validation score > baseline validation score by MinImprovement,
+- completed trades >= MinTradeCount,
+- max_drawdown_r <= baseline max_drawdown_r * MaxDrawdownExpansion,
+- no critical data-quality warnings,
+- no single fold catastrophic failure.
+
+Suggested defaults:
+- MinImprovement = 5%
+- MinTradeCount = 30
+- MaxDrawdownExpansion = 1.10
+
+----------------------------------------------------------------------
+7.13 Candidate Promotion Workflow
+----------------------------------------------------------------------
+
+REQ-B07-013
+Promotion must support two modes:
+
+Mode A: Manual Approval
+  Candidate is stored as CANDIDATE and requires explicit activation.
+
+Mode B: Guarded Auto-Promotion
+  Candidate may become ACTIVE only if all promotion rules pass.
+
+Promotion artifacts must include:
+- candidate metrics by fold,
+- comparison vs active baseline,
+- parameter diff,
+- replay run references,
+- optimizer run reference,
+- promotion reason.
+
+When promoted:
+- old active set => RETIRED
+- new set => ACTIVE
+- activation timestamp recorded
+- runtime cache refreshed atomically
+
+----------------------------------------------------------------------
+7.14 Runtime Parameter Resolution
+----------------------------------------------------------------------
+
+REQ-B07-014
+Live services must resolve trading parameters from an IParameterProvider.
+
+Requirements:
+- in-memory cache
+- DB-backed source of truth
+- safe reload on activation
+- no service restart required
+- fallback to last-known-good parameter set if load fails
+
+At runtime, all parameterized strategy services must depend on:
+  StrategyParameters current = parameterProvider.GetActive(symbol, version)
+
+No component may use hardcoded thresholds once this integration is done.
+
+----------------------------------------------------------------------
+7.15 Job Scheduling and Triggers
+----------------------------------------------------------------------
+
+REQ-B07-015
+The system must expose replay and optimizer jobs through both:
+- internal scheduler,
+- HTTP API,
+- optional admin dashboard trigger.
+
+Required job types:
+- nightly_replay_catchup
+- nightly_outcome_finalization
+- weekly_optimizer_run
+- manual_backfill_replay
+- manual_candidate_validation
+
+Suggested schedule:
+- replay catch-up: every day after session close or at fixed UTC time
+- outcome finalization: every 15 minutes or hourly
+- optimizer: weekly, low-load period
+
+Concurrency rule:
+- only one optimizer run per symbol may execute at a time
+- replay runs may execute concurrently only if date windows do not
+  overlap for the same symbol and write scope
+
+Distributed lock requirement:
+- Use DB advisory lock or lock table
+
+----------------------------------------------------------------------
+7.16 API Requirements
+----------------------------------------------------------------------
+
+REQ-B07-016
+Add admin APIs:
+
+POST /api/admin/replay-runs
+  body:
+  {
+    "symbol": "ETHUSD",
+    "startUtc": "...",
+    "endUtc": "...",
+    "parameterSetId": 123,
+    "mode": "historical_rebuild",
+    "overwritePolicy": "replace_generated_only"
+  }
+
+GET /api/admin/replay-runs/{id}
+GET /api/admin/replay-runs/{id}/artifacts
+POST /api/admin/optimizer-runs
+GET /api/admin/optimizer-runs/{id}
+POST /api/admin/parameter-sets/{id}/activate
+GET /api/admin/parameter-sets/active
+GET /api/admin/parameter-sets/candidates
+
+API security:
+- admin-only authorization
+- full audit log of trigger actions
+
+----------------------------------------------------------------------
+7.17 Dashboard Requirements
+----------------------------------------------------------------------
+
+REQ-B07-017
+Extend dashboard/admin UI to show:
+- active parameter set summary
+- last optimizer run status
+- candidate leaderboard
+- current objective score vs baseline
+- last replay run summary
+- approval / activation controls (if enabled)
+- data quality alerts (gaps, insufficient samples, stale outcomes)
+
+This is an admin/research dashboard, not the public trading dashboard.
+
+----------------------------------------------------------------------
+7.18 Auditability and Artifacts
+----------------------------------------------------------------------
+
+REQ-B07-018
+Each replay and optimizer run must store machine-readable artifacts.
+
+Examples:
+- metrics_summary.json
+- fold_metrics.json
+- candidate_rankings.json
+- warnings.json
+- parameter_diff.json
+
+Artifact storage options:
+- jsonb in DB for small artifacts
+- file system / blob storage for large artifacts
+- DB row references from optimizer_runs and replay_runs
+
+======================================================================
+8. NON-FUNCTIONAL REQUIREMENTS
+======================================================================
+
+NFR-001 Performance
+- Replay of 180 days of 1m data for one symbol should complete within an
+  operationally acceptable time budget.
+- Initial target: <= 15 minutes on the deployment environment for one
+  symbol and one parameter set.
+- Optimizer runs may take longer; they must be cancellable.
+
+NFR-002 Determinism
+- Same inputs and code version must produce identical outputs.
+
+NFR-003 Resilience
+- Job crashes must mark runs FAILED with useful diagnostics.
+- Partial results must not silently appear complete.
+
+NFR-004 Observability
+- Structured logs required for:
+  replay start/end,
+  fold start/end,
+  candidate start/end,
+  activation,
+  rejection,
+  lock acquisition,
+  data-quality warnings.
+
+NFR-005 Security
+- Admin actions must require authorization.
+- Parameter activation must be audited.
+
+NFR-006 Backward Compatibility
+- Existing live trading and dashboard APIs must continue to function if
+  optimizer features are disabled.
+
+======================================================================
+9. DATA MODEL CHANGES
+======================================================================
+
+Minimum new/updated tables:
+
+1) strategy_parameter_sets
+2) replay_runs
+3) replay_run_progress
+4) optimizer_runs
+5) optimizer_candidates
+6) optimizer_candidate_folds
+7) optimizer_artifacts
+8) parameter_activation_history
+
+Suggested optimizer_candidates fields:
+- id
+- optimizer_run_id
+- parameter_set_id
+- status (pending / running / completed / rejected)
+- train_score
+- validation_score
+- baseline_delta_pct
+- trade_count
+- win_rate
+- expectancy_r
+- total_pnl_r
+- profit_factor
+- max_drawdown_r
+- timeout_rate
+- overfit_penalty
+- sparsity_penalty
+- rank nullable
+- summary_json
+
+Suggested optimizer_candidate_folds fields:
+- id
+- optimizer_candidate_id
+- fold_index
+- train_start_utc
+- train_end_utc
+- val_start_utc
+- val_end_utc
+- train_metrics_json
+- val_metrics_json
+- warnings_json
+
+======================================================================
+10. DETAILED COMPONENT DESIGN
+======================================================================
+
+----------------------------------------------------------------------
+10.1 HistoricalReplayService
+----------------------------------------------------------------------
+
+Responsibilities:
+- load candles,
+- feed candle stream into domain pipeline,
+- persist generated artifacts,
+- checkpoint progress,
+- finalize outcomes.
+
+Pseudo-flow:
+
+for each candle_1m in closedCandlesOrdered:
+    replayClock = candle_1m.CloseTime
+    update 1m state
+    if completes 5m bar:
+        build closed 5m
+        compute indicators on closed bars only
+    if completes 15m bar:
+        compute regime first
+        persist regime snapshot
+    if completes 5m bar:
+        evaluate signal using current 15m regime
+        if signal emitted:
+            persist signal + features
+            try finalizing if enough future bars available
+    checkpoint every N bars
+
+Key requirement:
+Replay must simulate the same event ordering as live fixed by B-03:
+15m regime update before 5m signal generation on shared boundaries.
+
+----------------------------------------------------------------------
+10.2 ReplayState
+----------------------------------------------------------------------
+
+Must keep:
+- rolling 1m/5m/15m windows,
+- current regime,
+- current active parameter set,
+- warmup completeness flags,
+- unresolved gap flags,
+- replay clock,
+- statistics counters.
+
+Warmup rules:
+A signal may not be generated until all indicators and lookbacks required
+by the strategy have enough historical bars.
+
+----------------------------------------------------------------------
+10.3 OptimizerService
+----------------------------------------------------------------------
+
+Responsibilities:
+- generate candidate parameter sets,
+- enforce constraints,
+- schedule replay per fold,
+- compute metrics,
+- rank candidates,
+- compare against baseline,
+- write artifacts.
+
+Recommended implementation sequence:
+Phase 1: randomized/grid search
+Phase 2: add Bayesian search only after core path is stable
+
+----------------------------------------------------------------------
+10.4 ParameterProvider
+----------------------------------------------------------------------
+
+Responsibilities:
+- fetch active set from DB,
+- cache it,
+- refresh cache on activation,
+- expose GetActive(symbol, strategyVersion)
+
+Implementation note:
+Cache refresh should be atomic so live signal generation never uses a
+partially loaded parameter set.
+
+----------------------------------------------------------------------
+10.5 ActivationService
+----------------------------------------------------------------------
+
+Responsibilities:
+- validate promotion rules,
+- retire old set,
+- activate new set in one transaction,
+- write activation history,
+- notify runtime cache.
+
+======================================================================
+11. MATHEMATICAL AND STATISTICAL DETAILS
+======================================================================
+
+11.1 Expected Value / Expectancy
+  expectancy_r = mean(pnl_r_i)
+
+Alternative decomposed form:
+  expectancy_r = p(win) * avg_win_r - p(loss) * avg_loss_r_abs
+
+11.2 Profit Factor
+  PF = sum(all positive pnl_r) / max(epsilon, abs(sum(all negative pnl_r)))
+
+11.3 Maximum Drawdown
+  Let cumulative equity:
+      E_0 = 0
+      E_t = E_(t-1) + pnl_r_t
+
+  Running peak:
+      P_t = max(E_0 ... E_t)
+
+  Drawdown:
+      DD_t = P_t - E_t
+
+  Max drawdown:
+      MDD = max(DD_t)
+
+11.4 Overfit Penalty
+  OP = max(0, TrainScore - ValidationScore)
+
+11.5 Sparsity Penalty
+  Let n = completed validation trades
+  Let n_min = required minimum trades
+
+  SP = max(0, (n_min - n) / n_min)
+
+11.6 Composite Objective Example
+  Score =
+      0.30 * Norm(total_pnl_r)
+    + 0.20 * Norm(expectancy_r)
+    + 0.20 * Norm(profit_factor)
+    + 0.10 * Norm(win_rate)
+    - 0.10 * Norm(max_drawdown_r)
+    - 0.05 * timeout_rate
+    - 0.03 * overfit_penalty
+    - 0.02 * sparsity_penalty
+
+These weights are initial defaults and must themselves be versioned.
+
+======================================================================
+12. IMPLEMENTATION PHASES
+======================================================================
+
+----------------------------------------------------------------------
+Phase B07-1: Parameterization + Persistence
+----------------------------------------------------------------------
+
+Deliverables:
+- StrategyParameters class
+- strategy_parameter_sets table
+- ParameterProvider
+- migrate all strategy thresholds from hardcoded values into parameters
+
+Acceptance criteria:
+- live strategy can run entirely from an active parameter set
+- no hidden thresholds remain in code review
+- activating a new set changes behavior without restart
+
+Mandatory tests:
+1) unit test: parameter serialization/deserialization round-trip
+2) unit test: constraint validation rejects invalid candidate
+3) integration test: active parameter set switch updates runtime
+4) code audit: no hardcoded strategy thresholds left
+
+Gate:
+Do not proceed to replay until live mode reads parameters correctly.
+
+----------------------------------------------------------------------
+Phase B07-2: Historical Replay Engine
+----------------------------------------------------------------------
+
+Deliverables:
+- replay_runs table
+- HistoricalReplayService
+- ReplayState
+- checkpointing
+- rebuild modes
+
+Acceptance criteria:
+- a replay over a known window reproduces deterministic signals
+- signals, features, and outcomes are persisted
+- 15m-before-5m ordering is preserved
+- no future data leakage detected
+
+Mandatory tests:
+1) golden dataset replay test:
+   known candle set => exact expected signals/outcomes
+2) idempotence test:
+   rerunning same window yields same results
+3) causality test:
+   signal at t does not depend on bars after t
+4) gap handling test:
+   unresolved gaps block signal generation when required
+
+Gate:
+Do not proceed to optimizer until replay outputs are trustworthy.
+
+----------------------------------------------------------------------
+Phase B07-3: Outcome Backfill + Artifact Validation
+----------------------------------------------------------------------
+
+Deliverables:
+- outcome finalization job
+- replay artifact summaries
+- warnings collection
+
+Acceptance criteria:
+- PENDING outcomes finalize correctly as future bars become available
+- artifacts summarize counts and metrics accurately
+
+Mandatory tests:
+1) timeout horizon test
+2) TP-first / SL-first edge case test
+3) PENDING to final transition integration test
+4) artifact summary reconciliation test
+
+Gate:
+Only proceed when replay metrics match raw DB outcomes.
+
+----------------------------------------------------------------------
+Phase B07-4: Optimizer Core
+----------------------------------------------------------------------
+
+Deliverables:
+- optimizer_runs
+- optimizer_candidates
+- optimizer_candidate_folds
+- candidate generator
+- walk-forward validation
+- ranking logic
+
+Acceptance criteria:
+- optimizer can evaluate baseline + candidates over folds
+- candidates are ranked by explicit objective
+- rejected candidates are tagged with reasons
+
+Mandatory tests:
+1) fold split correctness test
+2) candidate constraints test
+3) deterministic ranking test
+4) baseline comparison test
+5) insufficient-trades rejection test
+
+Gate:
+Do not enable activation until optimizer is stable.
+
+----------------------------------------------------------------------
+Phase B07-5: Promotion + Runtime Activation
+----------------------------------------------------------------------
+
+Deliverables:
+- ActivationService
+- parameter_activation_history
+- admin APIs
+- runtime cache refresh
+
+Acceptance criteria:
+- manual activation works transactionally
+- auto-promotion obeys safety rules
+- old set retires automatically
+- live runtime uses new set without restart
+
+Mandatory tests:
+1) activation transaction atomicity test
+2) rollback/fallback test on cache refresh failure
+3) promotion criteria guard test
+4) audit log completeness test
+
+Gate:
+Do not enable scheduled optimizer activation until manual mode passes.
+
+----------------------------------------------------------------------
+Phase B07-6: Scheduling + Admin UX
+----------------------------------------------------------------------
+
+Deliverables:
+- scheduled replay and optimizer jobs
+- admin APIs
+- admin dashboard pages
+
+Acceptance criteria:
+- operators can trigger, inspect, approve, and monitor runs
+- job collisions are prevented by lock mechanism
+
+Mandatory tests:
+1) concurrency lock test
+2) duplicate-run prevention test
+3) authz test for admin endpoints
+4) dashboard status consistency test
+
+======================================================================
+13. TEST STRATEGY
+======================================================================
+
+13.1 Unit Tests
+- indicator and signal parameter validation
+- objective function calculations
+- fold generation logic
+- candidate constraints
+- parameter activation guards
+
+13.2 Integration Tests
+- replay end-to-end over seeded candle fixtures
+- optimizer end-to-end on small historical sample
+- activation and cache refresh
+- API workflows
+
+13.3 Regression Tests
+- previous live-signal bugs must not reappear:
+  - regime ordering
+  - provisional candle misuse
+  - premature EXPIRED outcome
+  - unresolved gap bypass
+  - bulk upsert closed/open flag corruption
+
+13.4 Golden Dataset
+A fixed historical fixture must be created where expected:
+- regimes
+- signals
+- signal features
+- outcomes
+- summary metrics
+are known ahead of time.
+
+This dataset becomes the baseline regression oracle.
+
+======================================================================
+14. LOGGING AND DIAGNOSTICS
+======================================================================
+
+Replay logs must include:
+- run_id
+- symbol
+- parameter_set_id
+- bar counts processed
+- checkpoint position
+- generated signals count
+- pending outcomes count
+- warnings count
+- duration
+
+Optimizer logs must include:
+- optimizer_run_id
+- candidate_id
+- fold index
+- train/val windows
+- score
+- rejection reason if any
+- baseline delta
+
+Activation logs must include:
+- previous active id
+- new active id
+- actor
+- promotion basis
+- rollback if any
+
+======================================================================
+15. CONFIGURATION
+======================================================================
+
+Add configuration section example:
+
+"B07": {
+  "Replay": {
+    "CheckpointEveryBars": 500,
+    "DefaultOverwritePolicy": "replace_generated_only",
+    "MaxConcurrentReplayRunsPerSymbol": 1
+  },
+  "Optimizer": {
+    "Enabled": true,
+    "DefaultFoldCount": 3,
+    "MinTradeCount": 30,
+    "MinImprovementPct": 5.0,
+    "MaxDrawdownExpansion": 1.10,
+    "WeeklyScheduleCronUtc": "0 2 * * 0",
+    "SearchMethod": "Randomized",
+    "MaxCandidatesPerRun": 100
+  },
+  "Activation": {
+    "Mode": "Manual",
+    "RequireApproval": true,
+    "FallbackToLastKnownGood": true
+  }
+}
+
+======================================================================
+16. OPEN IMPLEMENTATION DECISIONS
+======================================================================
+
+These must be explicitly decided during implementation:
+
+D1. Whether signal_features is stored as KV rows only or JSONB + flat
+    analytics table.
+
+D2. Whether optimizer artifacts remain in DB only or are also exported to
+    files/blob storage.
+
+D3. Whether promotion is manual only for first release.
+    Recommendation: yes.
+
+D4. Whether replay reads prebuilt 5m/15m tables or always aggregates from
+    1m.
+    Recommendation: aggregate from trusted closed 1m candles to avoid
+    drift between historical derivations.
+
+D5. Whether optimizer initially uses randomized search or grid search.
+    Recommendation: randomized search with bounded candidate count.
+
+======================================================================
+17. RISKS AND MITIGATIONS
+======================================================================
+
+Risk R1: Overfitting
+Mitigation:
+- walk-forward validation
+- baseline comparison
+- overfit penalty
+- manual approval for first release
+
+Risk R2: Runtime instability after activation
+Mitigation:
+- last-known-good fallback
+- atomic cache refresh
+- activation history + quick rollback
+
+Risk R3: Historical data quality issues distort optimization
+Mitigation:
+- unresolved gap gating
+- data-quality warnings
+- replay artifact counts
+- sample sufficiency thresholds
+
+Risk R4: Performance bottlenecks
+Mitigation:
+- checkpointing
+- batched persistence
+- per-fold summaries
+- candidate count limits
+
+Risk R5: Hidden logic divergence between live and replay
+Mitigation:
+- shared domain services
+- golden dataset regression
+- code review rule: no duplicate rule engines
+
+======================================================================
+18. DEFINITION OF DONE FOR B-07
+======================================================================
+
+B-07 is complete only when ALL of the following are true:
+
+1) Live trading parameters are externally versioned and runtime-resolved.
+2) Historical replay can rebuild signals/features/outcomes deterministically.
+3) Optimizer can evaluate baseline and candidates using walk-forward folds.
+4) Candidate metrics and artifacts are persisted and auditable.
+5) A new parameter set can be promoted manually without restart.
+6) Safety gates prevent degraded/overfit auto-promotion.
+7) Full end-to-end tests pass on a golden dataset.
+8) Admin APIs and run summaries exist for operational control.
+
+If any of the above is missing, B-07 is not complete.
+
+======================================================================
+19. RECOMMENDED FIRST IMPLEMENTATION ORDER
+======================================================================
+
+1) parameter sets + provider
+2) replay engine
+3) replay regression tests
+4) outcome backfill
+5) optimizer core
+6) manual candidate activation
+7) scheduling + admin APIs
+8) admin dashboard
+
+This order minimizes risk and makes debugging tractable.
+
+======================================================================
+20. FINAL IMPLEMENTATION GUIDANCE FOR CODE-GENERATING AGENTS
+======================================================================
+
+The implementing agent must follow these rules:
+
+- Reuse existing domain services wherever possible.
+- Do not create a second "approximate" signal engine for replay.
+- Do not activate candidates automatically in first release.
+- Prefer deterministic, testable components over clever abstractions.
+- Every phase must include unit + integration tests before next phase.
+- Every persisted artifact must include parameter_set_id and strategy_version.
+- Every candidate evaluation must use out-of-sample metrics.
+- Never let optimization logic use future data beyond each validation window.
+
+END OF DOCUMENT

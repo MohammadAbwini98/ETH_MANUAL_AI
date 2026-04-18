@@ -1,0 +1,47 @@
+## Build
+bin/
+obj/
+
+## IDE
+.vs/
+.vscode/
+.claude/
+*.user
+*.suo
+
+## Logs
+logs/
+**/logs/
+capital-chrome-profile/
+
+## Secrets
+.env
+*.env
+
+## Virtual environments
+.venv/
+**/.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+
+## Node dependencies
+node_modules/
+**/node_modules/
+
+## ML generated artifacts
+ml/models/
+ml/data/training_data*.csv
+ml/data/training_data_summary.json
+
+## DB exports
+db_export_*/
+db_backup_*/
+backups/
+
+## Runtime / local state
+Sessions/
+
+## OS
+.DS_Store
+Thumbs.db

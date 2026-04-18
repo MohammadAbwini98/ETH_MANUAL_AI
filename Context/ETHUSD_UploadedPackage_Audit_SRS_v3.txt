@@ -1,0 +1,656 @@
+ETHUSD SCALPING PLATFORM
+UPLOADED PACKAGE AUDIT / CORRECTIVE SRS v3
+Date: 2026-03-29
+Basis of review: actual contents of uploaded file /mnt/data/ETH_MANUAL.zip plus reference SRS documents:
+- ETHUSD_Scalping_SRS.txt
+- ETHUSD_Implementation_Audit_SRS.txt
+- ETHUSD_Followup_Implementation_Audit_SRS_v2.txt
+- ETHUSD_B07_HistoricalReplay_Optimizer_SRS.txt
+
+IMPORTANT SCOPE NOTE
+This audit is based on the package that was actually uploaded in this turn.
+The uploaded ZIP does NOT contain the B-07 implementation described in the user summary.
+It contains a small console application under ETH_MANUAL/ETH_G with only these relevant source files:
+- Program.cs
+- Apis/CapitalClient.cs
+- Db/CandleRepository.cs
+- Db/DbInitializer.cs
+- Engine/CandleAggregator.cs
+- Engine/CandleEngine.cs
+- Engine/Timeframes.cs
+- run.sh
+It does NOT contain the following artifacts that the request said were included:
+- no logs
+- no exported database CSV files
+- no dashboard HTML / JavaScript / CSS
+- no web API project
+- no tests
+- no StrategyParameters / parameter repository / parameter provider
+- no replay engine
+- no optimizer
+- no signal engine / regime analyzer / indicator engine / outcome evaluator
+Therefore, all validation statements below are about the ACTUAL uploaded package, not the claimed implementation summary.
+
+=====================================================================
+1. EXECUTIVE CONCLUSION
+=====================================================================
+
+1.1 Overall result
+The uploaded source package is NON-COMPLIANT with the implementation SRS, the prior audit SRS, and the B-07 SRS.
+It appears to be an earlier prototype focused only on:
+- authentication to Capital.com
+- backfilling candles
+- polling spot price every second
+- building and storing live candles
+
+1.2 Consequence
+This package cannot satisfy the target system requirements because it lacks the entire decision pipeline:
+- no indicators
+- no 15m regime classification
+- no 5m signal generation
+- no SL/TP/risk recommendation model
+- no signal persistence
+- no outcomes
+- no learning loop
+- no replay runtime
+- no optimizer runtime
+- no dashboard
+- no admin APIs
+
+1.3 Most important finding
+The user-provided implementation summary for B-07 does not match the uploaded source code.
+This is not a minor bug. It is a source-package mismatch.
+Before any deeper validation can succeed, the correct source tree must be packaged and uploaded.
+
+=====================================================================
+2. PACKAGE CONTENT MISMATCH AGAINST CLAIMED IMPLEMENTATION
+=====================================================================
+
+ISSUE U-01
+Severity: CRITICAL
+Title: Uploaded package does not match the claimed B-07 implementation
+Observed evidence:
+- Uploaded project tree is ETH_G only.
+- No files named StrategyParameters.cs, StrategyParameterSet.cs, HistoricalReplayService.cs, OptimizerService.cs, ReplayRun.cs, Program.cs web endpoints, dashboard assets, or test projects are present.
+- No DB exports or runtime logs are included in the ZIP.
+Why this is wrong:
+The request asked for validation against the follow-up audit SRS and B-07 SRS. The actual uploaded codebase does not implement those requirements.
+Required behavior:
+The uploaded package must contain the same codebase that actually implements the claimed features.
+Required fix:
+Re-package the real solution root, including:
+- source projects
+- tests
+- dashboard assets
+- logs
+- DB exports
+- migrations
+- B-07 components
+Acceptance gate:
+The uploaded ZIP must visibly contain the replay/optimizer/parameterization/runtime/admin/dashboard components before another B-07 compliance audit can be meaningful.
+
+=====================================================================
+3. SOURCE CODE AUDIT OF THE ACTUAL UPLOADED PACKAGE
+=====================================================================
+
+---------------------------------------------------------------------
+ISSUE U-02
+Severity: CRITICAL
+Title: Startup destroys all data on every run
+Location:
+- ETH_G/Program.cs lines 25-30
+- ETH_G/Db/DbInitializer.cs lines 24-54
+Observed behavior:
+Program.cs calls:
+- InitializeAsync()
+- TruncateAllAsync()
+DbInitializer.InitializeAsync() drops every timeframe table and recreates it.
+Then TruncateAllAsync() clears all rows again.
+Why this is wrong:
+This directly violates the earlier audit and the main SRS requirement that history, signals, outcomes, and learning data persist across runs.
+A trading system cannot learn, validate, backtest, or audit results if it destroys all state at startup.
+Required behavior:
+Startup must be idempotent and non-destructive.
+Only create missing schema objects.
+Never drop or truncate production data automatically.
+Required fix:
+- Remove Program.cs lines 28-29 in production startup path.
+- Replace DbInitializer.InitializeAsync() with migration logic that uses CREATE TABLE IF NOT EXISTS and ALTER TABLE migration steps only.
+- Move any destructive operation behind an explicit manual admin command or separate maintenance script.
+Acceptance gate:
+A restart must preserve existing candle rows and all higher-level tables.
+
+---------------------------------------------------------------------
+ISSUE U-03
+Severity: CRITICAL
+Title: Hardcoded secrets present in run.sh
+Location:
+- run.sh lines 3-7
+Observed behavior:
+API credentials and database connection details are embedded directly in a shell script.
+Why this is wrong:
+This is a severe security defect.
+It exposes broker credentials and account access material to source control, backups, logs, and any person who can access the repository.
+Required behavior:
+Secrets must never be committed in plaintext.
+Required fix:
+- Remove all hardcoded secrets from run.sh.
+- Replace with environment-variable checks.
+- Rotate the exposed credentials immediately.
+- Use .env locally only if excluded from version control, or use OS secret store / CI secret manager.
+Acceptance gate:
+Repository contains no live credentials or passwords in source files, scripts, configs, or binaries.
+
+---------------------------------------------------------------------
+ISSUE U-04
+Severity: CRITICAL
+Title: Live rollover still closes candles with the first price of the next bucket
+Location:
+- ETH_G/Engine/CandleEngine.cs lines 149-159
+Observed behavior:
+When a boundary is crossed, the previous candle is finalized using the CURRENT price variable:
+- High = max(current.High, price)
+- Low = min(current.Low, price)
+- Close = price
+But price is already the first tick seen after the bucket boundary.
+Why this is wrong:
+This reproduces the exact rollover defect from the first audit.
+The close of candle N becomes the first tick of candle N+1.
+This corrupts OHLC, indicators, higher-timeframe aggregates, and any future signals/backtests.
+Required behavior:
+The previous candle must close using the LAST price observed before the boundary.
+Required fix:
+Store previous spot/tick and use it to finalize the previous bucket.
+Pseudo-fix:
+1. Keep previousPrice and previousTimestamp.
+2. On boundary crossing:
+   finalClose = previousPrice
+3. Open the new candle with currentPrice.
+Acceptance gate:
+For a boundary-crossing sequence [price(t-1), price(t boundary)], candle N closes at price(t-1) and candle N+1 opens at price(t boundary).
+
+---------------------------------------------------------------------
+ISSUE U-05
+Severity: CRITICAL
+Title: Higher timeframe live candles are built independently from tick stream instead of being derived from closed 1m bars
+Location:
+- ETH_G/Engine/CandleEngine.cs lines 144-199
+Observed behavior:
+The live loop updates M1, M5, M15, M30, H1, and H4 directly from the same current spot price.
+Why this is wrong:
+This violates the architecture required in the audits and SRS.
+Causally correct higher-timeframe candles must be derived from closed 1m candles, not updated independently in parallel.
+Otherwise:
+- 5m high/low can disagree with its constituent 1m candles
+- 15m close can again inherit next-bucket prices
+- data lineage is broken
+Required behavior:
+- Build only 1m from live spot/tick data.
+- Derive higher timeframes from closed 1m candles only.
+Required fix:
+After each closed 1m candle:
+1. persist that 1m candle
+2. check whether a 5m boundary completed
+3. aggregate exactly the closed 1m rows in that bucket
+4. persist derived 5m candle
+5. similarly for 15m and above if required
+Acceptance gate:
+Every 5m candle must exactly match O/H/L/C/V aggregated from its five constituent 1m candles.
+
+---------------------------------------------------------------------
+ISSUE U-06
+Severity: CRITICAL
+Title: Backfill forcibly closes partial last candles
+Location:
+- ETH_G/Engine/CandleEngine.cs lines 75-76
+- ETH_G/Db/CandleRepository.cs line 47
+Observed behavior:
+Backfill inserts candles and then calls CloseAllOpenAsync(), which marks all open rows closed.
+In BulkInsertAsync(), is_closed is determined by c.OpenTime < lastTime.
+Why this is wrong:
+The last bucket in a backfill window may be partial.
+Marking it closed makes the system believe the candle is complete when it is not.
+That contaminates any downstream strategy logic.
+Required behavior:
+A bucket should be closed only when completeness is known from the number of constituent lower-timeframe candles or from an explicit data-finalization rule.
+Required fix:
+- Remove CloseAllOpenAsync() from backfill finalization.
+- For each aggregated timeframe, mark a candle closed only if full component coverage exists.
+- Add explicit completeness calculation:
+  complete if observed_count == expected_count
+Acceptance gate:
+The final bucket of a range remains open/partial unless it is truly complete.
+
+---------------------------------------------------------------------
+ISSUE U-07
+Severity: HIGH
+Title: CandleRepository bulk close semantics still use positional heuristic instead of explicit candle state
+Location:
+- ETH_G/Db/CandleRepository.cs line 47
+Observed behavior:
+is_closed is written as c.OpenTime < lastTime.
+Why this is wrong:
+This is the old defect from the previous audits.
+Whether a candle is closed is not a function of its position in a list.
+It is a property of data completeness.
+Required behavior:
+Each candle object should carry explicit IsClosed state.
+Required fix:
+- Extend Candle model with IsClosed.
+- Persist c.IsClosed directly.
+- Stop deriving state from sorting position.
+Acceptance gate:
+Bulk inserts preserve the exact candle closure state supplied by the caller.
+
+---------------------------------------------------------------------
+ISSUE U-08
+Severity: HIGH
+Title: Database schema stores only mid OHLC and lacks provenance timestamps
+Location:
+- ETH_G/Db/DbInitializer.cs lines 31-43
+Why this is wrong:
+The corrective audits required bid/ask/mid or equivalent richer market data and source timestamps.
+This schema stores only one OHLC set and no source timestamp or received timestamp.
+Consequences:
+- spread cannot be computed historically
+- bid/ask slippage cannot be analyzed
+- source freshness cannot be audited
+Required behavior:
+At minimum store:
+- bid_open/high/low/close
+- ask_open/high/low/close
+- source_timestamp_utc
+- received_timestamp_utc
+- created_at_utc / updated_at_utc
+Required fix:
+Replace the current candle schema with the richer schema from the previous audits.
+Acceptance gate:
+Historical rows support spread analysis, provenance analysis, and live-vs-source timing checks.
+
+---------------------------------------------------------------------
+ISSUE U-09
+Severity: HIGH
+Title: No indicator engine implemented
+Observed behavior:
+No files for EMA/RSI/MACD/ATR/ADX/VWAP calculations are present.
+Why this is wrong:
+The SRS explicitly requires indicator-driven strategy logic and dashboard visibility.
+Without indicators there can be no strategy recommendation.
+Required behavior:
+Implement indicator pipeline on closed candles only.
+Required fix:
+Add:
+- IndicatorSnapshot model
+- IndicatorEngine
+- EMA, RSI, MACD, ATR, ADX, VWAP calculators
+- persistence table indicator_snapshots
+Acceptance gate:
+Indicator snapshots are generated on each closed 5m and 15m candle and stored in DB.
+
+---------------------------------------------------------------------
+ISSUE U-10
+Severity: HIGH
+Title: No regime classification implemented
+Observed behavior:
+No 15m regime analyzer or regime table exists.
+Why this is wrong:
+The target architecture requires 15m regime gating before 5m entries.
+Required behavior:
+Implement 15m regime classification using EMA trend, ADX, VWAP alignment, and structure checks.
+Required fix:
+Add:
+- RegimeResult model
+- RegimeAnalyzer
+- regime_snapshots table
+Acceptance gate:
+Each closed 15m candle produces a persisted regime classification.
+
+---------------------------------------------------------------------
+ISSUE U-11
+Severity: HIGH
+Title: No signal engine, no risk manager, no signal persistence
+Observed behavior:
+No signal or risk modules exist in the uploaded code.
+Why this is wrong:
+This is the main functional requirement of the entire product.
+Required behavior:
+Generate:
+- BUY / SELL / NO_TRADE
+- entry
+- TP
+- SL
+- risk percent and risk USD
+Required fix:
+Implement:
+- SignalRecommendation model
+- SignalEngine
+- RiskManager
+- signals table
+- signal_features table
+Acceptance gate:
+Closed 5m candles generate persisted recommendations whenever regime and entry conditions pass.
+
+---------------------------------------------------------------------
+ISSUE U-12
+Severity: HIGH
+Title: No outcome evaluator and no learning tables
+Observed behavior:
+No signal_outcomes table, no signal_features table, no evaluator.
+Why this is wrong:
+The system cannot learn or measure accuracy without labeling outcomes.
+Required behavior:
+For each stored signal, evaluate later candles and store outcome with:
+- WIN / LOSS / PENDING / EXPIRED / AMBIGUOUS
+- PnlR
+- MFE / MAE
+Required fix:
+Implement:
+- SignalOutcome model
+- OutcomeEvaluator
+- signal_outcomes persistence
+Acceptance gate:
+Open signals are periodically evaluated until resolved or expired.
+
+---------------------------------------------------------------------
+ISSUE U-13
+Severity: HIGH
+Title: No B-07 parameterization or parameter persistence
+Observed behavior:
+No StrategyParameters, no parameter repository, no active/candidate lifecycle, no activation history.
+Why this is wrong:
+This fails B07-1 entirely.
+Required behavior:
+All strategy thresholds must be externalized into a versioned parameter set.
+Required fix:
+Implement:
+- StrategyParameters.cs
+- StrategyParameterSet.cs
+- strategy_parameter_sets table
+- parameter_activation_history table
+- repository + provider
+Acceptance gate:
+Runtime reads active parameters from DB-backed provider instead of hardcoded thresholds.
+
+---------------------------------------------------------------------
+ISSUE U-14
+Severity: HIGH
+Title: No historical replay engine
+Observed behavior:
+No replay models or runtime exist.
+Why this is wrong:
+This fails B07-2 and prevents causal historical rebuild and optimizer input generation.
+Required behavior:
+Implement replay of closed 1m candles through the same domain logic as live runtime.
+Required fix:
+Add:
+- ReplayRun model
+- replay_runs table
+- HistoricalReplayService
+- checkpointing and progress tracking
+Acceptance gate:
+Replay run can rebuild indicators, regime, signals, and outcomes for a specified historical window.
+
+---------------------------------------------------------------------
+ISSUE U-15
+Severity: HIGH
+Title: No optimizer implementation
+Observed behavior:
+No optimizer models or service exist.
+Why this is wrong:
+This fails B07-3/4.
+Required behavior:
+Implement walk-forward optimization using replay runs, composite objective, hard filters, and candidate persistence.
+Required fix:
+Add:
+- OptimizerRun / OptimizerCandidate / OptimizerCandidateFold / ReplayMetrics
+- optimizer_* tables
+- OptimizerService
+Acceptance gate:
+Optimizer can generate candidate parameter sets, evaluate folds, rank candidates, and persist the best candidate.
+
+---------------------------------------------------------------------
+ISSUE U-16
+Severity: HIGH
+Title: No dashboard and no web API
+Observed behavior:
+The uploaded package is a console application only.
+Why this is wrong:
+The SRS explicitly requires an HTML/JavaScript/Bootstrap dashboard showing:
+- live quote
+- indicators
+- regime
+- latest signal
+- signal history
+- performance summary
+Required behavior:
+Provide a web project with REST APIs and static assets.
+Required fix:
+Add a web project with:
+- /api/quote/current
+- /api/candles
+- /api/indicators/current
+- /api/regime/current
+- /api/signals/latest
+- /api/signals/history
+- /api/performance/summary
+and the Bootstrap dashboard.
+Acceptance gate:
+Dashboard loads and binds correctly to live and historical data.
+
+---------------------------------------------------------------------
+ISSUE U-17
+Severity: HIGH
+Title: No logs or CSV exports were included, so runtime and data correctness cannot be validated
+Observed behavior:
+The ZIP does not include logs or DB exports, despite the request text saying they are present.
+Why this matters:
+A trading-system audit requires runtime proof, not only source code.
+Required behavior:
+Audit package should include:
+- application logs
+- exported tables as CSV
+- test output
+Required fix:
+Package these artifacts in the next upload.
+Acceptance gate:
+A future audit can compare code, logs, and database rows consistently.
+
+---------------------------------------------------------------------
+ISSUE U-18
+Severity: MEDIUM
+Title: CapitalClient sentiment failures are swallowed silently
+Location:
+- ETH_G/Apis/CapitalClient.cs lines 103-117
+Observed behavior:
+Any failure returns 0/0 sentiment with no logging or differentiation.
+Why this is wrong:
+This masks API/path mapping issues and can hide invalid marketId usage.
+Required behavior:
+Log the error and preserve last known good sentiment instead of silently zeroing it.
+Required fix:
+Return previous sentiment on failure and emit structured warning log.
+
+---------------------------------------------------------------------
+ISSUE U-19
+Severity: MEDIUM
+Title: Spot price timestamp is modeled as string instead of DateTimeOffset
+Location:
+- ETH_G/Apis/CapitalClient.cs line 65
+- public record SpotPrice line 235
+Observed behavior:
+SpotPrice stores UpdatedAt as string.
+Why this is wrong:
+This prevents robust time comparisons and data freshness checks.
+Required behavior:
+Use DateTimeOffset for source timestamps.
+Required fix:
+Change SpotPrice to use a typed timestamp and parse once in the API client.
+
+---------------------------------------------------------------------
+ISSUE U-20
+Severity: MEDIUM
+Title: Base URL defaults are inconsistent between code and run script
+Location:
+- ETH_G/Program.cs line 5
+- run.sh line 3
+Observed behavior:
+Program defaults to demo API base URL while the run script sets the live API base URL.
+Why this is risky:
+The environment can unintentionally switch between demo and live modes.
+Required behavior:
+Use explicit environment selection and log it clearly at startup.
+Required fix:
+Add APP_ENV or CAPITAL_MODE and validate intended endpoint.
+
+---------------------------------------------------------------------
+ISSUE U-21
+Severity: MEDIUM
+Title: Repository and project package contain build outputs and local metadata
+Observed behavior:
+The ZIP includes bin/, obj/, .DS_Store, and .claude local settings.
+Why this is wrong:
+This adds noise, risks stale binary confusion, and may leak local tooling configuration.
+Required behavior:
+Upload source-only package or a clean release artifact plus source separately.
+Required fix:
+Exclude build outputs and local metadata from audit bundles.
+
+---------------------------------------------------------------------
+ISSUE U-22
+Severity: MEDIUM
+Title: No structured logging, health checks, or fail-fast background behavior
+Observed behavior:
+The console app writes directly to stdout and has no structured logging or service health model.
+Why this is wrong:
+The previous audit required better operational visibility and fail-fast semantics.
+Required behavior:
+Add structured logs, health state, and explicit failure policy.
+Required fix:
+Move to a hosted service / web process with logging framework and health endpoint.
+
+=====================================================================
+4. DASHBOARD / PERFORMANCE / DATA BINDING REVIEW
+=====================================================================
+
+Result: NOT REVIEWABLE FROM THIS PACKAGE
+Reason:
+- no dashboard assets in uploaded ZIP
+- no web API project in uploaded ZIP
+- no runtime logs in uploaded ZIP
+- no CSV exports in uploaded ZIP
+Therefore the following could not be validated:
+- dashboard functionality
+- data binding correctness
+- live refresh behavior
+- chart rendering
+- performance widgets
+- DB-to-UI consistency
+
+=====================================================================
+5. DATABASE STRUCTURE REVIEW
+=====================================================================
+
+Result: NON-COMPLIANT
+Observed schema in code only creates candles tables with these columns:
+- symbol
+- datetime
+- open
+- high
+- low
+- close
+- volume
+- buyer_pct
+- seller_pct
+- is_closed
+Missing required tables include:
+- ingestion_audit
+- gap_events
+- indicator_snapshots
+- regime_snapshots
+- signals
+- signal_features
+- signal_outcomes
+- strategy_parameter_sets
+- parameter_activation_history
+- replay_runs
+- optimizer_runs
+- optimizer_candidates
+- optimizer_candidate_folds
+Therefore the database structure does not support the required product behavior.
+
+=====================================================================
+6. REQUIRED REBUILD ORDER FROM THIS PACKAGE STATE
+=====================================================================
+
+Because the uploaded package is so far behind the target SRS, the safest path is:
+
+Phase R1: Security and packaging cleanup
+- remove secrets from run.sh
+- remove bin/ obj/ .DS_Store local files from package
+- stop destructive startup behavior
+Gate:
+- no secrets in repo
+- no drop/truncate on startup
+
+Phase R2: Data layer rebuild
+- replace simple candle schema with rich schema
+- add migrations
+- persist source/received timestamps
+Gate:
+- restart preserves data
+- candles have provenance
+
+Phase R3: Correct market data pipeline
+- build only 1m from live spot
+- derive 5m/15m from closed 1m
+- fix rollover using previous tick
+Gate:
+- 5m exactly matches aggregated 1m
+- no next-bucket-close contamination
+
+Phase R4: Strategy layer
+- implement indicators
+- implement regime
+- implement signal engine
+- implement risk manager
+Gate:
+- signals appear in DB on valid setups
+
+Phase R5: Evaluation and learning
+- signal_features
+- signal_outcomes
+- outcome evaluator
+Gate:
+- signals resolve correctly over time
+
+Phase R6: B-07 architecture
+- parameterization
+- replay
+- optimizer
+- activation workflow
+Gate:
+- active parameter set can be swapped without code changes
+- replay and optimizer persist runs and results
+
+Phase R7: Web platform
+- APIs
+- dashboard
+- health
+- admin controls
+Gate:
+- dashboard reflects live and persisted state correctly
+
+=====================================================================
+7. FINAL JUDGMENT
+=====================================================================
+
+7.1 On the question "does the uploaded package satisfy the follow-up audit and B-07 SRS?"
+Answer: No.
+
+7.2 On the question "why?"
+Because the uploaded package is not the B-07 codebase.
+It is an earlier candle-ingestion prototype and still contains several of the original critical defects.
+
+7.3 On the question "what should happen next?"
+The correct codebase must be packaged and uploaded.
+If the current ZIP is intentionally the latest source, then the project must be rebuilt phase-by-phase according to the rebuild order above because the required strategy platform has not yet been implemented in this package.

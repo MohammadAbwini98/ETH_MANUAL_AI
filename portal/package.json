@@ -1,0 +1,9 @@
+{
+  "name": "signal-portal",
+  "version": "1.0.0",
+  "main": "server.js",
+  "dependencies": {
+    "express": "^4.18.0",
+    "pg": "^8.20.0"
+  }
+}

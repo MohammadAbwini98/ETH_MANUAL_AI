@@ -1,0 +1,1123 @@
+SOFTWARE REQUIREMENTS SPECIFICATION (SRS)
+Project: ETHUSD Scalping Signal and Monitoring Platform
+Document Version: 1.0
+Date: 2026-03-25
+Target Stack: ASP.NET, PostgreSQL, HTML, JavaScript, Bootstrap
+Primary Market Data Provider: Capital.com API
+Primary Instrument: ETHUSD
+Primary Operating Timeframes: 5-minute and 15-minute
+
+====================================================================
+1. PURPOSE
+====================================================================
+This document defines the software requirements for an ETHUSD scalping signal platform that:
+1. Collects and stores market data from Capital.com.
+2. Builds reliable 1m, 5m, and 15m candles.
+3. Calculates technical indicators and market state.
+4. Produces trading recommendations in the format:
+   - Timeframe: 5M/15M
+   - Direction: BUY / SELL / NO_TRADE
+   - Entry Price
+   - Take Profit (TP)
+   - Stop Loss (SL)
+   - Risk
+5. Stores all indicator snapshots, signals, and outcomes in PostgreSQL.
+6. Learns from historical signal performance by evaluating outcomes and tuning rule weights.
+7. Displays a real-time dashboard showing ETHUSD live price, indicators, signal recommendations, and analytics.
+
+The system is intended to generate recommendations, not execute trades automatically in phase 1. Full auto-execution is out of scope unless explicitly added in a later version.
+
+====================================================================
+2. SCOPE
+====================================================================
+The system shall support:
+- Historical candle ingestion from Capital.com.
+- Live quote streaming or near-real-time polling.
+- Candle construction and validation.
+- Technical indicator computation on closed candles.
+- Rule-based market bias analysis on 15m timeframe.
+- Rule-based entry signal generation on 5m timeframe.
+- Risk management and signal output generation.
+- Signal persistence and performance tracking.
+- A browser dashboard built with HTML, JavaScript, and Bootstrap.
+- Statistical review of historical recommendations to improve future signal quality.
+
+Out of scope for the first release:
+- Automated order placement.
+- Portfolio management across multiple instruments.
+- Deep learning forecasting.
+- Mobile app.
+
+====================================================================
+3. DEFINITIONS
+====================================================================
+Candle:
+A market bar containing Open, High, Low, Close, and Volume values for a given timeframe.
+
+Closed Candle:
+A candle whose time interval has completed and whose OHLC values should no longer change.
+
+Bias:
+A directional context derived from higher timeframe market analysis. Valid values: BULLISH, BEARISH, NEUTRAL.
+
+Signal:
+A recommendation derived from defined trading rules. Valid values: BUY, SELL, NO_TRADE.
+
+ATR:
+Average True Range.
+
+ADX:
+Average Directional Index.
+
+VWAP:
+Volume Weighted Average Price.
+
+R:
+The risk unit of a trade. If stop loss distance equals 1R, then TP at 1.5R means profit target distance equals 1.5 times stop distance.
+
+MFE:
+Maximum Favorable Excursion.
+
+MAE:
+Maximum Adverse Excursion.
+
+====================================================================
+4. HIGH-LEVEL OBJECTIVES
+====================================================================
+The system shall:
+- Maintain clean and validated market data.
+- Produce reproducible and explainable trading recommendations.
+- Avoid signal generation when market conditions are poor.
+- Enforce risk controls suitable for a small account balance.
+- Provide auditable signal history with reasons and feature values.
+- Improve signal quality over time through performance review.
+
+====================================================================
+5. ARCHITECTURE OVERVIEW
+====================================================================
+The application shall be structured into the following logical layers:
+
+5.1 Infrastructure Layer
+- Capital.com REST client
+- Capital.com WebSocket client if available for live prices
+- PostgreSQL repositories
+- Logging and configuration providers
+
+5.2 Domain Layer
+- Candle entity
+- Quote entity
+- IndicatorSnapshot entity
+- SignalRecommendation entity
+- RiskPolicy entity
+- SignalOutcome entity
+
+5.3 Application Layer
+- Candle ingestion service
+- Candle aggregation service
+- Data integrity validator
+- Indicator calculation service
+- Market regime analyzer
+- Signal generation engine
+- Risk manager
+- Signal evaluation service
+- Statistics and learning service
+
+5.4 Presentation Layer
+- ASP.NET Web API
+- Live dashboard using HTML, JavaScript, Bootstrap
+- Optional SignalR hub for push updates
+
+====================================================================
+6. EXTERNAL INTEGRATIONS
+====================================================================
+6.1 Capital.com API
+The system shall consume:
+- Historical price endpoints for candles.
+- Quote or price endpoints for live updates.
+- Optional sentiment endpoint if instrument mapping is validated.
+
+6.2 PostgreSQL
+The system shall persist:
+- Raw candles
+- Aggregated candles
+- Indicator snapshots
+- Signals
+- Signal outcomes
+- Signal features
+- System logs / audit records (optional but recommended)
+
+====================================================================
+7. FUNCTIONAL REQUIREMENTS BY PHASE
+====================================================================
+Each phase must be completed and tested before the next phase begins. No phase may proceed until all blocking tests in the previous phase pass.
+
+--------------------------------------------------------------------
+PHASE 1 - MARKET DATA INGESTION AND DATA INTEGRITY
+--------------------------------------------------------------------
+Objective:
+Build a trustworthy data foundation for all future analytics and signals.
+
+7.1.1 Requirements
+The system shall:
+1. Authenticate against Capital.com using configured credentials.
+2. Fetch historical ETHUSD candles for at least 1m, 5m, and 15m resolutions where available.
+3. If only 1m candles are fetched, aggregate 5m and 15m candles from 1m candles.
+4. Store candles in PostgreSQL without dropping or truncating historical data on startup.
+5. Mark whether a candle is closed or still forming.
+6. Persist bid, ask, and mid prices if supported by source responses.
+7. Capture source timestamp and system receive timestamp.
+8. Support incremental backfill without creating duplicates.
+9. Validate continuity and OHLC correctness before candles are marked usable.
+
+7.1.2 Candle Construction Rules
+For a candle C over interval [t_open, t_close):
+- Open = first price observed in interval
+- High = max(price_i)
+- Low = min(price_i)
+- Close = last price observed in interval
+- Volume = sum(volume_i) where available
+
+For aggregation from lower timeframe candles:
+Let a target candle be built from n source candles.
+- O_target = O_1
+- H_target = max(H_1 ... H_n)
+- L_target = min(L_1 ... L_n)
+- C_target = C_n
+- V_target = sum(V_1 ... V_n)
+
+7.1.3 Time Alignment
+The system shall floor timestamps to the timeframe boundary.
+Examples:
+- 10:03:12 UTC on 5m timeframe belongs to candle open 10:00:00 UTC.
+- 10:14:59 UTC on 15m timeframe belongs to candle open 10:00:00 UTC.
+- 10:15:00 UTC starts new 15m candle.
+
+Mathematical definition:
+Let T be the timeframe in minutes.
+Let ts be Unix timestamp in minutes or seconds.
+Then:
+open_time = floor(ts / T) * T
+
+7.1.4 Data Integrity Rules
+Each stored candle must satisfy:
+- Low <= Open <= High
+- Low <= Close <= High
+- High >= Low
+- OpenTime unique per symbol + timeframe
+- No missing 1m intervals in validated ranges unless gap explicitly recorded
+- Aggregated 5m candle must match its 5 source 1m candles exactly
+- Aggregated 15m candle must match its 15 source 1m candles exactly
+
+7.1.5 Database Requirements
+Suggested tables:
+- candles_1m
+- candles_5m
+- candles_15m
+- ingestion_audit
+- gap_events
+
+Each candle table shall include at minimum:
+- id
+- symbol
+- timeframe
+- open_time_utc
+- open_bid
+- high_bid
+- low_bid
+- close_bid
+- open_ask
+- high_ask
+- low_ask
+- close_ask
+- open_mid
+- high_mid
+- low_mid
+- close_mid
+- volume
+- is_closed
+- source_timestamp_utc
+- received_timestamp_utc
+- created_at_utc
+- updated_at_utc
+
+Unique index:
+(symbol, timeframe, open_time_utc)
+
+7.1.6 Non-Functional Requirements
+- Historical import shall be restart-safe.
+- The service shall tolerate transient network failures and retry.
+- The service shall not corrupt prior candles.
+- Logging must capture request failures and incomplete batches.
+
+7.1.7 Phase 1 Test Plan (Mandatory Gate)
+Test P1-T1: Historical fetch correctness
+- Fetch a known time range from Capital.com.
+- Verify count of returned candles matches expected number for that interval.
+Pass condition: Count matches expected or API-documented availability limits.
+
+Test P1-T2: Duplicate prevention
+- Run same backfill twice.
+Pass condition: Row counts remain unchanged after second run.
+
+Test P1-T3: OHLC validity
+- Scan all inserted rows.
+Pass condition: 100 percent of rows satisfy OHLC inequalities.
+
+Test P1-T4: Time bucket correctness
+- Check sample timestamps near timeframe boundaries.
+Pass condition: Every record is assigned to the correct bucket.
+
+Test P1-T5: Aggregation accuracy
+- For 20 random 5m candles and 20 random 15m candles, recompute from 1m source candles.
+Pass condition: Exact match in O, H, L, C, V.
+
+Test P1-T6: Live rollover correctness
+- Simulate tick sequence over candle boundary.
+Pass condition: Closed candle uses the last price before boundary, not first price after boundary.
+
+Blocking rule:
+Phase 2 cannot begin until all P1 tests pass.
+
+--------------------------------------------------------------------
+PHASE 2 - INDICATOR ENGINE AND MARKET STATE MODEL
+--------------------------------------------------------------------
+Objective:
+Compute reliable indicators on validated closed candles only.
+
+7.2.1 Requirements
+The system shall:
+1. Compute indicators for 5m and 15m candles.
+2. Never compute final signal indicators from incomplete candles unless explicitly marked provisional.
+3. Persist indicator snapshots with timestamp, symbol, timeframe, and source candle time.
+4. Support re-calculation of indicators for historical backtests.
+
+7.2.2 Required Indicators
+The system shall implement at minimum:
+- EMA(20)
+- EMA(50)
+- RSI(14)
+- MACD(12, 26, 9)
+- ATR(14)
+- ADX(14)
+- Volume SMA(20)
+- VWAP (session-based or rolling definition must be specified and consistent)
+- Spread
+
+7.2.3 Indicator Equations
+A. Exponential Moving Average (EMA)
+For period N:
+alpha = 2 / (N + 1)
+EMA_t = alpha * Price_t + (1 - alpha) * EMA_(t-1)
+Seed may be initialized using SMA(N) or first close; implementation must be documented and consistent.
+
+B. Relative Strength Index (RSI)
+For period N = 14:
+Gain_t = max(Close_t - Close_(t-1), 0)
+Loss_t = max(Close_(t-1) - Close_t, 0)
+AvgGain_t = Wilder smoothing of Gain
+AvgLoss_t = Wilder smoothing of Loss
+RS_t = AvgGain_t / AvgLoss_t
+RSI_t = 100 - (100 / (1 + RS_t))
+If AvgLoss_t = 0, RSI_t = 100.
+
+C. MACD
+MACD_t = EMA_12(Close_t) - EMA_26(Close_t)
+Signal_t = EMA_9(MACD_t)
+Histogram_t = MACD_t - Signal_t
+
+D. True Range (TR)
+TR_t = max(
+  High_t - Low_t,
+  abs(High_t - Close_(t-1)),
+  abs(Low_t - Close_(t-1))
+)
+
+E. ATR(14)
+ATR_t = Wilder smoothing of TR over 14 periods.
+
+F. Directional Movement and ADX
++DM_t = High_t - High_(t-1) if this value > Low_(t-1) - Low_t and > 0 else 0
+-DM_t = Low_(t-1) - Low_t if this value > High_t - High_(t-1) and > 0 else 0
+
+Smoothed +DM and -DM shall use Wilder smoothing.
++DI_t = 100 * (Smoothed +DM / ATR_t)
+-DI_t = 100 * (Smoothed -DM / ATR_t)
+DX_t = 100 * abs(+DI_t - -DI_t) / (+DI_t + -DI_t)
+ADX_t = Wilder smoothing of DX over 14 periods
+
+G. VWAP
+For a defined session or rolling window:
+VWAP_t = sum(Price_i * Volume_i) / sum(Volume_i)
+Where Price_i may be typical price:
+TypicalPrice_i = (High_i + Low_i + Close_i) / 3
+Implementation must define whether VWAP resets daily UTC or uses a rolling window.
+
+H. Spread
+Spread_t = Ask_t - Bid_t
+SpreadPct_t = Spread_t / Mid_t
+
+7.2.4 Output Requirements
+The system shall produce one indicator snapshot per closed candle per timeframe.
+Each indicator snapshot shall include:
+- symbol
+- timeframe
+- candle_open_time_utc
+- ema20
+- ema50
+- rsi14
+- macd
+- macd_signal
+- macd_hist
+- atr14
+- adx14
+- plus_di
+- minus_di
+- volume_sma20
+- vwap
+- spread
+- close_mid
+
+7.2.5 Phase 2 Test Plan (Mandatory Gate)
+Test P2-T1: EMA verification
+- Compare calculated EMA values against independently computed reference values from a test dataset.
+Pass condition: Difference below tolerance epsilon = 1e-8 or exact decimal tolerance chosen by implementation.
+
+Test P2-T2: RSI verification
+- Use known dataset and manually validated results.
+Pass condition: Values match expected within tolerance.
+
+Test P2-T3: MACD verification
+- Compare against reference implementation.
+Pass condition: Values match within tolerance.
+
+Test P2-T4: ATR and ADX verification
+- Compare against offline benchmark script.
+Pass condition: Values match within tolerance.
+
+Test P2-T5: Closed-candle policy
+- Simulate live forming candle.
+Pass condition: Indicator engine does not mark incomplete-candle values as final.
+
+Blocking rule:
+Phase 3 cannot begin until all P2 tests pass.
+
+--------------------------------------------------------------------
+PHASE 3 - MARKET REGIME FILTER (15M CONTEXT)
+--------------------------------------------------------------------
+Objective:
+Decide whether the higher timeframe context supports BUY, SELL, or NO_TRADE conditions.
+
+7.3.1 Requirements
+The system shall classify the 15m market regime into:
+- BULLISH
+- BEARISH
+- NEUTRAL
+
+7.3.2 Regime Rules
+Initial regime logic shall be rule-based:
+
+Bullish regime candidate if all are true:
+- EMA20_15m > EMA50_15m
+- Slope(EMA20_15m) > 0
+- Close_15m > VWAP_15m
+- ADX_15m >= 18
+- +DI_15m > -DI_15m
+
+Bearish regime candidate if all are true:
+- EMA20_15m < EMA50_15m
+- Slope(EMA20_15m) < 0
+- Close_15m < VWAP_15m
+- ADX_15m >= 18
+- -DI_15m > +DI_15m
+
+Else:
+- NEUTRAL
+
+7.3.3 Slope Definition
+Let X_t be an indicator value.
+A simple slope over k candles may be defined as:
+Slope_k(X_t) = (X_t - X_(t-k)) / k
+Initial implementation:
+- k = 3 candles
+
+7.3.4 Optional Market Structure Filter
+The system may additionally classify swing structure:
+- Higher highs and higher lows support bullish regime.
+- Lower highs and lower lows support bearish regime.
+This feature shall be optional in initial delivery if deterministic implementation is delayed.
+
+7.3.5 Regime Output
+Each 15m candle close shall produce:
+- regime
+- regime_score
+- triggered_conditions list
+- disqualifying_conditions list
+
+7.3.6 Phase 3 Test Plan (Mandatory Gate)
+Test P3-T1: Bullish classification
+- Feed sample bullish dataset.
+Pass condition: Regime = BULLISH.
+
+Test P3-T2: Bearish classification
+- Feed sample bearish dataset.
+Pass condition: Regime = BEARISH.
+
+Test P3-T3: Range classification
+- Feed sideways low-ADX dataset.
+Pass condition: Regime = NEUTRAL.
+
+Test P3-T4: Threshold boundary behavior
+- Test ADX around 18 and EMA equality cases.
+Pass condition: Output respects exact rule definitions.
+
+Blocking rule:
+Phase 4 cannot begin until all P3 tests pass.
+
+--------------------------------------------------------------------
+PHASE 4 - 5M ENTRY SIGNAL ENGINE
+--------------------------------------------------------------------
+Objective:
+Generate BUY, SELL, or NO_TRADE recommendations using 5m execution logic aligned with 15m regime.
+
+7.4.1 Requirements
+The system shall:
+1. Only allow BUY candidates when 15m regime = BULLISH.
+2. Only allow SELL candidates when 15m regime = BEARISH.
+3. Return NO_TRADE when regime = NEUTRAL.
+4. Use closed 5m candle data for final signal generation.
+5. Output reasons explaining why a signal was produced.
+
+7.4.2 Initial BUY Rules
+BUY setup shall require all mandatory conditions:
+Mandatory:
+- 15m regime = BULLISH
+- Close_5m > EMA20_5m after recent pullback OR close reclaims EMA20_5m
+- RSI_5m in recovery zone, e.g. rising from 40 to 55 or crossing above a configured threshold
+- MACD histogram improving or MACD crossing above signal
+- Spread below configured threshold
+
+At least one confirmation condition:
+- Volume_5m > 1.2 * VolumeSMA20_5m
+- Close_5m > VWAP_5m
+- Bullish candle body ratio above threshold
+
+7.4.3 Initial SELL Rules
+SELL setup shall mirror BUY logic:
+Mandatory:
+- 15m regime = BEARISH
+- Close_5m < EMA20_5m after recent pullback OR close falls back below EMA20_5m
+- RSI_5m in downward recovery/rejection zone
+- MACD histogram weakening or MACD crossing below signal
+- Spread below configured threshold
+
+At least one confirmation condition:
+- Volume_5m > 1.2 * VolumeSMA20_5m
+- Close_5m < VWAP_5m
+- Bearish candle body ratio above threshold
+
+7.4.4 Candle Body Ratio
+For a candle:
+Body = abs(Close - Open)
+Range = High - Low
+BodyRatio = Body / Range
+If Range = 0 then BodyRatio = 0.
+
+7.4.5 Signal Scoring
+The system shall compute a score from 0 to 100.
+Initial default weights:
+- Regime alignment: 20
+- EMA condition: 15
+- RSI condition: 15
+- MACD condition: 15
+- ADX strength: 10
+- VWAP alignment: 10
+- Volume confirmation: 10
+- Spread quality: 5
+
+TotalScore = sum(weight_i * passed_i)
+Where passed_i is 1 if condition satisfied, else 0.
+
+Initial mapping:
+- Score >= 70 => actionable BUY or SELL
+- Score 55 to 69 => weak setup, default NO_TRADE unless explicitly configured otherwise
+- Score < 55 => NO_TRADE
+
+7.4.6 Signal Output Schema
+Each recommendation shall include:
+- signal_id
+- symbol
+- timeframe
+- signal_time_utc
+- direction
+- entry_price
+- tp_price
+- sl_price
+- risk_percent
+- risk_usd
+- confidence_score
+- reasons_json
+- strategy_version
+- status
+
+7.4.7 Phase 4 Test Plan (Mandatory Gate)
+Test P4-T1: BUY generation
+- Input bullish regime + valid 5m setup.
+Pass condition: BUY output with score >= threshold.
+
+Test P4-T2: SELL generation
+- Input bearish regime + valid 5m setup.
+Pass condition: SELL output with score >= threshold.
+
+Test P4-T3: Regime block
+- Input neutral regime + otherwise valid 5m features.
+Pass condition: NO_TRADE.
+
+Test P4-T4: Weak score block
+- Input partial conditions only.
+Pass condition: NO_TRADE.
+
+Test P4-T5: Explainability
+- Verify reasons_json includes satisfied and failed key conditions.
+Pass condition: Output is auditable and understandable.
+
+Blocking rule:
+Phase 5 cannot begin until all P4 tests pass.
+
+--------------------------------------------------------------------
+PHASE 5 - RISK MANAGEMENT AND PRICE TARGETS
+--------------------------------------------------------------------
+Objective:
+Convert raw directional setups into practical recommendations with Entry, TP, SL, and risk sizing.
+
+7.5.1 Requirements
+The system shall apply risk rules suitable for a small account.
+Initial balance assumption:
+- account_balance_usd = 50.00
+
+Default risk policy:
+- risk_percent_per_trade = 0.5 percent
+- hard_max_risk_percent = 1.0 percent
+- daily_max_drawdown_percent = 2.0 percent
+- max_consecutive_losses_per_day = 2
+- max_open_positions = 1 for future execution mode
+
+7.5.2 Risk Equations
+A. Risk amount in USD
+RiskUsd = AccountBalanceUsd * RiskPercent / 100
+
+For 50 USD and 0.5 percent risk:
+RiskUsd = 50 * 0.5 / 100 = 0.25 USD
+
+B. Stop distance
+For BUY:
+StopDistance = max(ATRMultiplier * ATR_5m, EntryPrice - SwingLow)
+For SELL:
+StopDistance = max(ATRMultiplier * ATR_5m, SwingHigh - EntryPrice)
+
+Initial ATRMultiplier = 0.8
+A minimum stop distance threshold may be applied to avoid unrealistically tight stops.
+
+C. Stop Loss
+BUY:
+SL = EntryPrice - StopDistance
+SELL:
+SL = EntryPrice + StopDistance
+
+D. Take Profit
+TPDistance = RewardToRisk * StopDistance
+Initial RewardToRisk = 1.5
+
+BUY:
+TP = EntryPrice + TPDistance
+SELL:
+TP = EntryPrice - TPDistance
+
+E. Position size (if execution is added later)
+PositionSize = RiskUsd / StopDistance
+This value must later be adjusted for contract specification, lot size, and broker minimums.
+
+7.5.3 Additional Trading Safeguards
+The system shall return NO_TRADE if:
+- SpreadPct exceeds configured maximum.
+- ATR is below a configured minimum volatility threshold.
+- Risk-reward after rounding becomes less than 1.2R.
+- Signal occurs during excluded low-liquidity windows if such windows are configured.
+
+7.5.4 Phase 5 Test Plan (Mandatory Gate)
+Test P5-T1: Risk calculation
+- Use fixed account balance and risk percent.
+Pass condition: RiskUsd computed correctly.
+
+Test P5-T2: BUY SL/TP computation
+- Use test entry, ATR, and swing low values.
+Pass condition: SL and TP match formula exactly.
+
+Test P5-T3: SELL SL/TP computation
+- Use test entry, ATR, and swing high values.
+Pass condition: SL and TP match formula exactly.
+
+Test P5-T4: Safety block
+- Use excessive spread and low ATR case.
+Pass condition: NO_TRADE.
+
+Blocking rule:
+Phase 6 cannot begin until all P5 tests pass.
+
+--------------------------------------------------------------------
+PHASE 6 - SIGNAL STORAGE, OUTCOME TRACKING, AND ANALYTICS
+--------------------------------------------------------------------
+Objective:
+Persist every recommendation and measure its performance.
+
+7.6.1 Requirements
+The system shall store:
+- signal metadata
+- indicator snapshot at signal time
+- feature values used by scoring
+- eventual trade outcome label
+- performance metrics such as MFE, MAE, PnL in R, and hit result
+
+7.6.2 Database Tables
+Minimum tables:
+- signals
+- signal_features
+- signal_outcomes
+- indicator_snapshots
+
+signals fields:
+- signal_id
+- symbol
+- timeframe
+- signal_time_utc
+- direction
+- entry_price
+- tp_price
+- sl_price
+- risk_percent
+- risk_usd
+- confidence_score
+- regime
+- strategy_version
+- reasons_json
+- status
+- created_at_utc
+
+signal_features fields:
+- signal_id
+- feature_name
+- feature_value_numeric
+- feature_value_text
+
+signal_outcomes fields:
+- signal_id
+- evaluated_at_utc
+- bars_observed
+- tp_hit
+- sl_hit
+- outcome_label
+- pnl_r
+- mfe_price
+- mae_price
+- mfe_r
+- mae_r
+- closed_at_utc
+
+7.6.3 Outcome Evaluation Logic
+For each signal, the system shall evaluate future candles in sequence.
+For BUY:
+- If price reaches TP before SL, outcome = WIN
+- If price reaches SL before TP, outcome = LOSS
+- Else if timeout_bars reached, outcome = EXPIRED
+
+For SELL:
+- Inverse logic
+
+If both TP and SL are touched in the same candle and only OHLC is available, tie-break policy must be explicit. Recommended options:
+Option A: Conservative assumption against the strategy.
+Option B: Mark as ambiguous.
+Initial recommendation: mark as ambiguous for research mode, conservative for live score reporting.
+
+7.6.4 Performance Equations
+For BUY:
+MFE = max(FutureHigh_i - EntryPrice)
+MAE = max(EntryPrice - FutureLow_i)
+
+For SELL:
+MFE = max(EntryPrice - FutureLow_i)
+MAE = max(FutureHigh_i - EntryPrice)
+
+PnL in R:
+PnL_R = RealizedPnL / StopDistance
+
+WinRate = Wins / TotalResolvedSignals
+AverageR = sum(PnL_R) / TotalResolvedSignals
+ProfitFactor = SumPositivePnL / abs(SumNegativePnL)
+
+7.6.5 Phase 6 Test Plan (Mandatory Gate)
+Test P6-T1: Signal persistence
+- Generate a sample signal.
+Pass condition: Signal, features, and indicator snapshot rows inserted.
+
+Test P6-T2: Win outcome evaluation
+- Feed future candles touching TP first.
+Pass condition: Outcome = WIN.
+
+Test P6-T3: Loss outcome evaluation
+- Feed future candles touching SL first.
+Pass condition: Outcome = LOSS.
+
+Test P6-T4: Analytics computation
+- Insert known outcomes.
+Pass condition: WinRate, AverageR, and ProfitFactor match manual calculations.
+
+Blocking rule:
+Phase 7 cannot begin until all P6 tests pass.
+
+--------------------------------------------------------------------
+PHASE 7 - ADAPTIVE IMPROVEMENT / SMARTER SIGNAL QUALITY
+--------------------------------------------------------------------
+Objective:
+Increase recommendation quality over time using stored history.
+
+7.7.1 Requirements
+The first implementation of "smartness" shall be statistical and explainable, not black-box.
+The system shall:
+1. Analyze historical signal performance by feature and condition.
+2. Recompute feature weights offline.
+3. Version all strategy configurations.
+4. Keep old signals reproducible under the strategy version that generated them.
+
+7.7.2 Adaptive Learning Approach
+Initial approach shall use one or both of the following:
+A. Weighted rule optimization
+- Compare win rate and average R across bins of feature values.
+- Increase or decrease weights according to observed predictive utility.
+
+B. Simple supervised model
+- Logistic regression or gradient boosted trees may be added later using exported historical features.
+- Model output should remain probability-like and explainable.
+
+7.7.3 Example Feature Set
+- regime_score
+- ema20_minus_ema50
+- ema20_slope
+- rsi14
+- macd_hist
+- adx14
+- plus_di_minus_minus_di
+- distance_to_vwap
+- volume_ratio = volume / volume_sma20
+- spread_pct
+- atr_pct = atr / close
+- body_ratio
+- session bucket / hour of day
+
+7.7.4 Reweighting Requirement
+Weight changes shall not happen automatically in production without review in version 1.
+Instead:
+- Generate proposed new weights.
+- Store them as draft strategy version.
+- Validate on out-of-sample historical data.
+- Promote manually if performance improves.
+
+7.7.5 Phase 7 Test Plan (Mandatory Gate)
+Test P7-T1: Historical export correctness
+- Export feature dataset from stored signals.
+Pass condition: All expected columns present and consistent.
+
+Test P7-T2: Draft weight generation
+- Run offline analysis.
+Pass condition: New draft strategy version produced.
+
+Test P7-T3: Reproducibility
+- Recompute old signal with old version.
+Pass condition: Same output as original.
+
+Blocking rule:
+Phase 8 cannot begin until all P7 tests pass.
+
+--------------------------------------------------------------------
+PHASE 8 - DASHBOARD AND OPERATOR INTERFACE
+--------------------------------------------------------------------
+Objective:
+Provide a web dashboard for monitoring market state, indicators, recommendations, and performance.
+
+7.8.1 Requirements
+The dashboard shall be built using:
+- HTML5
+- JavaScript
+- Bootstrap 5
+
+Recommended libraries:
+- Chart.js or Lightweight Charts for candles
+- SignalR for live updates
+- Fetch API or Axios for API calls
+
+7.8.2 Dashboard Sections
+A. Live Quote Panel
+- ETHUSD bid, ask, mid
+- spread and spread percent
+- last update timestamp
+- optional tick direction indicator
+
+B. Price Charts
+- 5m candle chart with EMA20, EMA50, VWAP
+- 15m chart with trend/regime indicators
+- optional markers for generated signals
+
+C. Indicator Panel
+- current 5m values
+- current 15m values
+- regime label
+- confidence score
+
+D. Recommendation Card
+Fields:
+- Timeframe
+- Direction
+- Entry
+- TP
+- SL
+- Risk percent and USD
+- Confidence
+- Reasons
+
+E. Signal History Table
+- recent N signals
+- outcome status
+- confidence
+- strategy version
+- PnL in R when resolved
+
+F. Performance Summary
+- win rate
+- average R
+- profit factor
+- total resolved signals
+- last 7 days stats
+
+7.8.3 Backend API Requirements
+Minimum endpoints:
+- GET /api/quote/current
+- GET /api/candles?timeframe=5m&limit=200
+- GET /api/candles?timeframe=15m&limit=200
+- GET /api/indicators/current
+- GET /api/regime/current
+- GET /api/signals/latest
+- GET /api/signals/history?limit=50
+- GET /api/performance/summary
+- GET /api/performance/daily
+
+7.8.4 Performance Requirements
+- Live price panel refresh target <= 1 second when live stream available
+- Dashboard initial load <= 3 seconds under normal local deployment conditions
+- API responses for latest signal and current indicators <= 500 ms from local database
+
+7.8.5 UI Validation Rules
+- Direction colors should be consistent
+  - BUY = green
+  - SELL = red
+  - NO_TRADE = gray
+- Missing data must be displayed safely, not as broken UI
+- Timestamps must be UTC or explicitly converted and labeled
+
+7.8.6 Phase 8 Test Plan (Mandatory Gate)
+Test P8-T1: Endpoint availability
+Pass condition: All required endpoints return valid JSON.
+
+Test P8-T2: Chart rendering
+Pass condition: 5m and 15m charts render correctly with overlays.
+
+Test P8-T3: Live updates
+Pass condition: Quote panel refreshes continuously without page reload.
+
+Test P8-T4: Recommendation rendering
+Pass condition: Latest recommendation card displays all required fields.
+
+Test P8-T5: Historical table integrity
+Pass condition: Displayed rows match database contents.
+
+Blocking rule:
+Phase 9 cannot begin until all P8 tests pass.
+
+--------------------------------------------------------------------
+PHASE 9 - BACKTESTING, PAPER VALIDATION, AND RELEASE READINESS
+--------------------------------------------------------------------
+Objective:
+Validate strategy quality before any real capital usage.
+
+7.9.1 Requirements
+The system shall support:
+- Historical backtest mode using stored candles
+- Paper recommendation mode in live operation
+- Comparison between historical and live behavior
+
+7.9.2 Backtest Rules
+The backtest must:
+- Use only information available up to each candle close
+- Prevent look-ahead bias
+- Use the same indicator and scoring logic as live mode
+- Apply spread and stop/target rules consistently
+- Record outputs in the same signal schema
+
+7.9.3 Acceptance Targets (initial suggestions)
+These are project goals, not hard-coded truths. They may be refined later.
+- No critical data integrity errors
+- No candle rollover errors in live tests
+- Signal generation reproducible between historical and live modes
+- At least 100 paper signals collected before considering execution automation
+- Strategy performance reviewed over multiple market conditions
+
+7.9.4 Phase 9 Test Plan (Mandatory Gate)
+Test P9-T1: Look-ahead prevention
+Pass condition: Backtest output at candle t uses only data up to candle t.
+
+Test P9-T2: Historical/live parity
+Pass condition: Replaying historical data through live engine produces same signal set as direct backtest, allowing documented timing differences only.
+
+Test P9-T3: Stability
+Pass condition: System runs through full trading day without crash and without data corruption.
+
+Blocking rule:
+No execution automation may be developed until P9 tests pass and operator approval is granted.
+
+====================================================================
+8. NON-FUNCTIONAL REQUIREMENTS
+====================================================================
+8.1 Reliability
+- Services must recover from transient API failures.
+- Data writes must be idempotent where possible.
+- Logs must capture exceptions with enough context for diagnosis.
+
+8.2 Maintainability
+- Each service must have clear interfaces.
+- Indicator formulas and parameters must be configurable.
+- Strategy versions must be traceable.
+
+8.3 Performance
+- Indicator computation for a new closed candle should complete fast enough to issue a signal before the next candle matters.
+- Database queries for latest signal and current indicators should be indexed.
+
+8.4 Security
+- API keys must not be stored in source code.
+- Secrets must be loaded from secure configuration or environment variables.
+- Dashboard admin actions, if any, should require authentication.
+
+8.5 Observability
+- Structured logs for ingestion, indicator calculation, signal generation, and failures.
+- Health endpoint recommended:
+  - /health/live
+  - /health/ready
+
+====================================================================
+9. CONFIGURATION REQUIREMENTS
+====================================================================
+All major parameters shall be configurable, including:
+- instrument symbol
+- timeframe list
+- EMA periods
+- RSI period and thresholds
+- MACD periods
+- ATR period and multiplier
+- ADX threshold
+- VWAP mode
+- volume ratio threshold
+- spread max threshold
+- score weights
+- score action threshold
+- risk percent
+- daily drawdown limit
+- consecutive loss limit
+- excluded time windows
+- strategy_version
+
+====================================================================
+10. SUGGESTED PROJECT STRUCTURE
+====================================================================
+/src
+  /Domain
+    Candle.cs
+    Quote.cs
+    IndicatorSnapshot.cs
+    SignalRecommendation.cs
+    SignalOutcome.cs
+    RiskPolicy.cs
+
+  /Application
+    /Interfaces
+    /Services
+      HistoricalIngestionService.cs
+      LivePriceService.cs
+      CandleAggregationService.cs
+      IntegrityValidationService.cs
+      IndicatorCalculationService.cs
+      RegimeAnalysisService.cs
+      SignalScoringService.cs
+      RiskManagementService.cs
+      OutcomeEvaluationService.cs
+      PerformanceAnalyticsService.cs
+
+  /Infrastructure
+    CapitalComRestClient.cs
+    CapitalComWebSocketClient.cs
+    PostgresCandleRepository.cs
+    PostgresSignalRepository.cs
+    PostgresIndicatorRepository.cs
+    Logging
+
+  /Web
+    Controllers or Minimal APIs
+    SignalR hubs
+    wwwroot/
+      index.html
+      js/
+      css/
+
+  /Tests
+    Unit
+    Integration
+    EndToEnd
+
+====================================================================
+11. ACCEPTANCE CRITERIA SUMMARY
+====================================================================
+The overall system shall be considered acceptable for paper-signal release only if:
+1. Phase 1 through Phase 9 mandatory tests pass.
+2. Candle integrity is proven and reproducible.
+3. Indicator values are verified against reference calculations.
+4. Recommendations are explainable and stored with full context.
+5. Dashboard presents correct live and historical information.
+6. Historical and live engines behave consistently.
+7. No live money execution is enabled before paper validation is complete.
+
+====================================================================
+12. IMPLEMENTATION NOTES FOR CODE-GENERATING AGENTS
+====================================================================
+The code-generating agent (e.g., Codex) should follow these rules:
+1. Implement one phase at a time.
+2. Create automated tests for each phase before marking it complete.
+3. Do not skip data integrity tests.
+4. Do not use incomplete candles for final signal decisions unless explicitly labeled provisional.
+5. Use interfaces and dependency injection.
+6. Make formulas deterministic and document seed logic for indicators.
+7. Preserve historical data; never truncate production tables on startup.
+8. All scoring and risk parameters must be configurable.
+9. Store strategy version on every signal.
+10. Prefer clean, testable modules over large monolithic services.
+
+====================================================================
+13. FUTURE EXTENSIONS
+====================================================================
+Potential future enhancements:
+- Multi-instrument support
+- Broker order execution module
+- Walk-forward optimization
+- Auto-session analysis
+- News/event filters
+- Multi-timeframe confluence beyond 5m/15m
+- Machine learning ranking model with probability calibration
+
+====================================================================
+14. FINAL DELIVERY PRINCIPLE
+====================================================================
+The project must be built as a staged, test-gated trading recommendation platform. Accuracy improvements are allowed only after the base data and signal pipeline are proven correct. Data correctness is more important than signal quantity. No strategy optimization is valid if candle integrity, indicator correctness, or outcome labeling is unreliable.

@@ -1,0 +1,1338 @@
+ETHUSD SCALPING PLATFORM IMPLEMENTATION AUDIT AND CORRECTIVE SRS
+Version: 1.0
+Date: 2026-03-26
+Prepared for: ETHUSD / Capital.com / ASP.NET / PostgreSQL implementation review
+
+====================================================================
+1. PURPOSE
+====================================================================
+
+This document is a corrective Software Requirements Specification (SRS)
+and implementation audit for the uploaded ETH.zip project, the attached
+logs, and the exported CSV tables.
+
+Its purpose is to:
+1. compare the current implementation against the intended phased SRS,
+2. identify mismatches, logical errors, wrong mappings, missing pieces,
+3. explain why no signals were generated yet,
+4. define the exact corrective actions and re-test requirements needed
+   before the system can be considered reliable.
+
+This document is written to be used later by an engineer or an AI coding
+agent to fix the implementation systematically.
+
+Important limitation:
+- This audit is based on static source review, uploaded logs, and CSV
+  exports.
+- The code was not executed end-to-end in this environment because the
+  .NET SDK/runtime was not available here.
+- Findings below are therefore based on code logic, data evidence, and
+  logs, not on a local runtime replay.
+
+====================================================================
+2. EVIDENCE REVIEWED
+====================================================================
+
+Artifacts reviewed:
+- Source code under:
+  - src/EthSignal.Domain
+  - src/EthSignal.Infrastructure
+  - src/EthSignal.Web
+  - tests/EthSignal.Tests
+- Logs:
+  - logs/ethsignal-20260326.log
+- Data exports:
+  - candles_1m.csv
+  - candles_5m.csv
+  - candles_15m.csv
+  - indicator_snapshots.csv
+  - regime_snapshots.csv
+  - ingestion_audit.csv
+  - gap_events.csv
+  - additional exported tables: candles_30m.csv, candles_1h.csv, candles_4h.csv
+
+Files were reviewed comprehensively across the full source tree under src/
+and tests/ (excluding build artifacts in bin/obj).
+
+====================================================================
+3. EXECUTIVE SUMMARY
+====================================================================
+
+Overall assessment:
+- The project contains most of the major modules required by the target
+  architecture:
+  - Capital.com API client
+  - PostgreSQL repositories
+  - backfill engine
+  - live tick processor
+  - indicator engine
+  - regime analyzer
+  - signal engine
+  - risk manager
+  - outcome evaluator
+  - dashboard pages and APIs
+  - unit/integration test scaffolding
+- However, the implementation is NOT yet aligned with the intended SRS
+  strongly enough to trust it for live trading recommendations.
+
+Current status by phase:
+- Phase 1 (ingestion correctness): PARTIALLY IMPLEMENTED but NOT PASSING
+- Phase 2 (indicator engine): PARTIALLY IMPLEMENTED but BLOCKED by data quality issues
+- Phase 3 (regime classification): IMPLEMENTED but too narrow and not historically persisted
+- Phase 4 (signal generation): IMPLEMENTED but not aligned to the intended entry model and over-gated
+- Phase 5 (risk management): PARTIALLY IMPLEMENTED; core stop/TP math exists but daily risk policy is missing
+- Phase 6 (signal outcomes and learning): PARTIALLY IMPLEMENTED; outcomes depend on signals, and feature storage is missing
+- Phase 7 (optimization / adaptive learning): LIBRARY EXISTS but not wired into runtime or persistence
+- Phase 8 (dashboard): IMPLEMENTED visually, but the live data model is not tick-by-tick and adds API load
+
+Top 7 reasons the system is not ready:
+1. 5m and 15m candles are not consistently derived from 1m truth.
+2. The live rollover logic still closes old candles using the first price
+   of the next candle.
+3. Open candles are read back from the repository as if they were closed.
+4. Backfill creates partial higher-timeframe candles and force-closes them.
+5. The dashboard/API layer directly polls Capital.com in parallel with the
+   ingestion loop, increasing rate-limit risk and creating data divergence.
+6. The signal engine only emits live signals on fresh 5m closes, while the
+   observed regime remained NEUTRAL during the captured runtime.
+7. The learning loop is incomplete because signal_features are never stored.
+
+Bottom line:
+- The absence of signals is currently expected from the captured runtime,
+  but it also hides deeper architectural issues that would still reduce
+  signal quality even after the market becomes directional.
+
+====================================================================
+4. WHY THERE ARE NO SIGNALS YET
+====================================================================
+
+There is not one single reason; there are multiple stacked reasons.
+
+4.1 Immediate runtime reason observed in logs and data
+------------------------------------------------------
+
+During the captured run:
+- the 15m regime remained NEUTRAL,
+- the regime score remained low,
+- ADX remained below the regime threshold,
+- therefore the signal engine returned NO_TRADE before risk or persistence.
+
+Evidence from logs:
+- regime loaded as NEUTRAL at startup,
+- regime updated again as NEUTRAL after 15m closes,
+- no "Signal generated" entries appear in the uploaded log.
+
+Evidence from data:
+- regime_snapshots.csv contains only NEUTRAL rows,
+- recent 15m disqualifying conditions repeatedly include ADX < 18,
+- recent 5m ADX values are around 10 to 12, which is too weak for the
+  current regime and signal thresholds.
+
+4.2 Structural reason
+---------------------
+
+Signals are only generated inside the live loop when a 5m candle closes:
+- src/EthSignal.Infrastructure/Engine/LiveTickProcessor.cs lines 201-258
+
+Backfill computes indicators and latest regime, but it does NOT generate
+historical signals into the signals table.
+Therefore:
+- if the app did not stay online long enough during a directional regime,
+  signal tables remain empty,
+- there is no historical bootstrap of signals from already stored candles.
+
+4.3 Strategy-gating reason
+--------------------------
+
+Even if the regime became directional, the current signal engine is strict:
+
+Mandatory gates:
+- regime must not be NEUTRAL,
+- EMA condition must pass,
+- RSI condition must pass,
+- MACD condition must pass,
+- spread condition must pass,
+- at least one confirmation must pass,
+- final score must be at least 70.
+
+Because the current design also requires a trending regime and uses an ADX
+threshold of 18, signals will be rare in choppy conditions.
+
+4.4 Data-quality reason
+-----------------------
+
+Because higher-timeframe candles and live volume are not consistently
+derived from finalized 1m candles, even a valid trade setup can fail the
+signal rules incorrectly. This can suppress signal creation.
+
+4.5 Missing learning data reason
+--------------------------------
+
+signal_features, signal_outcomes, and signals are empty because:
+- no live signal passed all gates yet,
+- feature rows are never inserted anywhere in runtime code,
+- the optimization engine exists only as an offline utility.
+
+Conclusion:
+- The immediate reason for no signals is NEUTRAL regime and weak ADX.
+- The deeper reasons are architecture and data correctness gaps that must
+  be fixed before trusting future signals.
+
+====================================================================
+5. DETAILED FINDINGS BY PHASE
+====================================================================
+
+--------------------------------------------------------------------
+PHASE 1 - DATA INGESTION, CANDLE CORRECTNESS, AND PERSISTENCE
+--------------------------------------------------------------------
+
+ISSUE P1-01
+Severity: CRITICAL
+Title: Higher-timeframe live candles do not reliably equal aggregation of 1m candles
+
+Current implementation:
+- The live loop updates 1m, 5m, and 15m candles directly from spot ticks in
+  parallel.
+- 5m and 15m candles are not derived exclusively from finalized 1m candles.
+- Relevant code:
+  - src/EthSignal.Infrastructure/Engine/LiveTickProcessor.cs lines 105-135
+
+Why this is wrong:
+- The SRS required 5m and 15m candles to be internally consistent with the
+  1m base series.
+- Directly building higher-timeframe candles from spot polling introduces
+  divergence in:
+  - open price,
+  - high/low,
+  - close,
+  - volume.
+
+Data evidence:
+- candles_5m.csv and candles_15m.csv do not fully match aggregation of
+  candles_1m.csv.
+- Mismatches were found in OHLC and volume, especially in recent live-built
+  bars.
+
+Impact:
+- indicator values become inconsistent,
+- signal decisions can differ from what the 1m truth would imply,
+- backtests and live behavior become incomparable.
+
+Required fix:
+- Make 1m the only live-constructed candle stream.
+- Derive 5m and 15m only by aggregating CLOSED 1m candles.
+- Do not update higher-timeframe OHLC directly from ticks.
+- Trigger:
+  - on 1m close -> persist 1m
+  - if 1m close completes a 5m bucket -> aggregate last 5 closed 1m rows
+  - if 1m close completes a 15m bucket -> aggregate last 15 closed 1m rows
+
+Re-test requirement:
+- SQL and unit test must prove that every 5m candle equals aggregation of
+  the exact 5 underlying 1m candles.
+- Same for 15m.
+
+------------------------------------------------------------
+
+ISSUE P1-02
+Severity: CRITICAL
+Title: Rollover logic closes the old candle with the first price of the new candle
+
+Current implementation:
+- On boundary crossing, the code finalizes the current candle by calling:
+  - UpdateCandle(current, spot)
+- Relevant code:
+  - src/EthSignal.Infrastructure/Engine/LiveTickProcessor.cs lines 110-123
+
+Why this is wrong:
+- The first tick after the boundary belongs to the NEW candle.
+- The previous candle should close using the LAST price seen before the
+  boundary, not the first price of the next bucket.
+- This is the same defect identified in the earlier review.
+
+Additional test problem:
+- The test suite currently validates the wrong behavior.
+- Relevant test:
+  - tests/EthSignal.Tests/Engine/LiveRolloverTests.cs lines 39-47
+- That test explicitly closes the prior candle using the boundary tick price.
+
+Impact:
+- previous candle close is polluted,
+- higher-timeframe aggregation is distorted,
+- indicators and signals are shifted.
+
+Required fix:
+- Track previous bid/ask tick.
+- On bucket transition:
+  - finalize old candle using previous tick,
+  - create new candle using current tick.
+- Update tests to reflect the corrected rollover model.
+
+Correct target behavior:
+- old candle close = last tick strictly before new bucket open
+- new candle open = first tick at or after new bucket open
+
+Re-test requirement:
+- deterministic unit tests for 1m, 5m, and 15m transitions.
+- verify no candle uses a price from the next bucket as its final close.
+
+------------------------------------------------------------
+
+ISSUE P1-03
+Severity: CRITICAL
+Title: Repository reads open candles back as if they were closed
+
+Current implementation:
+- GetOpenCandleAsync() does not select is_closed.
+- ReadCandle() hardcodes IsClosed = true.
+- Relevant code:
+  - src/EthSignal.Infrastructure/Db/CandleRepository.cs lines 102-121
+  - src/EthSignal.Infrastructure/Db/CandleRepository.cs lines 320-335
+
+Why this is wrong:
+- Any caller receiving an "open" candle from the repository sees it as
+  closed/final.
+- This directly breaks closed-candle policy.
+
+Impact:
+- open candle indicator snapshots may be treated as final,
+- API responses can misrepresent live data,
+- provisional/final distinction is compromised.
+
+Required fix:
+- Include is_closed in all select statements that read candles.
+- Populate RichCandle.IsClosed from the database value.
+- Create separate read methods if needed:
+  - ReadClosedCandle
+  - ReadOpenCandle
+
+Re-test requirement:
+- repository tests must verify:
+  - open candle returns IsClosed = false,
+  - closed candle returns IsClosed = true.
+
+------------------------------------------------------------
+
+ISSUE P1-04
+Severity: CRITICAL
+Title: Backfill creates partial 5m and 15m candles and then force-closes them
+
+Current implementation:
+- Backfill fetches only the requested 1m range,
+- aggregates whatever 1m rows were fetched into 5m/15m,
+- then force-closes all open candles.
+- Relevant code:
+  - src/EthSignal.Infrastructure/Engine/BackfillService.cs lines 98-108
+  - src/EthSignal.Infrastructure/Db/CandleRepository.cs lines 233-245
+
+Why this is wrong:
+- If backfill starts or ends inside a higher-timeframe bucket, the first or
+  last 5m/15m candle can be partial.
+- Example observed in data:
+  - first 5m candle at 2026-03-18 02:05 was built from only the minutes
+    02:07-02:09 because earlier minutes were not fetched.
+- Yet these candles are stored as closed/final.
+
+Impact:
+- higher-timeframe OHLC and volume become invalid,
+- indicators on early/late edges of a backfill window become wrong,
+- regime and signal logic start from corrupted data.
+
+Required fix:
+- When backfilling 5m/15m derived candles, always pull a boundary-safe
+  overlap:
+  - start from floor(fromUtc, 15m) minus 15m,
+  - end at floor(toUtc, 1m) but do not finalize incomplete current buckets.
+- Alternatively:
+  - persist only 1m from backfill,
+  - rebuild 5m/15m from the full 1m table with strict completeness checks.
+
+Completeness rule:
+- mark a 5m candle closed only if 5 distinct 1m closed rows exist,
+- mark a 15m candle closed only if 15 distinct 1m closed rows exist.
+
+Re-test requirement:
+- first and last aggregated bars around a backfill window must be verified
+  for completeness before insert/update.
+
+------------------------------------------------------------
+
+ISSUE P1-05
+Severity: HIGH
+Title: Live 1m volume and higher-timeframe volume are approximate and can be wrong
+
+Current implementation:
+- volume is refreshed only every 15 ticks,
+- current 1m volume is copied from a REST candle snapshot only occasionally,
+- 5m/15m volume is built from accumulators plus current 1m state.
+- Relevant code:
+  - src/EthSignal.Infrastructure/Engine/LiveTickProcessor.cs lines 10-11
+  - src/EthSignal.Infrastructure/Engine/LiveTickProcessor.cs lines 80-99
+  - src/EthSignal.Infrastructure/Engine/LiveTickProcessor.cs lines 126-132
+
+Why this is wrong:
+- If the minute closes between volume refreshes, the final 1m volume may be
+  stale or incomplete.
+- Because higher-timeframe candles depend on that 1m volume, 5m/15m volume
+  also diverges.
+
+Impact:
+- volume-based confirmation in SignalEngine can fail incorrectly,
+- VWAP and volume analytics are degraded.
+
+Required fix:
+Option A (preferred):
+- move to broker websocket/tick feed and build volume from actual trades if
+  available.
+Option B:
+- refresh the current 1m broker candle every second and overwrite current
+  1m volume with the latest value from the API.
+- derive 5m and 15m strictly from closed 1m candles only.
+
+Re-test requirement:
+- compare finalized 5m volume against sum of 5 finalized 1m volumes.
+- zero mismatches permitted.
+
+------------------------------------------------------------
+
+ISSUE P1-06
+Severity: HIGH
+Title: Repeated gaps exist in 1m data and are not repaired or quarantined
+
+Observed data issues:
+- gap_events.csv shows 167 gap entries.
+- Repeated daily gaps appear around 00:00-00:04.
+- A large 121-minute gap also exists on 2026-03-21.
+
+Why this matters:
+- gaps invalidate aggregated bars crossing the missing region,
+- indicators should not be treated as trustworthy across unresolved gaps.
+
+Current implementation:
+- gaps are detected and inserted into gap_events,
+- but the pipeline continues using the affected data.
+
+Required fix:
+- Add a gap-aware validity layer.
+- If a 5m or 15m candle spans a missing 1m slot:
+  - either do not build it,
+  - or mark it invalid and exclude it from indicator/signal generation.
+- Add a repair/backfill recovery routine for unresolved gaps.
+
+Re-test requirement:
+- if any 1m gap exists inside a 5m/15m bucket, that bucket must not be
+  used in indicator or signal computation.
+
+------------------------------------------------------------
+
+ISSUE P1-07
+Severity: MEDIUM
+Title: Gap detection marks the slot before the first fetched candle as missing
+
+Current implementation:
+- gap detection starts from floor(from).
+- Relevant code:
+  - src/EthSignal.Infrastructure/Engine/GapDetector.cs lines 23-24
+
+Why this can be misleading:
+- If the requested period starts at 02:06:xx and the first actual candle is
+  02:07, the detector marks 02:06 as missing even if the system never asked
+  the broker for the full 02:06 minute.
+- This is visible in gap_events.csv where the first expected gap is 02:06.
+
+Required fix:
+- start expected gap scanning from the first exact minute boundary that is
+  logically expected to exist in the requested dataset,
+- or explicitly classify this as "range_edge_partial" instead of
+  "missing_candle".
+
+====================================================================
+PHASE 2 - INDICATOR ENGINE
+====================================================================
+
+ISSUE P2-01
+Severity: HIGH
+Title: /api/indicators/current forces open-candle indicators to appear final
+
+Current implementation:
+- API endpoint appends the open candle using:
+  - open with { IsClosed = true }
+- Relevant code:
+  - src/EthSignal.Web/Program.cs lines 104-123
+
+Why this is wrong:
+- The SRS required closed-candle-safe indicators for decision logic.
+- Even for dashboard display, provisional values should remain marked
+  provisional.
+- The current endpoint explicitly removes that distinction.
+
+Impact:
+- UI can show "final-looking" indicators that are still evolving,
+- users may mistake provisional values for trade-grade values.
+
+Required fix:
+- Do not coerce open candle to closed.
+- Return:
+  - latestClosed5m,
+  - latestClosed15m,
+  - optional livePreview5m,
+  - optional livePreview15m,
+  each with an explicit provisional flag.
+- Signals must continue using closed candles only.
+
+Re-test requirement:
+- verify the current indicator endpoint distinguishes final vs provisional.
+- verify no provisional snapshot is stored in the final snapshot table unless
+  explicitly intended and flagged.
+
+------------------------------------------------------------
+
+ISSUE P2-02
+Severity: MEDIUM
+Title: Indicator engine itself is mathematically reasonable, but data quality upstream invalidates output
+
+Observation:
+- EMA, RSI, MACD, ATR, ADX, VWAP, and spread calculators are present.
+- The formulas are broadly implemented in line with the intended design.
+
+However:
+- indicator correctness depends on candle correctness,
+- because candles are not yet reliable, indicator outputs are also not
+  reliable enough for trading decisions.
+
+Required fix:
+- Do not optimize indicator formulas further until Phase 1 is fixed.
+- Re-run indicator validation only after candle truth is stable.
+
+------------------------------------------------------------
+
+ISSUE P2-03
+Severity: MEDIUM
+Title: Warm-up handling exists, but runtime path mixes provisional and final concepts
+
+Relevant files:
+- src/EthSignal.Infrastructure/Engine/IndicatorEngine.cs
+- tests/EthSignal.Tests/Engine/Indicators/ClosedCandlePolicyTests.cs
+
+Observation:
+- The indicator engine marks early or open-candle snapshots provisional.
+- That is good.
+- But the API path and repository issue described above undermine that policy.
+
+Required fix:
+- Fix P1-03 and P2-01 first.
+- Then ensure all runtime consumers respect IsProvisional.
+
+====================================================================
+PHASE 3 - 15M REGIME FILTER
+====================================================================
+
+ISSUE P3-01
+Severity: HIGH
+Title: Regime logic is stricter and narrower than the intended SRS
+
+Current implementation:
+- RegimeAnalyzer requires ALL of:
+  - EMA20 > EMA50 / EMA20 < EMA50
+  - EMA20 slope sign
+  - Close vs VWAP
+  - ADX >= 18
+  - +DI > -DI or inverse
+- Relevant code:
+  - src/EthSignal.Infrastructure/Engine/RegimeAnalyzer.cs lines 47-106
+
+Mismatch with intended SRS:
+- Intended filter:
+  - EMA20 / EMA50 directional trend,
+  - slope,
+  - price vs VWAP,
+  - ADX strength,
+  - market structure context.
+- Current implementation:
+  - adds DI dominance as a mandatory condition,
+  - does NOT include market structure logic (HH/HL or LH/LL),
+  - returns only BULLISH / BEARISH if every condition is satisfied.
+
+Impact:
+- regime becomes NEUTRAL too often,
+- signal throughput becomes lower than expected,
+- the implementation is not the same strategy that was specified.
+
+Required fix:
+- Add explicit market-structure evaluation on 15m.
+- Decide whether DI dominance is:
+  - a mandatory rule,
+  - a soft score component,
+  - or removed.
+- If the original strategy should be more permissive, move some conditions
+  from mandatory to scored.
+
+Recommended target:
+- mandatory:
+  - EMA20 relative to EMA50
+  - EMA20 slope sign
+  - ADX >= threshold
+- scored/confirming:
+  - close vs VWAP
+  - DI dominance
+  - HH/HL or LH/LL structure
+  - volatility adequacy
+
+------------------------------------------------------------
+
+ISSUE P3-02
+Severity: HIGH
+Title: Historical regime snapshots are not persisted across all 15m bars
+
+Current implementation:
+- Backfill stores only the latest classified regime, not the full regime
+  timeline.
+- Live processing stores one regime row per new 15m close.
+- Relevant code:
+  - src/EthSignal.Infrastructure/Engine/BackfillService.cs lines 122-137
+  - src/EthSignal.Infrastructure/Engine/LiveTickProcessor.cs lines 180-193
+
+Observed evidence:
+- regime_snapshots.csv contains only 3 rows.
+
+Why this is wrong:
+- The system loses auditability and historical context.
+- Backtests, performance analysis, and dashboard history cannot rely on a
+  fully stored regime sequence.
+
+Required fix:
+- During backfill, compute and persist regime for every eligible 15m candle
+  after warm-up.
+- Store one row per 15m candle.
+- Add an upsert method that accepts bulk regime rows.
+
+Re-test requirement:
+- regime_snapshots row count should approximately equal:
+  closed_15m_count - warmup_offset
+
+====================================================================
+PHASE 4 - 5M SIGNAL ENGINE
+====================================================================
+
+ISSUE P4-01
+Severity: HIGH
+Title: Entry model does not follow the intended "next candle open after confirmation" behavior
+
+Current implementation:
+- Signal time = current 5m candle open time
+- Entry price = current 5m close mid
+- Relevant code:
+  - src/EthSignal.Infrastructure/Engine/SignalEngine.cs lines 192-202
+
+Why this is wrong:
+- The intended strategy was:
+  - confirmation occurs on candle close,
+  - entry is the next candle open (or explicit next-tick execution model).
+- Current logic mixes candle-close confirmation with same-candle entry price.
+
+Impact:
+- backtest and live signal semantics are inconsistent,
+- performance metrics can become overstated or ambiguous.
+
+Required fix:
+- Add explicit entry model:
+  - signal_detected_at = just after candle close
+  - planned_entry_time = next 5m candle open
+  - planned_entry_price = next candle bid/ask open or next available live tick
+- Persist both:
+  - signal candle close
+  - intended execution candle/time
+
+------------------------------------------------------------
+
+ISSUE P4-02
+Severity: HIGH
+Title: Signal rules do not fully match the intended scalping setup
+
+Current implementation:
+- EMA condition checks only Close vs EMA20
+- RSI buy zone allows 40-70 instead of a tighter recovery band
+- RSI sell zone allows 30-60 instead of a tighter rejection band
+- MACD condition uses hist positive OR improving
+- Confirmation uses volume/VWAP/body ratio
+- Relevant code:
+  - src/EthSignal.Infrastructure/Engine/SignalEngine.cs lines 54-188
+
+Mismatch with intended SRS:
+- Intended setup emphasized:
+  - 15m directional bias
+  - 5m pullback to EMA20 or VWAP zone
+  - RSI recovery/rejection around a narrower zone
+  - candle closes back in the trend direction
+  - volume confirmation
+- Current engine does not explicitly model:
+  - pullback zone touch,
+  - bounce/rejection from EMA20 or VWAP,
+  - swing structure around the entry,
+  - session/time filter,
+  - nearby support/resistance veto.
+
+Impact:
+- strategy implemented in code is not the same as the target scalping logic.
+
+Required fix:
+- Replace simple "close vs EMA20" with a pullback-and-reclaim rule.
+- Example BUY condition:
+  1. prior bar or current bar touches/undercuts EMA20 or VWAP zone
+  2. current close finishes back above EMA20
+  3. RSI recovered upward from a predefined band
+  4. MACD histogram improving
+  5. 15m regime bullish
+- Similar inverse logic for SELL.
+
+------------------------------------------------------------
+
+ISSUE P4-03
+Severity: HIGH
+Title: Score threshold and mandatory gates may be too restrictive for practical throughput
+
+Current implementation:
+- Mandatory:
+  - EMA
+  - RSI
+  - MACD
+  - spread
+- Threshold = 70
+- Body confirmation is not scored, only gating.
+- Relevant code:
+  - src/EthSignal.Infrastructure/Engine/SignalEngine.cs lines 21-29
+  - src/EthSignal.Infrastructure/Engine/SignalEngine.cs lines 165-188
+
+Why this matters:
+- If market is directional but ADX is slightly weak or volume is average,
+  the score can stay below threshold even with a valid pullback setup.
+- Since the live logs show weak ADX, the current rule stack is naturally
+  suppressing signals.
+
+Required fix:
+- After Phase 1 data fixes, backtest the strategy over a larger sample.
+- Measure signal frequency, win rate, and expectancy.
+- Consider softening some gates:
+  - move ADX to regime-only or scored-not-mandatory,
+  - separate "hard fail" from "confidence reduction",
+  - lower threshold only after empirical testing.
+
+------------------------------------------------------------
+
+ISSUE P4-04
+Severity: MEDIUM
+Title: Signal engine does not persist NO_TRADE diagnostics anywhere
+
+Current implementation:
+- Reasons are produced for NO_TRADE decisions but not persisted.
+
+Why this matters:
+- Debugging signal scarcity becomes harder.
+- You cannot answer:
+  - how many setups failed due to regime,
+  - how many failed due to MACD,
+  - how many failed due to low volume.
+
+Required fix:
+- Add a decision_audit table:
+  - decision_time
+  - timeframe
+  - regime
+  - passed_rules
+  - failed_rules
+  - score
+  - final_decision
+- Persist both actionable and non-actionable decisions.
+
+====================================================================
+PHASE 5 - RISK MANAGEMENT
+====================================================================
+
+ISSUE P5-01
+Severity: HIGH
+Title: RiskManager does not enforce most of the declared RiskPolicy
+
+Current implementation:
+- RiskPolicy defines:
+  - HardMaxRiskPercent
+  - DailyMaxDrawdownPercent
+  - MaxConsecutiveLossesPerDay
+  - MaxOpenPositions
+- RiskManager only uses:
+  - RiskPercentPerTrade
+  - AtrMultiplier
+  - RewardToRisk
+  - MinAtrThreshold
+  - MaxSpreadPct
+  - MinRiskRewardAfterRounding
+- Relevant code:
+  - src/EthSignal.Domain/Models/RiskPolicy.cs lines 4-16
+  - src/EthSignal.Infrastructure/Engine/RiskManager.cs lines 20-77
+
+Why this is wrong:
+- The intended SRS included daily and session-level risk controls.
+- These controls are currently declared but ignored.
+
+Required fix:
+- Add a PortfolioRiskService or TradingGuard service that checks:
+  - open signal count,
+  - total daily realized loss,
+  - consecutive losses today,
+  - hard risk cap per signal,
+  - daily stop-trading rule.
+- Block new signals if policy is exceeded.
+
+Re-test requirement:
+- unit tests for:
+  - max open positions,
+  - daily drawdown stop,
+  - max consecutive losses,
+  - hard cap override.
+
+------------------------------------------------------------
+
+ISSUE P5-02
+Severity: MEDIUM
+Title: Position sizing / tradable size is missing
+
+Current implementation:
+- The system outputs risk_usd and risk_percent,
+- but does not compute tradable position size or contract size.
+
+Why this matters:
+- For real execution or realistic paper evaluation, risk must map to size:
+  position_size = risk_usd / stop_distance_value_per_unit
+
+Required fix:
+- Add broker/instrument metadata:
+  - contract size
+  - minimum trade size
+  - tick size
+  - value per point
+- Then compute size rounded to broker minimum.
+
+====================================================================
+PHASE 6 - SIGNAL STORAGE, OUTCOMES, AND LEARNING
+====================================================================
+
+ISSUE P6-01
+Severity: CRITICAL
+Title: signal_features table is never populated
+
+Current implementation:
+- Table exists in schema.
+- No runtime code inserts any feature rows.
+- Relevant schema:
+  - src/EthSignal.Infrastructure/Db/DbMigrator.cs lines 193-199
+- Relevant optimization utility:
+  - src/EthSignal.Infrastructure/Engine/StrategyOptimizer.cs lines 32-71
+
+Observed evidence:
+- signal_features table export is absent because it was empty.
+
+Why this is wrong:
+- The original design required storing signal features so the system can
+  become smarter over time.
+- Without feature persistence, no learning loop can operate.
+
+Required fix:
+- At signal creation time, insert a feature row set for every signal:
+  - ema20_minus_ema50
+  - ema20_slope
+  - rsi14
+  - macd_hist
+  - adx14
+  - plus_di_minus_minus_di
+  - distance_to_vwap
+  - volume_ratio
+  - spread_pct
+  - atr_pct
+  - body_ratio
+  - hour_of_day
+  - regime_score
+  - strategy_version
+- Store into signal_features immediately after signal insert.
+
+Re-test requirement:
+- every inserted signal must have a complete signal_features row-set.
+
+------------------------------------------------------------
+
+ISSUE P6-02
+Severity: HIGH
+Title: signal_outcomes are implemented, but can never populate until signals exist
+
+Current implementation:
+- outcome evaluator exists and is called from the live loop.
+- Because no signals were inserted, no outcomes were produced.
+
+Required fix:
+- Fix the signal creation path first.
+- Add explicit outcome-evaluation tests using realistic future candle paths.
+- Add an endpoint or scheduled job to backfill outcomes for historical
+  open signals after restarts.
+
+------------------------------------------------------------
+
+ISSUE P6-03
+Severity: MEDIUM
+Title: Outcome timestamps use evaluation time, not actual hit time
+
+Current implementation:
+- ClosedAtUtc is set to DateTimeOffset.UtcNow inside OutcomeEvaluator.
+- Relevant code:
+  - src/EthSignal.Infrastructure/Engine/OutcomeEvaluator.cs lines 146-160
+
+Why this is suboptimal:
+- The actual TP/SL hit bar timestamp is more useful than evaluation clock
+  time.
+- For performance analysis, you want the candle time where outcome occurred.
+
+Required fix:
+- When TP/SL/expiry is detected, store:
+  - resolved_on_candle_open_time_utc
+  - resolved_on_candle_close_time_utc (if tracked)
+  - evaluation_timestamp_utc separately
+
+====================================================================
+PHASE 7 - ADAPTIVE LEARNING / OPTIMIZATION
+====================================================================
+
+ISSUE P7-01
+Severity: HIGH
+Title: StrategyOptimizer exists only as offline code and is not connected to the runtime system
+
+Current implementation:
+- StrategyOptimizer.cs exists,
+- BacktestEngine.cs exists,
+- neither is invoked by hosted services, APIs, or persistence jobs.
+
+Why this is incomplete:
+- The "make it smart each time" requirement is not fulfilled in runtime.
+- There is no scheduled learning cycle, no draft strategy persistence, and
+  no promotion workflow.
+
+Required fix:
+- Add a periodic optimization job, but only after enough signal outcomes
+  exist.
+- Save proposed weights or strategy versions to a database table:
+  - strategy_versions
+  - strategy_weight_sets
+  - performance_by_version
+- Do not auto-activate a new strategy without human approval.
+
+------------------------------------------------------------
+
+ISSUE P7-02
+Severity: MEDIUM
+Title: Feature export uses signal time directly, which is ambiguous under the current entry model
+
+Current implementation:
+- StrategyOptimizer looks up snapshots by sig.SignalTimeUtc.
+- Relevant code:
+  - src/EthSignal.Infrastructure/Engine/StrategyOptimizer.cs lines 44-68
+
+Why this matters:
+- If signal time means candle open while entry happens at candle close or
+  next candle open, feature alignment becomes ambiguous.
+
+Required fix:
+- Standardize these timestamps:
+  - setup_candle_open_time
+  - setup_candle_close_time
+  - decision_time
+  - intended_entry_time
+- Feature extraction must reference the setup candle close snapshot, not an
+  ambiguous signal timestamp.
+
+====================================================================
+PHASE 8 - DASHBOARD, API, AND RUNTIME BEHAVIOR
+====================================================================
+
+ISSUE P8-01
+Severity: CRITICAL
+Title: Dashboard does not use the internal live engine as source of truth; it calls Capital.com again
+
+Current implementation:
+- /api/quote/current calls CapitalClient.GetSpotPriceAsync directly.
+- Dashboard polls that endpoint every 2 seconds.
+- Relevant code:
+  - src/EthSignal.Web/Program.cs lines 77-81
+  - src/EthSignal.Web/wwwroot/js/dashboard.js lines 19-31
+  - src/EthSignal.Web/wwwroot/js/dashboard.js lines 210-215
+
+Why this is wrong:
+- The live engine already polls the broker every second.
+- The dashboard should read the platform's internal state, not create a
+  second direct market-data path.
+- This duplicates broker traffic and can produce values that do not match
+  the candle builder state.
+
+Observed evidence:
+- The log shows a 429 rate-limit problem during startup authentication.
+
+Required fix:
+- Introduce a MarketStateCache or SignalR hub that publishes the latest
+  internal tick/candle/indicator/signal state.
+- The dashboard should consume only your application state.
+- Capital.com should be polled by a single ingestion path.
+
+------------------------------------------------------------
+
+ISSUE P8-02
+Severity: HIGH
+Title: The UI is not actually tick-by-tick
+
+Current implementation:
+- Dashboard quote refresh = every 2 seconds
+- chart/indicator refresh = every 5 seconds
+- no websocket push to browser
+- live ingestion is also REST polling, not streaming
+- Relevant code:
+  - src/EthSignal.Web/wwwroot/js/dashboard.js lines 210-215
+
+Mismatch with requirement:
+- The user requested current price tick by tick.
+- Current implementation is periodic polling.
+
+Required fix:
+- Add broker websocket ingestion if available.
+- Publish internal ticks to browser via SignalR or server-sent events.
+- Update quote panel and chart incrementally from pushed state.
+
+------------------------------------------------------------
+
+ISSUE P8-03
+Severity: HIGH
+Title: Authentication and session handling are not concurrency-safe
+
+Current implementation:
+- CapitalClient stores CST and security token in mutable shared fields.
+- SendAuthorizedGetAsync can call AuthenticateAsync automatically.
+- Dashboard/browser startup can create parallel requests while the
+  background service is also authenticating.
+- There is no lock/semaphore around AuthenticateAsync.
+- Relevant code:
+  - src/EthSignal.Infrastructure/Apis/CapitalClient.cs lines 18-19, 36-61, 166-195
+  - src/EthSignal.Web/Program.cs lines 298-312
+
+Observed behavior:
+- The log shows:
+  - a 429 on authentication,
+  - then another authentication success shortly after.
+
+Interpretation:
+- Multiple concurrent auth/session attempts likely occurred.
+
+Required fix:
+- Protect session creation with a SemaphoreSlim.
+- Store token expiry / session state.
+- Never let dashboard endpoints trigger new auth while bootstrap auth is
+  already in progress.
+- Disable automatic browser opening in production and during automated tests.
+
+------------------------------------------------------------
+
+ISSUE P8-04
+Severity: HIGH
+Title: Sentiment is likely mis-mapped and all stored buyer/seller percentages are zero
+
+Current implementation:
+- LiveTickProcessor calls:
+  - _api.GetSentimentAsync(symbol, ct)
+- CapitalClient catches all exceptions and returns 0/0 silently.
+- Relevant code:
+  - src/EthSignal.Infrastructure/Engine/LiveTickProcessor.cs line 49
+  - src/EthSignal.Infrastructure/Apis/CapitalClient.cs lines 132-146
+
+Observed evidence:
+- buyer_pct and seller_pct are zero across uploaded candle exports.
+
+Why this is likely wrong:
+- Either:
+  - the broker endpoint expects a market identifier different from the
+    visible symbol,
+  - or the sentiment request is failing and the catch block hides the error.
+
+Impact:
+- stored sentiment fields are useless,
+- any future sentiment-based logic will be invalid,
+- monitoring cannot reveal the true failure.
+
+Required fix:
+- Resolve the correct Capital.com market identifier for ETHUSD sentiment.
+- Stop swallowing exceptions silently.
+- Log broker response failures clearly.
+- Cache last successful sentiment instead of replacing with 0/0 on failure.
+
+------------------------------------------------------------
+
+ISSUE P8-05
+Severity: MEDIUM
+Title: Background service exception behavior is configured to ignore failures
+
+Current implementation:
+- builder.Services.Configure<HostOptions>(opts =>
+    opts.BackgroundServiceExceptionBehavior = BackgroundServiceExceptionBehavior.Ignore);
+- Relevant code:
+  - src/EthSignal.Web/Program.cs lines 58-60
+
+Why this is dangerous:
+- If ingestion crashes, the web server can remain alive while data becomes
+  stale.
+- For a trading platform, silent degradation is dangerous.
+
+Required fix:
+- In production:
+  - stop host on critical ingestion failure,
+  - or expose degraded health status and disable signal consumption.
+- Add health checks for:
+  - last successful tick,
+  - last closed 1m candle,
+  - last indicator update,
+  - last regime update.
+
+------------------------------------------------------------
+
+ISSUE P8-06
+Severity: MEDIUM
+Title: Unauthenticated truncate-all endpoint is too dangerous
+
+Current implementation:
+- /api/db/truncate-all is accessible with a simple custom header.
+- Relevant code:
+  - src/EthSignal.Web/Program.cs lines 279-296
+
+Why this is risky:
+- A browser user or script can wipe all tables easily.
+- This is acceptable for local debugging only, not for any production-like
+  environment.
+
+Required fix:
+- Remove from production.
+- Protect with authentication/authorization.
+- Prefer a development-only endpoint or CLI tool.
+
+====================================================================
+PHASE 9 - TESTING, VERIFICATION, AND ENGINEERING QUALITY
+====================================================================
+
+ISSUE P9-01
+Severity: HIGH
+Title: Some tests exist, but one rollover test validates the wrong logic
+
+Observation:
+- The test suite is larger than initially expected and includes useful
+  coverage across indicators, regime, risk, outcomes, and APIs.
+- However, tests do not guarantee correctness if their assumptions are
+  wrong.
+
+Critical example:
+- tests/EthSignal.Tests/Engine/LiveRolloverTests.cs lines 39-47 validate
+  the incorrect close-on-boundary behavior.
+
+Required fix:
+- Rewrite rollover tests around previous-tick finalization.
+- Add golden tests comparing live 5m/15m to strict aggregation of closed 1m.
+
+------------------------------------------------------------
+
+ISSUE P9-02
+Severity: MEDIUM
+Title: UnitTest1.cs is still a placeholder and should be removed or replaced
+
+Relevant file:
+- tests/EthSignal.Tests/UnitTest1.cs lines 1-9
+
+Required fix:
+- delete placeholder test file or replace with a meaningful test.
+
+------------------------------------------------------------
+
+ISSUE P9-03
+Severity: HIGH
+Title: Missing end-to-end phase-gate tests
+
+The original phased SRS required each phase to pass before moving on.
+
+Missing or insufficiently evidenced tests:
+1. End-to-end ingestion proof:
+   - 1m -> 5m -> 15m exact equivalence
+2. Backfill edge handling:
+   - partial first/last bucket prevention
+3. Open candle repository semantics:
+   - IsClosed flag correctness
+4. Sentiment mapping:
+   - non-zero data or explicit broker failure handling
+5. Signal persistence:
+   - signals row inserted with expected fields
+6. signal_features persistence:
+   - one complete feature set per signal
+7. Learning workflow:
+   - strategy version proposal persisted and reviewable
+8. Dashboard live source integrity:
+   - UI quote must equal internal live engine state, not broker-direct state
+
+------------------------------------------------------------
+
+ISSUE P9-04
+Severity: MEDIUM
+Title: Audit fields are present but not fully accurate
+
+Current implementation:
+- ingestion_audit includes:
+  - candles_updated
+  - duplicates_skipped
+- current backfill code always logs these as zero.
+- Relevant code:
+  - src/EthSignal.Infrastructure/Engine/BackfillService.cs lines 152-166
+
+Required fix:
+- track actual insert/update/skipped counts from repository upserts,
+- reflect them in audit rows.
+
+====================================================================
+6. ADDITIONAL OBSERVATIONS
+====================================================================
+
+OBS-01
+The uploaded CSV set includes candles_30m, candles_1h, and candles_4h, but
+the current reviewed codebase only defines 1m, 5m, and 15m in Timeframe.cs.
+Those higher-period exports appear to be legacy/manual artifacts or from a
+different code path, not from the reviewed runtime.
+
+OBS-02
+The database columns are named *_utc, but exported timestamptz values appear
+with +03 offset in the CSV. This is not inherently wrong if PostgreSQL is
+displaying local session timezone, but it can confuse debugging. All exports
+should be normalized explicitly to UTC.
+
+OBS-03
+The dashboard is visually polished and useful for local inspection, but it is
+currently a monitoring surface for a non-authoritative state model. That must
+be corrected before users trust it.
+
+====================================================================
+7. PRIORITIZED FIX ORDER
+====================================================================
+
+Do NOT fix everything randomly. Use this exact order.
+
+Priority Group A - Must be fixed first
+1. P1-02 rollover bug
+2. P1-03 open candle read bug
+3. P1-01 derive 5m/15m only from closed 1m
+4. P1-04 partial backfill bucket finalization
+5. P1-05 live volume correctness
+6. P8-01 and P8-03 remove duplicate broker polling / add shared market state
+7. P8-04 sentiment mapping and error visibility
+
+Priority Group B - Fix before expecting realistic signals
+8. P3-01 revise regime design to match intended strategy
+9. P4-01 fix entry timing semantics
+10. P4-02 revise 5m pullback/confirmation logic
+11. P5-01 enforce full risk policy
+12. P3-02 persist full regime history
+
+Priority Group C - Fix before claiming adaptive learning
+13. P6-01 populate signal_features
+14. P6-02 historical outcome lifecycle
+15. P7-01 wire optimizer/backtest strategy lifecycle
+
+Priority Group D - Fix for production readiness
+16. P8-05 background service failure handling
+17. P8-06 secure or remove dangerous admin endpoint
+18. P9-03 add phase-gate end-to-end tests
+19. P9-04 improve audit metrics
+
+====================================================================
+8. CORRECTIVE ACCEPTANCE CRITERIA
+====================================================================
+
+The implementation may move forward only when all of the following are true:
+
+A. Candle truth
+- 5m equals exact aggregation of closed 1m
+- 15m equals exact aggregation of closed 1m
+- no rollover closes use future-bucket first tick
+
+B. Closed-candle safety
+- repository preserves open vs closed state correctly
+- API distinguishes provisional vs final indicators
+- signal engine uses closed candles only
+
+C. Backfill safety
+- no partial higher-timeframe candle is stored as final
+- unresolved gaps invalidate affected derived bars
+
+D. Signal production
+- during a known trending sample, at least some signals are produced
+  according to the intended SRS logic
+- signals are stored in signals
+- full feature rows are stored in signal_features
+
+E. Risk controls
+- daily drawdown and open-position caps are enforced
+- signals can be blocked with explicit risk reasons
+
+F. Dashboard correctness
+- dashboard reads internal application state
+- dashboard no longer triggers extra broker auth/data storms
+- current price updates are pushed or refreshed from the internal live state
+
+G. Learning
+- outcomes are stored
+- feature rows are stored
+- draft strategy updates are reviewable and versioned
+
+====================================================================
+9. IMMEDIATE ACTION PLAN FOR THE NEXT REVISION
+====================================================================
+
+Sprint 1 - Data truth correction
+- Fix rollover bug
+- Fix repository open/closed mapping
+- Refactor live engine to build only 1m from ticks
+- Rebuild 5m/15m from closed 1m only
+- Fix backfill to avoid partial bucket finalization
+- Re-run integrity comparison against historical CSVs
+
+Sprint 2 - Strategy alignment
+- Re-implement 15m regime using intended market structure + trend filter
+- Re-implement 5m entry as pullback-and-reclaim, not only close vs EMA20
+- Standardize signal time and entry time semantics
+
+Sprint 3 - Persistence and learning
+- Insert signals, signal_features, and outcomes with full metadata
+- Add full regime history persistence
+- Add strategy_versions table and optimization job
+
+Sprint 4 - Runtime and dashboard hardening
+- Introduce shared live market state
+- Remove broker-direct dashboard polling
+- Add SignalR or equivalent push model
+- Add real health checks and fail-safe behavior
+
+====================================================================
+10. SUMMARY STATEMENT
+====================================================================
+
+The current project is a serious prototype, not a finished trading system.
+
+It has enough structure to evolve into the desired platform, but there are
+still critical mismatches between:
+- candle truth,
+- signal semantics,
+- risk enforcement,
+- adaptive learning,
+- and dashboard runtime behavior.
+
+The absence of signals in the uploaded evidence is currently explained by:
+1. NEUTRAL regime and weak ADX during the captured live window,
+2. signal generation occurring only on live 5m closes,
+3. no historical signal bootstrap,
+4. and data-quality/design issues that would still suppress or distort
+   signals even in a stronger market.
+
+This document should now be treated as the authoritative corrective SRS for
+the next implementation pass.

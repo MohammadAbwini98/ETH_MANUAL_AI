@@ -1,0 +1,1075 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Signal Platform Control</title>
+  <style>
+    :root {
+      --bg-body: #0d1117;
+      --bg-card: #161b22;
+      --bg-header: #21262d;
+      --bg-log: #0d1117;
+      --border: #30363d;
+      --text: #f0f6fc;
+      --text-dim: #8cb4d4;
+      --blue: #58a6ff;
+      --green: #3fb950;
+      --red: #f85149;
+      --yellow: #e3b341;
+      --radius: 10px;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background: var(--bg-body);
+      color: var(--text);
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header ──────────────────────────────────────── */
+    header {
+      background: var(--bg-header);
+      border-bottom: 1px solid var(--border);
+      padding: 13px 28px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-shrink: 0;
+    }
+
+    .logo {
+      width: 30px;
+      height: 30px;
+      background: linear-gradient(135deg, var(--blue) 0%, var(--blue) 100%);
+      border-radius: 7px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 800;
+      font-size: 14px;
+      color: #000;
+    }
+
+    header h1 {
+      font-size: 1rem;
+      font-weight: 600;
+    }
+
+    .header-sub {
+      font-size: .75rem;
+      color: var(--text-dim);
+      margin-left: auto;
+    }
+
+    /* ── Single-column layout ────────────────────────── */
+    .main {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 20px;
+      padding: 22px 28px;
+      min-height: 0;
+      width: 100%;
+    }
+
+    /* ── Instrument card ─────────────────────────────── */
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      transition: border-color .25s;
+    }
+
+    .card.running-eth {
+      border-color: var(--blue);
+    }
+
+    /* card header */
+    .card-head {
+      padding: 16px 18px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .card-top-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .card-identity {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .badge {
+      font-size: .68rem;
+      font-weight: 700;
+      padding: 2px 9px;
+      border-radius: 20px;
+      letter-spacing: .05em;
+    }
+
+    .badge-eth {
+      background: rgba(88, 166, 255, .14);
+      color: var(--blue);
+      border: 1px solid rgba(88, 166, 255, .4);
+    }
+
+    .inst-name {
+      font-size: 1.05rem;
+      font-weight: 700;
+    }
+
+    .inst-sub {
+      font-size: .75rem;
+      color: var(--text-dim);
+    }
+
+    /* toggle */
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .toggle-lbl {
+      font-size: .78rem;
+      color: var(--text-dim);
+      min-width: 40px;
+    }
+
+    .toggle {
+      position: relative;
+      display: inline-block;
+      width: 50px;
+      height: 26px;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
+    .toggle input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+
+    .slider {
+      position: absolute;
+      inset: 0;
+      background: #30363d;
+      border-radius: 26px;
+      transition: background .22s;
+    }
+
+    .slider::before {
+      content: '';
+      position: absolute;
+      width: 18px;
+      height: 18px;
+      left: 4px;
+      top: 4px;
+      background: #fff;
+      border-radius: 50%;
+      transition: transform .22s;
+      box-shadow: 0 1px 4px rgba(0, 0, 0, .5);
+    }
+
+    .toggle input:checked+.slider {
+      background: var(--green);
+    }
+
+    .toggle input:checked+.slider::before {
+      transform: translateX(24px);
+    }
+
+    .toggle input:disabled+.slider {
+      opacity: .45;
+      cursor: not-allowed;
+    }
+
+    /* status row */
+    .status-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: .82rem;
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #4a5568;
+      flex-shrink: 0;
+      transition: background .3s;
+    }
+
+    .dot.running {
+      background: var(--green);
+      box-shadow: 0 0 5px var(--green);
+    }
+
+    .dot.starting {
+      background: var(--yellow);
+      animation: blink 1s infinite;
+    }
+
+    @keyframes blink {
+
+      0%,
+      100% {
+        opacity: 1
+      }
+
+      50% {
+        opacity: .35
+      }
+    }
+
+    /* dashboard button */
+    .btn-dash {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 8px 0;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: none;
+      color: var(--text-dim);
+      font-size: .82rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all .15s;
+      width: 100%;
+    }
+
+    .btn-dash:hover:not(:disabled) {
+      background: var(--bg-header);
+      color: var(--text);
+    }
+
+    .btn-dash.eth-live {
+      border-color: var(--blue);
+      color: var(--blue);
+    }
+
+    .btn-dash:disabled {
+      opacity: .35;
+      cursor: not-allowed;
+      pointer-events: none;
+    }
+
+    /* ── Log panel ───────────────────────────────────── */
+    .log-panel {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    .log-titlebar {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      padding: 7px 14px;
+      background: var(--bg-header);
+      border-bottom: 1px solid var(--border);
+      font-size: .72rem;
+      color: var(--text-dim);
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      flex-shrink: 0;
+    }
+
+    .log-titlebar .log-file {
+      margin-left: auto;
+      opacity: .6;
+      font-size: .66rem;
+    }
+
+    .log-scroll {
+      flex: 1;
+      overflow-y: auto;
+      padding: 10px 14px;
+      background: var(--bg-log);
+      font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+      font-size: .7rem;
+      line-height: 1.55;
+      min-height: 220px;
+      max-height: 420px;
+    }
+
+    .log-scroll::-webkit-scrollbar {
+      width: 5px;
+    }
+
+    .log-scroll::-webkit-scrollbar-track {
+      background: transparent;
+    }
+
+    .log-scroll::-webkit-scrollbar-thumb {
+      background: #30363d;
+      border-radius: 3px;
+    }
+
+    .log-line {
+      white-space: pre-wrap;
+      word-break: break-all;
+      color: #8b949e;
+    }
+
+    .log-line.lvl-inf {
+      color: #8b949e;
+    }
+
+    .log-line.lvl-wrn {
+      color: var(--yellow);
+    }
+
+    .log-line.lvl-err {
+      color: var(--red);
+    }
+
+    .log-line.lvl-ftl {
+      color: var(--red);
+      font-weight: 600;
+    }
+
+    .log-line.lvl-dbg {
+      color: #444d56;
+    }
+
+    .log-empty {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 180px;
+      color: #444d56;
+      font-size: .78rem;
+      gap: 8px;
+      font-family: 'Segoe UI', sans-serif;
+    }
+
+    /* Scrollbar thumb colour for log */
+    .running-eth .log-scroll::-webkit-scrollbar-thumb {
+      background: rgba(88, 166, 255, .3);
+    }
+
+
+    /* ── Tick strip ──────────────────────────────────── */
+    #tick-strip {
+      font-family: 'Courier New', monospace;
+      font-size: 13px;
+      background: #0d1117;
+      color: #58a6ff;
+      padding: 6px 12px;
+      border-radius: 4px;
+      margin: 8px 0;
+      display: flex;
+      gap: 20px;
+      align-items: center;
+    }
+
+    #tick-strip .bid {
+      color: #f85149;
+    }
+
+    #tick-strip .ask {
+      color: #3fb950;
+    }
+
+    #tick-strip .hz {
+      color: #e3b341;
+      font-size: 11px;
+    }
+
+    #tick-count {
+      opacity: 0.6;
+      font-size: 11px;
+    }
+  </style>
+</head>
+
+<body>
+
+  <header>
+    <div class="logo">S</div>
+    <h1>Signal Platform Control</h1>
+    <span class="header-sub">capital.com · ETH/USD</span>
+  </header>
+
+  <div id="tick-strip">
+    <span>ETH/USD</span>
+    <span>Bid: <span class="bid" id="t-bid">—</span></span>
+    <span>Ask: <span class="ask" id="t-ask">—</span></span>
+    <span>Mid: <span id="t-mid">—</span></span>
+    <span class="hz" id="t-hz">— Hz</span>
+    <span class="hz" id="t-src">—</span>
+    <span id="tick-count">0 ticks</span>
+  </div>
+
+  <div class="main">
+
+    <!-- ── ETH Card ─────────────────────────────────────── -->
+    <div class="card" id="card-eth">
+      <div class="card-head">
+
+        <div class="card-top-row">
+          <div class="card-identity">
+            <span class="badge badge-eth">CRYPTO</span>
+            <div>
+              <div class="inst-name">ETH / USD</div>
+              <div class="inst-sub">Ethereum · port 5234</div>
+            </div>
+          </div>
+          <div class="toggle-row">
+            <span class="toggle-lbl" id="lbl-eth">OFF</span>
+            <label class="toggle">
+              <input type="checkbox" id="tog-eth" onchange="onToggle('eth',this)">
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
+
+        <div class="status-row">
+          <span class="dot" id="dot-eth"></span>
+          <span id="status-eth" style="color:var(--text-dim)">Stopped</span>
+        </div>
+
+        <button class="btn-dash" id="btn-eth" disabled onclick="openDash('eth')">
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
+            <path
+              d="M1 2.5A1.5 1.5 0 012.5 1h3A1.5 1.5 0 017 2.5v3A1.5 1.5 0 015.5 7h-3A1.5 1.5 0 011 5.5v-3zm8 0A1.5 1.5 0 0110.5 1h3A1.5 1.5 0 0115 2.5v3A1.5 1.5 0 0113.5 7h-3A1.5 1.5 0 019 5.5v-3zm-8 8A1.5 1.5 0 012.5 9h3A1.5 1.5 0 017 10.5v3A1.5 1.5 0 015.5 15h-3A1.5 1.5 0 011 13.5v-3zm8 0A1.5 1.5 0 0110.5 9h3A1.5 1.5 0 0115 10.5v3A1.5 1.5 0 0113.5 15h-3A1.5 1.5 0 019 13.5v-3z" />
+          </svg>
+          Open Dashboard in New Tab
+        </button>
+
+        <button class="btn-dash" id="btn-update-eth" onclick="restartEth()"
+          style="border-color:var(--yellow);color:var(--yellow)">
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
+            <path d="M8 3a5 5 0 104.546 2.914.5.5 0 01.908-.418A6 6 0 118 2v1z" />
+            <path d="M8 4.466V.534a.25.25 0 01.41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 018 4.466z" />
+          </svg>
+          Update
+        </button>
+
+        <div style="display:flex;align-items:center;gap:10px;padding:10px 0 4px;border-top:1px solid var(--border);margin-top:4px">
+          <span style="font-size:.75rem;color:var(--text-dim);min-width:90px">Chrome Mode:</span>
+          <button id="btn-headless-toggle" onclick="toggleHeadless()"
+            style="font-size:.75rem;padding:4px 12px;border-radius:5px;border:1px solid var(--border);background:none;cursor:pointer;color:var(--text);transition:all .15s">
+            Loading…
+          </button>
+          <span id="headless-apply-note" style="font-size:.68rem;color:var(--text-dim);display:none"></span>
+        </div>
+
+      </div>
+
+      <div class="log-panel">
+        <div class="log-titlebar">
+          <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor">
+            <path
+              d="M0 3a2 2 0 012-2h12a2 2 0 012 2v10a2 2 0 01-2 2H2a2 2 0 01-2-2V3zm5.854 4.854a.5.5 0 10-.708-.708L3.5 8.793l-.146-.147a.5.5 0 10-.708.708l.5.5a.5.5 0 00.708 0l2-.2zM7.5 9a.5.5 0 000 1h4a.5.5 0 000-1h-4zm0-2.5a.5.5 0 000 1h4a.5.5 0 000-1h-4zm0-2.5a.5.5 0 000 1h4a.5.5 0 000-1h-4z" />
+          </svg>
+          Runtime Logs
+          <span class="log-file" id="logfile-eth"></span>
+        </div>
+        <div class="log-scroll" id="log-eth">
+          <div class="log-empty">
+            <svg width="28" height="28" viewBox="0 0 16 16" fill="currentColor">
+              <path
+                d="M14 1H2a1 1 0 00-1 1v11a1 1 0 001 1h12a1 1 0 001-1V2a1 1 0 00-1-1zM2 0a2 2 0 00-2 2v11a2 2 0 002 2h12a2 2 0 002-2V2a2 2 0 00-2-2H2z" />
+              <path
+                d="M3 4.5a.5.5 0 01.5-.5h9a.5.5 0 010 1h-9a.5.5 0 01-.5-.5zm0 3a.5.5 0 01.5-.5h9a.5.5 0 010 1h-9a.5.5 0 01-.5-.5zm0 3a.5.5 0 01.5-.5h9a.5.5 0 010 1h-9a.5.5 0 01-.5-.5z" />
+            </svg>
+            Process not running
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Signal Blockers Card ──────────────────────────── -->
+    <div class="card" id="card-blockers">
+      <div class="card-head">
+        <div class="card-top-row">
+          <div class="card-identity">
+            <div>
+              <div class="inst-name">Signal Blockers</div>
+              <div class="inst-sub">Live DB limits — takes effect immediately</div>
+            </div>
+          </div>
+          <span id="blockers-save-status" style="font-size:.72rem;color:var(--text-dim)"></span>
+        </div>
+      </div>
+      <div style="padding:14px 18px;display:grid;grid-template-columns:1fr 1fr;gap:12px 20px">
+
+        <div id="blocker-maxOpenPositions" class="blocker-field">
+          <label style="font-size:.72rem;color:var(--text-dim);display:block;margin-bottom:3px">Max Open Positions</label>
+          <div style="display:flex;align-items:center;gap:8px">
+            <input type="number" id="inp-maxOpenPositions" min="0" step="1"
+              style="width:90px;background:var(--bg-header);border:1px solid var(--border);color:var(--text);font-size:.8rem;padding:3px 7px;border-radius:4px">
+            <label style="font-size:.72rem;color:var(--text-dim);display:flex;align-items:center;gap:4px;cursor:pointer">
+              <input type="checkbox" id="unlim-maxOpenPositions" onchange="onUnlimitedToggle('maxOpenPositions')"> Unlimited
+            </label>
+          </div>
+        </div>
+
+        <div id="blocker-maxOpenPerTimeframe" class="blocker-field">
+          <label style="font-size:.72rem;color:var(--text-dim);display:block;margin-bottom:3px">Max Open Per Timeframe</label>
+          <div style="display:flex;align-items:center;gap:8px">
+            <input type="number" id="inp-maxOpenPerTimeframe" min="0" step="1"
+              style="width:90px;background:var(--bg-header);border:1px solid var(--border);color:var(--text);font-size:.8rem;padding:3px 7px;border-radius:4px">
+            <label style="font-size:.72rem;color:var(--text-dim);display:flex;align-items:center;gap:4px;cursor:pointer">
+              <input type="checkbox" id="unlim-maxOpenPerTimeframe" onchange="onUnlimitedToggle('maxOpenPerTimeframe')"> Disabled (0)
+            </label>
+          </div>
+        </div>
+
+        <div id="blocker-maxOpenPerDirection" class="blocker-field">
+          <label style="font-size:.72rem;color:var(--text-dim);display:block;margin-bottom:3px">Max Open Per Direction</label>
+          <div style="display:flex;align-items:center;gap:8px">
+            <input type="number" id="inp-maxOpenPerDirection" min="0" step="1"
+              style="width:90px;background:var(--bg-header);border:1px solid var(--border);color:var(--text);font-size:.8rem;padding:3px 7px;border-radius:4px">
+            <label style="font-size:.72rem;color:var(--text-dim);display:flex;align-items:center;gap:4px;cursor:pointer">
+              <input type="checkbox" id="unlim-maxOpenPerDirection" onchange="onUnlimitedToggle('maxOpenPerDirection')"> Disabled (0)
+            </label>
+          </div>
+        </div>
+
+        <div id="blocker-dailyLossCapPercent" class="blocker-field">
+          <label style="font-size:.72rem;color:var(--text-dim);display:block;margin-bottom:3px">Daily Loss Cap %</label>
+          <div style="display:flex;align-items:center;gap:8px">
+            <input type="number" id="inp-dailyLossCapPercent" min="0" step="0.1"
+              style="width:90px;background:var(--bg-header);border:1px solid var(--border);color:var(--text);font-size:.8rem;padding:3px 7px;border-radius:4px">
+            <label style="font-size:.72rem;color:var(--text-dim);display:flex;align-items:center;gap:4px;cursor:pointer">
+              <input type="checkbox" id="unlim-dailyLossCapPercent" onchange="onUnlimitedToggle('dailyLossCapPercent')"> Unlimited
+            </label>
+          </div>
+        </div>
+
+        <div id="blocker-maxConsecutiveLossesPerDay" class="blocker-field">
+          <label style="font-size:.72rem;color:var(--text-dim);display:block;margin-bottom:3px">Max Consecutive Losses / Day</label>
+          <div style="display:flex;align-items:center;gap:8px">
+            <input type="number" id="inp-maxConsecutiveLossesPerDay" min="0" step="1"
+              style="width:90px;background:var(--bg-header);border:1px solid var(--border);color:var(--text);font-size:.8rem;padding:3px 7px;border-radius:4px">
+            <label style="font-size:.72rem;color:var(--text-dim);display:flex;align-items:center;gap:4px;cursor:pointer">
+              <input type="checkbox" id="unlim-maxConsecutiveLossesPerDay" onchange="onUnlimitedToggle('maxConsecutiveLossesPerDay')"> Unlimited
+            </label>
+          </div>
+        </div>
+
+        <div id="blocker-scalpMaxConsecutiveLossesPerDay" class="blocker-field">
+          <label style="font-size:.72rem;color:var(--text-dim);display:block;margin-bottom:3px">Scalp Max Consecutive Losses / Day</label>
+          <div style="display:flex;align-items:center;gap:8px">
+            <input type="number" id="inp-scalpMaxConsecutiveLossesPerDay" min="0" step="1"
+              style="width:90px;background:var(--bg-header);border:1px solid var(--border);color:var(--text);font-size:.8rem;padding:3px 7px;border-radius:4px">
+            <label style="font-size:.72rem;color:var(--text-dim);display:flex;align-items:center;gap:4px;cursor:pointer">
+              <input type="checkbox" id="unlim-scalpMaxConsecutiveLossesPerDay" onchange="onUnlimitedToggle('scalpMaxConsecutiveLossesPerDay')"> Unlimited
+            </label>
+          </div>
+        </div>
+
+      </div>
+      <div style="padding:0 18px 14px">
+        <button onclick="saveBlockers()"
+          style="width:100%;padding:8px 0;background:var(--blue);color:#000;border:none;border-radius:6px;font-size:.82rem;font-weight:600;cursor:pointer;transition:opacity .15s"
+          onmouseover="this.style.opacity='.85'" onmouseout="this.style.opacity='1'">
+          Save Blocker Settings
+        </button>
+      </div>
+    </div>
+
+  </div><!-- .main -->
+
+  <script>
+    const PORTS = { eth: 5234 };
+    let state = { eth: 'stopped' };
+    let startTimers = {};
+    let logTimers = {};
+    let initialLoaded = false;
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    function levelClass(line) {
+      if (/\[FTL\]/.test(line)) return 'lvl-ftl';
+      if (/\[ERR\]/.test(line)) return 'lvl-err';
+      if (/\[WRN\]/.test(line)) return 'lvl-wrn';
+      if (/\[DBG\]/.test(line)) return 'lvl-dbg';
+      return 'lvl-inf';
+    }
+
+    // ── Status polling ────────────────────────────────────────────────────────
+
+    async function fetchStatus() {
+      try {
+        const r = await fetch('/api/status');
+        const s = await r.json();
+        for (const inst of ['eth']) {
+          const prev = state[inst];
+          state[inst] = s[inst];
+          renderCard(inst);
+          // process came up — clear the start timer
+          if (initialLoaded && prev !== 'running' && s[inst] === 'running') {
+            clearStartTimer(inst);
+          }
+          // process died externally — uncheck toggle
+          if (prev === 'running' && s[inst] === 'stopped') {
+            document.getElementById(`tog-${inst}`).checked = false;
+            stopLogPolling(inst);
+          }
+        }
+      } catch { }
+    }
+
+    function renderCard(inst) {
+      const s = state[inst];
+      const starting = startTimers[inst] != null && s !== 'running';
+
+      const dot = document.getElementById(`dot-${inst}`);
+      const lbl = document.getElementById(`lbl-${inst}`);
+      const stTxt = document.getElementById(`status-${inst}`);
+      const tog = document.getElementById(`tog-${inst}`);
+      const btn = document.getElementById(`btn-${inst}`);
+      const card = document.getElementById(`card-${inst}`);
+
+      // dot
+      dot.className = 'dot' + (starting ? ' starting' : s === 'running' ? ' running' : '');
+
+      // label + status text
+      if (starting) {
+        lbl.textContent = '…';
+        stTxt.innerHTML = `<span style="color:var(--yellow);font-weight:600">Starting…</span>`;
+      } else if (s === 'running') {
+        lbl.textContent = 'ON';
+        stTxt.innerHTML = `<span style="color:var(--green);font-weight:600">Running</span>`;
+      } else {
+        lbl.textContent = 'OFF';
+        stTxt.innerHTML = `<span style="color:var(--text-dim)">Stopped</span>`;
+      }
+
+      // toggle sync
+      tog.disabled = starting;
+      if (!starting) tog.checked = (s === 'running');
+
+      // dashboard button
+      btn.disabled = s !== 'running';
+      btn.className = `btn-dash ${s === 'running' ? inst + '-live' : ''}`;
+
+      // card border
+      card.className = `card ${s === 'running' ? 'running-' + inst : ''}`;
+    }
+
+    // ── Toggle ────────────────────────────────────────────────────────────────
+
+    async function onToggle(inst, cb) {
+      cb.disabled = true;
+      if (cb.checked) {
+        // Open the portal-served waiting page now, while we have a user gesture.
+        // That page polls the service port itself and redirects when ready.
+        window.open(`/await/${inst}`, `dash-${inst}`);
+        await fetch(`/api/${inst}/start`, { method: 'POST' });
+        startTimers[inst] = setTimeout(() => clearStartTimer(inst), 90000);
+        renderCard(inst);
+        startLogPolling(inst);
+      } else {
+        clearStartTimer(inst);
+        stopLogPolling(inst);
+        await fetch(`/api/${inst}/stop`, { method: 'POST' });
+        state[inst] = 'stopped';
+        renderCard(inst);
+        clearLogPanel(inst);
+        cb.disabled = false;
+      }
+    }
+
+    function clearStartTimer(inst) {
+      if (startTimers[inst]) { clearTimeout(startTimers[inst]); startTimers[inst] = null; }
+    }
+
+    // ── Dashboard ─────────────────────────────────────────────────────────────
+
+    function openDash(inst) {
+      if (state[inst] !== 'running') return;
+      window.open(`http://localhost:${PORTS[inst]}/`, '_blank');
+    }
+
+    async function restartEth() {
+      const btn = document.getElementById('btn-update-eth');
+      btn.disabled = true;
+      btn.textContent = 'Restarting…';
+      btn.style.color = 'var(--yellow)';
+      try {
+        await fetch('/api/eth/restart', { method: 'POST' });
+        // Immediately reflect stopped state
+        state.eth = 'stopped';
+        renderCard('eth');
+        clearStartTimer('eth');
+        startTimers.eth = setTimeout(() => clearStartTimer('eth'), 120000);
+        startLogPolling('eth');
+        // Open waiting page that auto-redirects when service is ready
+        window.open('/await/eth', 'dash-eth');
+      } catch (e) {
+        alert('Restart failed: ' + e.message);
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M8 3a5 5 0 104.546 2.914.5.5 0 01.908-.418A6 6 0 118 2v1z"/><path d="M8 4.466V.534a.25.25 0 01.41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 018 4.466z"/></svg> Update';
+        btn.style.color = 'var(--yellow)';
+      }
+    }
+
+    // ── Playwright headless toggle ─────────────────────────────────────────────
+
+    let _headlessState = null; // true = headless, false = visible
+
+    async function loadHeadlessState() {
+      try {
+        const r = await fetch('/api/portal/playwright/headless');
+        if (!r.ok) return;
+        const d = await r.json();
+        _headlessState = d.headless;
+        renderHeadlessBtn();
+        const note = document.getElementById('headless-apply-note');
+        if (note) note.style.display = 'none';
+      } catch { }
+    }
+
+    function renderHeadlessBtn() {
+      const btn = document.getElementById('btn-headless-toggle');
+      if (!btn || _headlessState === null) return;
+      if (_headlessState) {
+        btn.textContent = 'HEADLESS (Silent)';
+        btn.style.borderColor = 'var(--text-dim)';
+        btn.style.color = 'var(--text-dim)';
+      } else {
+        btn.textContent = 'VISIBLE (Browser shown)';
+        btn.style.borderColor = 'var(--blue)';
+        btn.style.color = 'var(--blue)';
+      }
+    }
+
+    async function toggleHeadless() {
+      if (_headlessState === null) return;
+      const newVal = !_headlessState;
+      const btn = document.getElementById('btn-headless-toggle');
+      btn.disabled = true;
+      try {
+        const r = await fetch('/api/portal/playwright/headless', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ headless: newVal })
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const d = await r.json();
+        _headlessState = d.headless;
+        renderHeadlessBtn();
+        const note = document.getElementById('headless-apply-note');
+        if (note) {
+          note.textContent = d.appliedLive ? 'Applied live' : 'Saved for next start';
+          note.style.color = d.appliedLive ? 'var(--green)' : 'var(--yellow)';
+          note.style.display = 'inline';
+        }
+      } catch (e) {
+        alert('Failed to update headless mode: ' + e.message);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    // ── Signal blockers ───────────────────────────────────────────────────────
+
+    const INT_MAX = 2147483647;
+    const DEC_MAX = 1000000000;
+
+    const BLOCKER_FIELDS = [
+      { key: 'maxOpenPositions',              intField: true,  zeroMeansDisabled: false },
+      { key: 'maxOpenPerTimeframe',           intField: true,  zeroMeansDisabled: true  },
+      { key: 'maxOpenPerDirection',           intField: true,  zeroMeansDisabled: true  },
+      { key: 'dailyLossCapPercent',           intField: false, zeroMeansDisabled: false },
+      { key: 'maxConsecutiveLossesPerDay',    intField: true,  zeroMeansDisabled: false },
+      { key: 'scalpMaxConsecutiveLossesPerDay', intField: true, zeroMeansDisabled: false },
+    ];
+
+    function isUnlimited(key, val, zeroMeansDisabled) {
+      if (zeroMeansDisabled) return val === 0;
+      return val === INT_MAX || val === DEC_MAX || val >= 1e9;
+    }
+
+    async function loadBlockers() {
+      try {
+        const r = await fetch('/api/portal/signal-blockers');
+        if (!r.ok) return;
+        const d = await r.json();
+        for (const { key, intField, zeroMeansDisabled } of BLOCKER_FIELDS) {
+          const val = d[key]; // undefined = not yet set in portal_overrides
+          const inp = document.getElementById(`inp-${key}`);
+          const ck = document.getElementById(`unlim-${key}`);
+          if (!inp || !ck) continue;
+          if (val == null) {
+            ck.checked = true;
+            inp.disabled = true;
+            inp.value = '';
+            inp.placeholder = zeroMeansDisabled ? '0' : 'unlimited';
+            continue;
+          }
+          inp.placeholder = '';
+          const unlimited = isUnlimited(key, val, zeroMeansDisabled);
+          ck.checked = unlimited;
+          inp.disabled = unlimited;
+          inp.value = unlimited ? '' : (intField ? Math.round(val) : val);
+        }
+      } catch { }
+    }
+
+    function onUnlimitedToggle(key) {
+      const ck = document.getElementById(`unlim-${key}`);
+      const inp = document.getElementById(`inp-${key}`);
+      inp.disabled = ck.checked;
+      if (ck.checked) inp.value = '';
+    }
+
+    async function saveBlockers() {
+      const payload = {};
+      for (const { key, intField, zeroMeansDisabled } of BLOCKER_FIELDS) {
+        const ck = document.getElementById(`unlim-${key}`);
+        const inp = document.getElementById(`inp-${key}`);
+        if (ck.checked) {
+          payload[key] = zeroMeansDisabled ? 0 : (intField ? INT_MAX : DEC_MAX);
+        } else {
+          const raw = inp.value.trim();
+          if (raw === '') { alert(`Value required for "${key}"`); return; }
+          payload[key] = intField ? parseInt(raw, 10) : parseFloat(raw);
+        }
+      }
+      const statusEl = document.getElementById('blockers-save-status');
+      statusEl.textContent = 'Saving…';
+      statusEl.style.color = 'var(--yellow)';
+      try {
+        const r = await fetch('/api/portal/signal-blockers', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+        const d = await r.json();
+        statusEl.textContent = d.appliedLive ? 'Saved and applied live ✓' : 'Saved ✓';
+        statusEl.style.color = 'var(--green)';
+        setTimeout(() => { statusEl.textContent = ''; }, 3000);
+      } catch (e) {
+        statusEl.textContent = 'Save failed';
+        statusEl.style.color = 'var(--red)';
+        alert('Save failed: ' + e.message);
+      }
+    }
+
+    // ── Log polling ───────────────────────────────────────────────────────────
+
+    function startLogPolling(inst) {
+      if (logTimers[inst]) return;
+      fetchLogs(inst);
+      logTimers[inst] = setInterval(() => fetchLogs(inst), 3000);
+    }
+
+    function stopLogPolling(inst) {
+      if (logTimers[inst]) { clearInterval(logTimers[inst]); logTimers[inst] = null; }
+    }
+
+    async function fetchLogs(inst) {
+      try {
+        const r = await fetch(`/api/logs/${inst}`);
+        const d = await r.json();
+
+        const panel = document.getElementById(`log-${inst}`);
+        const fileLbl = document.getElementById(`logfile-${inst}`);
+
+        if (!d.lines || d.lines.length === 0) return;
+
+        fileLbl.textContent = d.file || '';
+
+        const atBottom = panel.scrollHeight - panel.scrollTop - panel.clientHeight < 60;
+
+        panel.innerHTML = d.lines.map(line => {
+          const escaped = line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+          return `<div class="log-line ${levelClass(line)}">${escaped}</div>`;
+        }).join('');
+
+        if (atBottom) panel.scrollTop = panel.scrollHeight;
+      } catch { }
+    }
+
+    function clearLogPanel(inst) {
+      const panel = document.getElementById(`log-${inst}`);
+      panel.innerHTML = `<div class="log-empty">
+      <svg width="28" height="28" viewBox="0 0 16 16" fill="currentColor"><path d="M14 1H2a1 1 0 00-1 1v11a1 1 0 001 1h12a1 1 0 001-1V2a1 1 0 00-1-1zM2 0a2 2 0 00-2 2v11a2 2 0 002 2h12a2 2 0 002-2V2a2 2 0 00-2-2H2z"/><path d="M3 4.5a.5.5 0 01.5-.5h9a.5.5 0 010 1h-9a.5.5 0 01-.5-.5zm0 3a.5.5 0 01.5-.5h9a.5.5 0 010 1h-9a.5.5 0 01-.5-.5zm0 3a.5.5 0 01.5-.5h9a.5.5 0 010 1h-9a.5.5 0 01-.5-.5z"/></svg>
+      Process not running</div>`;
+      document.getElementById(`logfile-${inst}`).textContent = '';
+    }
+
+    // ── Boot ──────────────────────────────────────────────────────────────────
+
+    // On load: check if any process is already running and start log polling for it
+    (async () => {
+      await fetchStatus();
+      initialLoaded = true;
+      for (const inst of ['eth']) {
+        if (state[inst] === 'running') startLogPolling(inst);
+      }
+      loadHeadlessState();
+      loadBlockers();
+    })();
+
+    setInterval(fetchStatus, 3000);
+  </script>
+
+  <script>
+    (function () {
+      let tickCount = 0;
+      let es;
+      let lastTickTs = null;
+
+      function animateValue(el, target, decimals = 2, durationMs = 140) {
+        if (!el || !Number.isFinite(target)) return;
+        const current = Number.isFinite(el._value)
+          ? el._value
+          : Number.parseFloat((el.textContent || '').replace(/,/g, ''));
+        const from = Number.isFinite(current) ? current : target;
+        const start = performance.now();
+
+        if (el._raf) cancelAnimationFrame(el._raf);
+
+        const step = (now) => {
+          const t = Math.min(1, (now - start) / durationMs);
+          const eased = 1 - Math.pow(1 - t, 3);
+          const v = from + (target - from) * eased;
+          el._value = v;
+          el.textContent = v.toFixed(decimals);
+          if (t < 1) el._raf = requestAnimationFrame(step);
+        };
+
+        el._raf = requestAnimationFrame(step);
+      }
+
+      function pulseMid(delta) {
+        const midEl = document.getElementById('t-mid');
+        if (!midEl || !delta) return;
+        const color = delta > 0 ? '#3fb950' : '#f85149';
+        midEl.animate(
+          [
+            { color, transform: 'translateY(-1px) scale(1.02)' },
+            { color: '#58a6ff', transform: 'translateY(0) scale(1)' }
+          ],
+          { duration: 180, easing: 'ease-out' }
+        );
+      }
+
+      function setDisconnected(label) {
+        const src = document.getElementById('t-src');
+        if (src) src.textContent = label || 'SSE disconnected';
+      }
+
+      function applyTickPayload(payload) {
+        if (!payload) return;
+
+        const bid = Number(payload.bid);
+        const ask = Number(payload.ask);
+        const mid = Number(payload.mid);
+        const ts = payload.ts || payload.timestamp || null;
+
+        if (!(bid > 0) || !(ask > 0) || !(mid > 0)) return;
+
+        const midEl = document.getElementById('t-mid');
+        const prevMid = Number.isFinite(midEl?._value) ? midEl._value : null;
+
+        animateValue(document.getElementById('t-bid'), bid, 2);
+        animateValue(document.getElementById('t-ask'), ask, 2);
+        animateValue(midEl, mid, 2);
+
+        if (prevMid != null && mid !== prevMid) {
+          pulseMid(mid - prevMid);
+        }
+
+        if (ts && ts !== lastTickTs) {
+          lastTickTs = ts;
+          tickCount++;
+          document.getElementById('tick-count').textContent = `${tickCount} ticks`;
+        }
+
+        document.title = `ETH/USD ${mid.toFixed(2)} — Signal Platform`;
+      }
+
+      function connectSse() {
+        if (es) {
+          try { es.close(); } catch { }
+        }
+
+        es = new EventSource('/api/eth/ticks/stream');
+        es.onmessage = (e) => {
+          try {
+            applyTickPayload(JSON.parse(e.data));
+          } catch { }
+        };
+        es.onerror = () => {
+          setDisconnected('SSE disconnected');
+          // Keep trying in case upstream tick stream was temporarily unavailable.
+          setTimeout(connectSse, 1500);
+        };
+      }
+
+      // SSE for live bid/ask ticks
+      connectSse();
+
+      // Quote polling fallback/booster: keeps UI populated even if EventSource stalls.
+      async function pollQuote() {
+        try {
+          const r = await fetch('/api/eth/quote/current', { cache: 'no-store' });
+          if (!r.ok) throw new Error('quote unavailable');
+          const q = await r.json();
+          applyTickPayload(q);
+        } catch {
+          // Keep last values; health poll will mark source/offline state.
+        }
+      }
+      pollQuote();
+      setInterval(pollQuote, 200);
+
+      // Poll health endpoint every 5 seconds for Hz and source info
+      async function pollHealth() {
+        try {
+          const r = await fetch('/api/eth/health/ticks');
+          if (!r.ok) throw new Error('health unavailable');
+          const d = await r.json();
+          document.getElementById('t-hz').textContent =
+            `${(d.tickRateHz || 0).toFixed(1)} Hz`;
+          document.getElementById('t-src').textContent =
+            d.tickProviderKind || '—';
+        } catch {
+          document.getElementById('t-hz').textContent = '— Hz';
+          setDisconnected('ETH offline');
+          // Keep retrying SSE in case ETH process was just started.
+          connectSse();
+        }
+      }
+      pollHealth();
+      setInterval(pollHealth, 5_000);
+    })();
+  </script>
+</body>
+
+</html>
