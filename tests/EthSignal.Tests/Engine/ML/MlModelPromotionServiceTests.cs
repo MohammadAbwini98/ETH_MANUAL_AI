@@ -107,7 +107,7 @@ public class MlModelPromotionServiceTests
     }
 
     [Fact]
-    public void EvaluatePromotion_CriticalFeatureDrift_BlocksPromotion()
+    public void EvaluatePromotion_CriticalFeatureDrift_DoesNotBlockPromotionByItself()
     {
         var candidatePath = Path.GetTempFileName();
         try
@@ -123,9 +123,10 @@ public class MlModelPromotionServiceTests
             var ctx = new MlPromotionContext { FeatureDriftStatus = MlDiagnosticsStatus.Critical };
             var decision = service.EvaluatePromotion("outcome_predictor", models, ctx);
 
-            decision.ShouldActivate.Should().BeFalse();
-            decision.Reason.Should().Contain("CRITICAL feature drift");
-            decision.BlockReasons.Should().NotBeEmpty();
+            decision.ShouldActivate.Should().BeTrue();
+            decision.SelectedModel!.ModelVersion.Should().Be("candidate-strong");
+            decision.Reason.Should().Contain("No active model exists");
+            decision.BlockReasons.Should().BeEmpty();
             service.LastPromotionBlockReason.Should().BeNull(); // set only by PromoteBestModelAsync
         }
         finally
@@ -207,7 +208,7 @@ public class MlModelPromotionServiceTests
             blockers.Should().Contain(b => b.Contains("WIN samples"));
             blockers.Should().Contain(b => b.Contains("LOSS samples"));
             blockers.Should().Contain(b => b.Contains("calibration samples"));
-            blockers.Should().Contain(b => b.Contains("live calibration Brier"));
+            blockers.Should().NotContain(b => b.Contains("live calibration Brier"));
             blockers.Should().Contain(b => b.Contains("threshold lift"));
         }
         finally

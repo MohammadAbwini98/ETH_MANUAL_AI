@@ -53,6 +53,23 @@ public class OutcomeEvaluatorTests
         outcome.BarsObserved.Should().Be(2);
     }
 
+    [Fact]
+    public void Resolved_Outcome_Uses_ClosedAt_As_EvaluatedAt()
+    {
+        var signal = MakeBuySignal(entry: 2000, tp: 2015, sl: 1990);
+        var t = signal.SignalTimeUtc;
+        var candles = new List<RichCandle>
+        {
+            MakeCandle(t.AddMinutes(5), midH: 2008, midL: 1995, midC: 2005),
+            MakeCandle(t.AddMinutes(10), midH: 2016, midL: 2003, midC: 2014),
+        };
+
+        var outcome = OutcomeEvaluator.Evaluate(signal, candles);
+
+        outcome.ClosedAtUtc.Should().NotBeNull();
+        outcome.EvaluatedAtUtc.Should().Be(outcome.ClosedAtUtc!.Value);
+    }
+
     /// <summary>P6-T3: LOSS outcome — SL hit first.</summary>
     [Fact]
     public void BUY_SL_Hit_First_Is_LOSS()
@@ -122,6 +139,31 @@ public class OutcomeEvaluatorTests
 
         outcome.OutcomeLabel.Should().Be(OutcomeLabel.WIN);
         outcome.PnlR.Should().Be(1m);
+    }
+
+    [Fact]
+    public void MultiTarget_PartialWin_Flags_TpAndSlAndPartialWin()
+    {
+        var signal = MakeBuySignal(entry: 2000, tp: 2030, sl: 1990) with
+        {
+            Tp1Price = 2010,
+            Tp2Price = 2020,
+            Tp3Price = 2030
+        };
+        var t = signal.SignalTimeUtc;
+        var candles = new List<RichCandle>
+        {
+            MakeCandle(t.AddMinutes(5), midH: 2011, midL: 2001, midC: 2010),
+            MakeCandle(t.AddMinutes(10), midH: 2006, midL: 1999, midC: 2000),
+        };
+
+        var outcome = OutcomeEvaluator.Evaluate(signal, candles);
+
+        outcome.OutcomeLabel.Should().Be(OutcomeLabel.WIN);
+        outcome.TpHit.Should().BeTrue();
+        outcome.SlHit.Should().BeTrue();
+        outcome.PartialWin.Should().BeTrue();
+        outcome.PnlR.Should().Be(0.4m);
     }
 
     [Fact]

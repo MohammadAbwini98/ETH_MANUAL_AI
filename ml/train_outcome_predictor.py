@@ -21,43 +21,42 @@ from sklearn.model_selection import TimeSeriesSplit
 
 # ─── Feature columns (must match MlFeatureVector.FeatureNames) ────────
 FEATURE_NAMES = [
-    # Category A (14)
+    # Category A (12) — removed: spread (zero imp; spread_pct used), volume (zero imp; volume_ratio/zscore used)
     "ema20", "ema50", "rsi14", "macd_hist", "adx14", "plus_di", "minus_di", "atr14",
-    "vwap", "volume_sma20", "spread", "close_mid", "volume", "body_ratio",
+    "vwap", "volume_sma20", "close_mid", "body_ratio",
     # Category B (18)
     "ema20_minus_ema50", "ema20_minus_ema50_pct", "ema20_slope_3", "ema20_slope_5",
     "rsi14_delta", "rsi14_delta_3", "macd_hist_delta", "macd_hist_delta_3",
     "adx14_delta", "atr14_pct", "atr14_delta_pct", "distance_to_ema20_pct",
     "distance_to_vwap_pct", "volume_ratio", "spread_pct", "di_differential",
     "di_ratio", "candle_range_pct",
-    # Category C (12)
-    # Note: direction_encoded is intentionally excluded. Training data filters to BUY/SELL
-    # contexts only (direction_encoded != 0), so the model never sees direction_encoded=0.
-    # Including it creates a train/inference distribution mismatch that degrades performance.
-    # Direction context is implicitly captured via regime_label and rule_based_score.
-    "regime_label", "regime_score", "regime_age_bars", "rule_based_score",
-    "timeframe_encoded", "hour_of_day", "day_of_week", "minutes_since_open",
-    "is_london_session", "is_ny_session", "is_asia_session", "is_overlap",
-    # Category D (8)
+    # Category C (7) — removed: regime_label (zero imp; regime_score captures strength),
+    # timeframe_encoded (zero imp), day_of_week (zero imp), is_ny_session (zero imp),
+    # is_overlap (zero imp). Direction context is captured via regime_score + rule_based_score.
+    "regime_score", "regime_age_bars", "rule_based_score",
+    "hour_of_day", "minutes_since_open",
+    "is_london_session", "is_asia_session",
+    # Category D (6) — removed: regime_changes_last_20 (zero imp)
     "bars_since_last_signal",
     "avg_atr_20_bars", "atr_zscore", "avg_volume_10_bars", "volume_zscore",
-    "price_range_20_bars_pct", "regime_changes_last_20", "pullback_depth_pct",
+    "price_range_20_bars_pct", "pullback_depth_pct",
     # Category E (7) — market structure
     "session_range_position_pct", "distance_to_prior_day_high_pct",
     "distance_to_prior_day_low_pct", "distance_to_session_vwap_pct",
     "range_position_pct", "distance_to_20_bar_high_pct", "distance_to_20_bar_low_pct",
-    # Category F (6) — volatility regime
+    # Category F (5) — volatility regime; removed: volatility_expansion_flag (zero imp)
     "realized_vol_15m", "realized_vol_1h", "realized_vol_4h",
-    "volatility_compression_flag", "volatility_expansion_flag", "atr_percentile_rank",
-    # Category G (5) — signal saturation
-    "signals_last_10_bars", "same_direction_signals_last_10",
-    "opposite_direction_signals_last_10", "recent_stop_out_count",
-    "recent_false_breakout_rate",
-    # Category H (3) — BTC cross-asset context
-    "btc_recent_return", "btc_regime_label", "eth_btc_relative_strength",
+    "volatility_compression_flag", "atr_percentile_rank",
+    # Category G (3) — signal saturation; removed: same/opposite_direction_signals_last_10
+    # and recent_false_breakout_rate (all zero imp)
+    "signals_last_10_bars", "recent_stop_out_count",
+    # Category H — BTC cross-asset: all three features had zero importance; removed entirely.
+    # Re-evaluate when dataset grows beyond 600 samples.
 ]
 
 EMBARGO_BARS = 12  # 60 min embargo at 5m bars
+MIN_TRAIN_SAMPLES_PER_FOLD = 30
+MIN_VALIDATION_SAMPLES_PER_FOLD = 10
 
 
 def load_data(data_path: str) -> pd.DataFrame:
@@ -86,13 +85,23 @@ def load_data(data_path: str) -> pd.DataFrame:
 def walk_forward_split(df: pd.DataFrame, n_folds: int = 5, embargo: int = EMBARGO_BARS):
     """Walk-forward split with purge/embargo. Embargo is scaled to dataset size."""
     tscv = TimeSeriesSplit(n_splits=n_folds)
-    for train_idx, test_idx in tscv.split(df):
+    for fold_num, (train_idx, test_idx) in enumerate(tscv.split(df), start=1):
         # Purge: remove last embargo bars from train
         if len(train_idx) > embargo:
             train_idx = train_idx[:-embargo]
         # Embargo: remove first embargo bars from test
         if len(test_idx) > embargo:
             test_idx = test_idx[embargo:]
+        if len(train_idx) < MIN_TRAIN_SAMPLES_PER_FOLD:
+            print(
+                f"  WARN: Fold {fold_num} has only {len(train_idx)} train samples after embargo; skipping fold"
+            )
+            continue
+        if len(test_idx) < MIN_VALIDATION_SAMPLES_PER_FOLD:
+            print(
+                f"  WARN: Fold {fold_num} has only {len(test_idx)} validation samples after embargo; skipping fold"
+            )
+            continue
         yield train_idx, test_idx
 
 
@@ -107,18 +116,29 @@ def train_lightgbm(X_train, y_train, X_val, y_val):
     # If val set has only one class, early stopping has no AUC signal — skip it
     # so the model trains for the full n_estimators and learns real feature splits.
     val_has_both_classes = len(np.unique(y_val)) >= 2
+    # Regularised GBDT for small datasets (~200–800 samples).
+    # DART was tested but degraded Brier/ECE on small data because the probability
+    # outputs become mis-calibrated when trees are randomly dropped at train time
+    # but all trees are used at inference. Standard GBDT with tighter regularisation
+    # achieves the same anti-overfitting goal without hurting calibration:
+    #   - num_leaves capped lower (n//6 vs n//4) → shallower trees
+    #   - min_child_samples raised (n//4 vs n//5) → larger leaf splits required
+    #   - L1/L2 regularisation added
+    #   - feature/bagging fractions slightly reduced
     params = {
         "objective": "binary",
         "metric": "auc",
         "boosting_type": "gbdt",
-        "num_leaves": max(4, min(31, n // 4)),
+        "num_leaves": max(4, min(20, n // 6)),
         "learning_rate": 0.05,
-        "feature_fraction": 0.8,
-        "bagging_fraction": 0.8,
+        "feature_fraction": 0.7,
+        "bagging_fraction": 0.7,
         "bagging_freq": 5,
+        "reg_alpha": 0.1,   # L1 — pushes small splits to zero
+        "reg_lambda": 1.0,  # L2 — shrinks all leaf weights
         "verbose": -1,
         "n_estimators": min(500, max(50, n * 5)),
-        "min_child_samples": max(1, min(20, n // 5)),
+        "min_child_samples": max(5, min(20, n // 5)),
         "scale_pos_weight": spw,
     }
     if val_has_both_classes:
@@ -256,17 +276,36 @@ def export_to_onnx(model, feature_names, output_path):
     print(f"Model saved to {native_path}")
 
 
-def main(data_path: str, output_dir: str, n_folds: int, model_type: str):
+REGIME_LABEL_MAP = {
+    "BEARISH": -1,
+    "NEUTRAL": 0,
+    "BULLISH": 1,
+}
+
+
+def main(data_path: str, output_dir: str, n_folds: int, model_type: str, regime: str = "ALL"):
     df = load_data(data_path)
 
-    MIN_TRAINING_SAMPLES = 200
+    # For regime-specific models, filter to matching rows.
+    # The "regime_label" column must exist in the export (values: -1, 0, 1).
+    regime_scope = regime.upper()
+    if regime_scope != "ALL":
+        if "regime_label" not in df.columns:
+            print(f"\nSKIP: 'regime_label' column not in CSV — cannot filter for regime={regime_scope}.")
+            sys.exit(2)
+        regime_int = REGIME_LABEL_MAP[regime_scope]
+        df = df[df["regime_label"] == regime_int].reset_index(drop=True)
+        print(f"Regime filter: {regime_scope} (label={regime_int}) → {len(df)} samples retained")
+
+    # Regime-specific models need fewer samples (they cover 1/3 of market conditions)
+    MIN_TRAINING_SAMPLES = 50 if regime_scope != "ALL" else 200
 
     available_features = [f for f in FEATURE_NAMES if f in df.columns]
     X = df[available_features].astype(np.float32)  # keep as DataFrame to preserve feature names
     y = df["target"].values.astype(int)
 
     if len(df) < MIN_TRAINING_SAMPLES:
-        print(f"\nSKIP: Only {len(df)} samples — need at least {MIN_TRAINING_SAMPLES}.")
+        print(f"\nSKIP: Only {len(df)} samples — need at least {MIN_TRAINING_SAMPLES} for regime={regime_scope}.")
         print("  Accumulate more labeled signals and re-run.")
         sys.exit(2)
 
@@ -436,12 +475,17 @@ def main(data_path: str, output_dir: str, n_folds: int, model_type: str):
     os.makedirs(output_dir, exist_ok=True)
     version = datetime.now(timezone.utc).strftime("v%Y%m%d_%H%M%S")
 
-    onnx_path = os.path.abspath(os.path.join(output_dir, f"outcome_predictor_{version}.onnx"))
+    # Regime-specific models get a distinguishing prefix in their filename so
+    # all four artifacts can coexist in the same models/ directory.
+    regime_prefix = f"_{regime_scope}" if regime_scope != "ALL" else ""
+    onnx_filename = f"outcome_predictor{regime_prefix}_{version}.onnx"
+    onnx_path = os.path.abspath(os.path.join(output_dir, onnx_filename))
     export_to_onnx(best_model, available_features, onnx_path)
 
     # Save metadata
     metadata = {
         "model_type": "outcome_predictor",
+        "regime_scope": regime_scope,
         "model_version": version,
         "file_path": onnx_path,
         "file_format": "onnx",
@@ -460,7 +504,8 @@ def main(data_path: str, output_dir: str, n_folds: int, model_type: str):
         "trained_at_utc": datetime.now(timezone.utc).isoformat(),
     }
 
-    meta_path = os.path.join(output_dir, f"outcome_predictor_{version}_meta.json")
+    meta_filename = f"outcome_predictor{regime_prefix}_{version}_meta.json"
+    meta_path = os.path.join(output_dir, meta_filename)
     with open(meta_path, "w") as f:
         json.dump(metadata, f, indent=2)
     print(f"\nMetadata saved to {meta_path}")
@@ -472,6 +517,12 @@ if __name__ == "__main__":
     parser.add_argument("--output", default="models/", help="Output directory for models")
     parser.add_argument("--folds", type=int, default=5, help="Number of walk-forward folds")
     parser.add_argument("--model", default="lightgbm", choices=["lightgbm", "xgboost"])
+    parser.add_argument(
+        "--regime",
+        default="ALL",
+        choices=["ALL", "BEARISH", "BULLISH", "NEUTRAL"],
+        help="Train on all data (ALL) or filter to a specific market regime.",
+    )
     args = parser.parse_args()
 
-    main(args.data, args.output, args.folds, args.model)
+    main(args.data, args.output, args.folds, args.model, args.regime)

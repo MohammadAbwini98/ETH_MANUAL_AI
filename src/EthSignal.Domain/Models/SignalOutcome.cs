@@ -10,6 +10,7 @@ public sealed record SignalOutcome
     public int BarsObserved { get; init; }
     public bool TpHit { get; init; }
     public bool SlHit { get; init; }
+    public bool PartialWin { get; init; }
     public required OutcomeLabel OutcomeLabel { get; init; }
 
     public decimal PnlR { get; init; }

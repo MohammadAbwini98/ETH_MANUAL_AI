@@ -89,7 +89,11 @@ public sealed class MlDataDiagnosticsRepository : IMlDataDiagnosticsRepository
                         WHERE (o.outcome_label = 'WIN' AND o.pnl_r <= 0)
                            OR (o.outcome_label = 'LOSS' AND o.pnl_r >= 0)
                     )::INT AS inconsistent_pnl_labels,
-                    COUNT(*) FILTER (WHERE o.tp_hit AND o.sl_hit)::INT AS conflicting_tp_sl_hits,
+                    COUNT(*) FILTER (
+                        WHERE o.tp_hit
+                          AND o.sl_hit
+                          AND COALESCE(o.partial_win, FALSE) = FALSE
+                    )::INT AS conflicting_tp_sl_hits,
                     COUNT(*) FILTER (
                         WHERE o.outcome_label IN ('WIN', 'LOSS', 'EXPIRED', 'AMBIGUOUS')
                           AND o.closed_at_utc IS NULL

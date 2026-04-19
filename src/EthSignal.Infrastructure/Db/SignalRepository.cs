@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using EthSignal.Domain.Models;
 using Npgsql;
@@ -67,21 +68,23 @@ public sealed class SignalRepository : ISignalRepository
 
         await using var cmd = new NpgsqlCommand(@"
             INSERT INTO ""ETH"".signal_outcomes
-                (signal_id, evaluated_at_utc, bars_observed, tp_hit, sl_hit,
+                (signal_id, evaluated_at_utc, bars_observed, tp_hit, sl_hit, partial_win,
                  outcome_label, pnl_r, mfe_price, mae_price, mfe_r, mae_r, closed_at_utc)
-            VALUES (@id, NOW(), @bars, @tp, @sl, @label, @pnl, @mfe, @mae, @mfer, @maer, @closed)
+            VALUES (@id, @evaluated, @bars, @tp, @sl, @partial, @label, @pnl, @mfe, @mae, @mfer, @maer, @closed)
             ON CONFLICT (signal_id) DO UPDATE SET
-                evaluated_at_utc = NOW(), bars_observed = EXCLUDED.bars_observed,
-                tp_hit = EXCLUDED.tp_hit, sl_hit = EXCLUDED.sl_hit,
+                evaluated_at_utc = EXCLUDED.evaluated_at_utc, bars_observed = EXCLUDED.bars_observed,
+                tp_hit = EXCLUDED.tp_hit, sl_hit = EXCLUDED.sl_hit, partial_win = EXCLUDED.partial_win,
                 outcome_label = EXCLUDED.outcome_label, pnl_r = EXCLUDED.pnl_r,
                 mfe_price = EXCLUDED.mfe_price, mae_price = EXCLUDED.mae_price,
                 mfe_r = EXCLUDED.mfe_r, mae_r = EXCLUDED.mae_r,
                 closed_at_utc = EXCLUDED.closed_at_utc;", conn);
 
         cmd.Parameters.AddWithValue("id", outcome.SignalId);
+        cmd.Parameters.AddWithValue("evaluated", outcome.EvaluatedAtUtc);
         cmd.Parameters.AddWithValue("bars", outcome.BarsObserved);
         cmd.Parameters.AddWithValue("tp", outcome.TpHit);
         cmd.Parameters.AddWithValue("sl", outcome.SlHit);
+        cmd.Parameters.AddWithValue("partial", outcome.PartialWin);
         cmd.Parameters.AddWithValue("label", outcome.OutcomeLabel.ToString());
         cmd.Parameters.AddWithValue("pnl", outcome.PnlR);
         cmd.Parameters.AddWithValue("mfe", outcome.MfePrice);
@@ -241,7 +244,7 @@ public sealed class SignalRepository : ISignalRepository
         await conn.OpenAsync(ct);
 
         var sql = @"
-            SELECT o.signal_id, o.bars_observed, o.tp_hit, o.sl_hit,
+            SELECT o.signal_id, o.bars_observed, o.tp_hit, o.sl_hit, o.partial_win,
                    o.outcome_label, o.pnl_r, o.mfe_price, o.mae_price, o.mfe_r, o.mae_r, o.closed_at_utc
             FROM ""ETH"".signal_outcomes o
             JOIN ""ETH"".signals s ON s.signal_id = o.signal_id
@@ -267,13 +270,14 @@ public sealed class SignalRepository : ISignalRepository
                 BarsObserved = r.GetInt32(1),
                 TpHit = r.GetBoolean(2),
                 SlHit = r.GetBoolean(3),
-                OutcomeLabel = Enum.Parse<OutcomeLabel>(r.GetString(4)),
-                PnlR = r.GetDecimal(5),
-                MfePrice = r.GetDecimal(6),
-                MaePrice = r.GetDecimal(7),
-                MfeR = r.GetDecimal(8),
-                MaeR = r.GetDecimal(9),
-                ClosedAtUtc = r.IsDBNull(10) ? null : r.GetFieldValue<DateTimeOffset>(10)
+                PartialWin = r.GetBoolean(4),
+                OutcomeLabel = Enum.Parse<OutcomeLabel>(r.GetString(5)),
+                PnlR = r.GetDecimal(6),
+                MfePrice = r.GetDecimal(7),
+                MaePrice = r.GetDecimal(8),
+                MfeR = r.GetDecimal(9),
+                MaeR = r.GetDecimal(10),
+                ClosedAtUtc = r.IsDBNull(11) ? null : r.GetFieldValue<DateTimeOffset>(11)
             });
         }
         return results;
@@ -315,23 +319,36 @@ public sealed class SignalRepository : ISignalRepository
 
     public async Task InsertSignalFeaturesAsync(Guid signalId, Dictionary<string, decimal> features, CancellationToken ct = default)
     {
+        if (features.Count == 0)
+            return;
+
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
-        await using var tx = await conn.BeginTransactionAsync(ct);
+        var sql = new StringBuilder(@"
+            INSERT INTO ""ETH"".signal_features (signal_id, feature_name, feature_value_numeric)
+            VALUES ");
 
+        await using var cmd = new NpgsqlCommand { Connection = conn };
+        cmd.Parameters.AddWithValue("id", signalId);
+
+        var index = 0;
         foreach (var (name, value) in features)
         {
-            await using var cmd = new NpgsqlCommand(@"
-                INSERT INTO ""ETH"".signal_features (signal_id, feature_name, feature_value_numeric)
-                VALUES (@id, @name, @val)
-                ON CONFLICT (signal_id, feature_name) DO UPDATE SET feature_value_numeric = EXCLUDED.feature_value_numeric;", conn);
-            cmd.Parameters.AddWithValue("id", signalId);
-            cmd.Parameters.AddWithValue("name", name);
-            cmd.Parameters.AddWithValue("val", value);
-            await cmd.ExecuteNonQueryAsync(ct);
+            if (index > 0)
+                sql.Append(", ");
+
+            sql.Append($"(@id, @name{index}, @val{index})");
+            cmd.Parameters.AddWithValue($"name{index}", name);
+            cmd.Parameters.AddWithValue($"val{index}", value);
+            index++;
         }
 
-        await tx.CommitAsync(ct);
+        sql.Append(@"
+            ON CONFLICT (signal_id, feature_name)
+            DO UPDATE SET feature_value_numeric = EXCLUDED.feature_value_numeric;");
+        cmd.CommandText = sql.ToString();
+
+        await cmd.ExecuteNonQueryAsync(ct);
     }
 
     public async Task<IReadOnlyList<SignalWithOutcome>> GetSignalHistoryWithOutcomesAsync(string symbol, int limit, int offset, CancellationToken ct = default)
@@ -343,7 +360,7 @@ public sealed class SignalRepository : ISignalRepository
             SELECT s.signal_id, s.timeframe, s.signal_time_utc, s.direction,
                    s.entry_price, s.tp_price, s.sl_price, s.risk_percent, s.risk_usd,
                    s.confidence_score, s.regime, s.strategy_version, s.reasons_json, s.status,
-                   o.outcome_label, o.pnl_r, o.bars_observed, o.tp_hit, o.sl_hit,
+                   o.outcome_label, o.pnl_r, o.bars_observed, o.tp_hit, o.sl_hit, o.partial_win,
                    o.mfe_price, o.mae_price, o.mfe_r, o.mae_r, o.closed_at_utc
             FROM ""ETH"".signals s
             LEFT JOIN ""ETH"".signal_outcomes o ON s.signal_id = o.signal_id
@@ -370,11 +387,12 @@ public sealed class SignalRepository : ISignalRepository
                     BarsObserved = r.GetInt32(16),
                     TpHit = r.GetBoolean(17),
                     SlHit = r.GetBoolean(18),
-                    MfePrice = r.GetDecimal(19),
-                    MaePrice = r.GetDecimal(20),
-                    MfeR = r.GetDecimal(21),
-                    MaeR = r.GetDecimal(22),
-                    ClosedAtUtc = r.IsDBNull(23) ? null : r.GetFieldValue<DateTimeOffset>(23)
+                    PartialWin = r.GetBoolean(19),
+                    MfePrice = r.GetDecimal(20),
+                    MaePrice = r.GetDecimal(21),
+                    MfeR = r.GetDecimal(22),
+                    MaeR = r.GetDecimal(23),
+                    ClosedAtUtc = r.IsDBNull(24) ? null : r.GetFieldValue<DateTimeOffset>(24)
                 };
             }
             results.Add(new SignalWithOutcome { Signal = signal, Outcome = outcome });

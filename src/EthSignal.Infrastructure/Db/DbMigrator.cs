@@ -224,6 +224,7 @@ public sealed class DbMigrator : IDbMigrator
                 bars_observed       INT         NOT NULL DEFAULT 0,
                 tp_hit              BOOLEAN     NOT NULL DEFAULT FALSE,
                 sl_hit              BOOLEAN     NOT NULL DEFAULT FALSE,
+                partial_win         BOOLEAN     NOT NULL DEFAULT FALSE,
                 outcome_label       TEXT        NOT NULL DEFAULT 'PENDING',
                 pnl_r               NUMERIC     NOT NULL DEFAULT 0,
                 mfe_price           NUMERIC     NOT NULL DEFAULT 0,
@@ -244,6 +245,7 @@ public sealed class DbMigrator : IDbMigrator
                 bars_observed       INT         NOT NULL DEFAULT 0,
                 tp_hit              BOOLEAN     NOT NULL DEFAULT FALSE,
                 sl_hit              BOOLEAN     NOT NULL DEFAULT FALSE,
+                partial_win         BOOLEAN     NOT NULL DEFAULT FALSE,
                 outcome_label       TEXT        NOT NULL DEFAULT 'PENDING',
                 pnl_r               NUMERIC     NOT NULL DEFAULT 0,
                 mfe_price           NUMERIC     NOT NULL DEFAULT 0,
@@ -274,6 +276,7 @@ public sealed class DbMigrator : IDbMigrator
                 bars_observed       INT         NOT NULL DEFAULT 0,
                 tp_hit              BOOLEAN     NOT NULL DEFAULT FALSE,
                 sl_hit              BOOLEAN     NOT NULL DEFAULT FALSE,
+                partial_win         BOOLEAN     NOT NULL DEFAULT FALSE,
                 outcome_label       TEXT        NOT NULL DEFAULT 'PENDING',
                 pnl_r               NUMERIC     NOT NULL DEFAULT 0,
                 mfe_price           NUMERIC     NOT NULL DEFAULT 0,
@@ -292,6 +295,10 @@ public sealed class DbMigrator : IDbMigrator
         await Exec(conn, @"
             CREATE INDEX IF NOT EXISTS idx_generated_signal_outcomes_label
             ON ""ETH"".generated_signal_outcomes (outcome_label, evaluated_at_utc DESC);", ct);
+
+        await Exec(conn, @"ALTER TABLE ""ETH"".signal_outcomes ADD COLUMN IF NOT EXISTS partial_win BOOLEAN NOT NULL DEFAULT FALSE;", ct);
+        await Exec(conn, @"ALTER TABLE ""ETH"".blocked_signal_outcomes ADD COLUMN IF NOT EXISTS partial_win BOOLEAN NOT NULL DEFAULT FALSE;", ct);
+        await Exec(conn, @"ALTER TABLE ""ETH"".generated_signal_outcomes ADD COLUMN IF NOT EXISTS partial_win BOOLEAN NOT NULL DEFAULT FALSE;", ct);
 
         // B-14: Migrate reasons_json from TEXT to JSONB
         if (await ColumnExistsAsync(conn, "signals", "reasons_json", ct))
@@ -621,6 +628,16 @@ public sealed class DbMigrator : IDbMigrator
         await Exec(conn, @"
             CREATE INDEX IF NOT EXISTS idx_ml_models_type
             ON ""ETH"".ml_models(model_type, status);", ct);
+
+        // ENH-1: Regime-specific sub-models — add regime_scope column if missing
+        await Exec(conn, @"
+            ALTER TABLE ""ETH"".ml_models
+            ADD COLUMN IF NOT EXISTS regime_scope VARCHAR(10) NOT NULL DEFAULT 'ALL';", ct);
+
+        await Exec(conn, @"
+            CREATE INDEX IF NOT EXISTS idx_ml_models_type_scope_status
+            ON ""ETH"".ml_models (model_type, regime_scope, status)
+            WHERE LOWER(status) = 'active';", ct);
 
         await Exec(conn, @"
             CREATE TABLE IF NOT EXISTS ""ETH"".ml_training_runs (

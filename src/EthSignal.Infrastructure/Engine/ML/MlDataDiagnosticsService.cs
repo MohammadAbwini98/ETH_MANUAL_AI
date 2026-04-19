@@ -24,6 +24,16 @@ public sealed class MlDataDiagnosticsService : IMlDataDiagnosticsService
     private const int CalibrationLimit = 400;
     private const int StaleUnlinkedHours = 6;
     private static readonly TimeSpan CacheTtl = TimeSpan.FromSeconds(30);
+    private static readonly HashSet<string> ValidScopes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "ALL",
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "1h",
+        "4h"
+    };
 
     private readonly IMlDataDiagnosticsRepository _repo;
     private readonly IMlModelRepository _modelRepo;
@@ -213,9 +223,16 @@ public sealed class MlDataDiagnosticsService : IMlDataDiagnosticsService
     }
 
     private static string NormalizeScope(string timeframe)
-        => string.Equals(timeframe, AllTimeframesScope, StringComparison.OrdinalIgnoreCase)
+    {
+        var normalized = string.Equals(timeframe, AllTimeframesScope, StringComparison.OrdinalIgnoreCase)
             ? "ALL"
-            : timeframe;
+            : timeframe?.Trim() ?? string.Empty;
+
+        if (!ValidScopes.Contains(normalized))
+            throw new ArgumentException($"Invalid scope '{timeframe}'", nameof(timeframe));
+
+        return normalized;
+    }
 
     private static IReadOnlyList<string> ResolveTimeframes(string normalizedScope)
         => string.Equals(normalizedScope, "ALL", StringComparison.OrdinalIgnoreCase)
@@ -665,8 +682,15 @@ public sealed class MlDataDiagnosticsService : IMlDataDiagnosticsService
 
             var trainingPct = Math.Max(1e-6, training.Count(v => v >= lower && v < upper) / (double)training.Length);
             var livePct = Math.Max(1e-6, live.Count(v => v >= lower && v < upper) / (double)live.Length);
-            psi += (livePct - trainingPct) * Math.Log(livePct / trainingPct);
+            var contribution = (livePct - trainingPct) * Math.Log(livePct / trainingPct);
+            if (double.IsNaN(contribution) || double.IsInfinity(contribution))
+                continue;
+
+            psi += Math.Clamp(contribution, -5d, 5d);
         }
+
+        if (double.IsNaN(psi) || double.IsInfinity(psi))
+            return 0d;
 
         return psi;
     }

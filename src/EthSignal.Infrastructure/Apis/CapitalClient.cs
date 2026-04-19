@@ -179,7 +179,10 @@ public sealed class CapitalClient : ICapitalClient
                 req.Headers.Add("X-SECURITY-TOKEN", _securityToken);
                 await _http.SendAsync(req);
             }
-            catch { }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[CapitalClient] Session logout failed; session may persist server-side");
+            }
         }
         _http.Dispose();
     }

@@ -330,12 +330,6 @@ public static class ExitEngine
             }
         }
 
-        // ═══════════════════════════════════════════════════════
-        // 4. SL REJECTION RULE
-        // ═══════════════════════════════════════════════════════
-        if (finalStopDistance > maxStop)
-            return Reject($"SL too wide ({finalStopDistance:F4} > max {maxStop:F4}) for setup");
-
         // Determine exit model used
         string exitModel = structureStop > 0
             ? (structureTargetDistance > 0 ? "STRUCTURE_FULL" : "STRUCTURE_SL_ONLY")
@@ -362,7 +356,7 @@ public static class ExitEngine
     {
         AtrMultiplier = p.StopAtrMultiplier,
         SpreadSlippageBufferPct = p.LiveEntrySlippageBufferPct,
-        MinStopDistancePct = 0.002m,
+        MinStopDistancePct = p.MinStopDistancePct,
         MaxStopDistancePct = p.ExitMaxStopDistancePct,
         MinRewardToRisk = p.MinRiskRewardAfterRounding,
         DefaultRewardToRisk = p.TargetRMultiple,

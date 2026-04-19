@@ -24,6 +24,7 @@ public sealed class MlInferenceService : IDisposable
     private readonly ILogger<MlInferenceService> _logger;
     private readonly ReaderWriterLockSlim _lock = new();
 
+    // Global (ALL-regime) model — primary fallback when no regime specialist is loaded
     private MlModelMetadata? _activeModel;
     private InferenceSession? _onnxSession;
     private Func<float[], (float winProb, float calibrated)>? _inferFunc;
@@ -32,6 +33,19 @@ public sealed class MlInferenceService : IDisposable
     private string? _thresholdLookupVersion;
     private SignalFrequencyManager? _frequencyManager;
     private IReadOnlyList<string>? _activeFeatureList;
+
+    // Regime-specific specialists (BEARISH / BULLISH / NEUTRAL)
+    // Loaded alongside the global model; each slot is null if no trained specialist exists.
+    private readonly Dictionary<string, RegimeModelSlot> _regimeModels = new(StringComparer.OrdinalIgnoreCase);
+
+    private sealed class RegimeModelSlot
+    {
+        public required MlModelMetadata Model { get; init; }
+        public InferenceSession? OnnxSession { get; init; }
+        public required Func<float[], (float winProb, float calibrated)> InferFunc { get; init; }
+        public List<CalibrationPoint>? CalibrationCurve { get; init; }
+        public IReadOnlyList<string>? FeatureList { get; init; }
+    }
 
     // Sentinel metadata used when running heuristic fallback (no trained model yet)
     private static readonly MlModelMetadata HeuristicSentinel = new()
@@ -229,6 +243,9 @@ public sealed class MlInferenceService : IDisposable
                 "[ML] Companion artifacts | Calibration={CalibrationVersion} | ThresholdLookup={ThresholdLookupVersion}",
                 _calibrationVersion ?? "none",
                 _thresholdLookupVersion ?? "none");
+
+            // Load regime-specific specialists (non-fatal — fall back to global if unavailable)
+            await LoadRegimeModelsAsync(ct);
         }
         catch (Exception ex)
         {
@@ -238,6 +255,83 @@ public sealed class MlInferenceService : IDisposable
             SetFallback(HeuristicSentinel);
             EnforceNoHeuristicInActiveMode();
         }
+    }
+
+    private static readonly string[] RegimeScopes = ["BEARISH", "BULLISH", "NEUTRAL"];
+
+    private async Task LoadRegimeModelsAsync(CancellationToken ct)
+    {
+        var newSlots = new Dictionary<string, RegimeModelSlot>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var scope in RegimeScopes)
+        {
+            try
+            {
+                var regimeModel = await _modelRepo.GetActiveModelAsync("outcome_predictor", scope, ct);
+                if (regimeModel == null)
+                {
+                    _logger.LogDebug("[ML] No active {Scope} specialist in DB — will use global model for this regime", scope);
+                    continue;
+                }
+
+                if (!File.Exists(regimeModel.FilePath))
+                {
+                    _logger.LogWarning("[ML] {Scope} specialist file missing at {Path} — skipping", scope, regimeModel.FilePath);
+                    continue;
+                }
+
+                if (!regimeModel.FileFormat.Equals("onnx", StringComparison.OrdinalIgnoreCase))
+                {
+                    _logger.LogWarning("[ML] {Scope} specialist has unsupported format '{Format}' — skipping", scope, regimeModel.FileFormat);
+                    continue;
+                }
+
+                var (regimeSession, regimeInfer) = LoadOnnxModel(regimeModel.FilePath);
+                if (regimeSession == null)
+                {
+                    _logger.LogWarning("[ML] {Scope} specialist ONNX session failed to load — skipping", scope);
+                    continue;
+                }
+
+                var regimeArtifacts = LoadCompanionArtifacts(regimeModel);
+                var regimeFeatureList = ParseFeatureList(regimeModel.FeatureListJson);
+
+                newSlots[scope] = new RegimeModelSlot
+                {
+                    Model = regimeModel,
+                    OnnxSession = regimeSession,
+                    InferFunc = regimeInfer,
+                    CalibrationCurve = regimeArtifacts.CalibrationCurve,
+                    FeatureList = regimeFeatureList
+                };
+
+                _logger.LogInformation(
+                    "[ML] Regime specialist loaded: {Scope} → {Version} (AUC={Auc:F4}, Brier={Brier:F4})",
+                    scope, regimeModel.ModelVersion, regimeModel.AucRoc, regimeModel.BrierScore);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[ML] Failed to load {Scope} regime specialist — will use global model for this regime", scope);
+            }
+        }
+
+        _lock.EnterWriteLock();
+        try
+        {
+            // Dispose old regime sessions before replacing
+            foreach (var slot in _regimeModels.Values)
+                slot.OnnxSession?.Dispose();
+            _regimeModels.Clear();
+            foreach (var kv in newSlots)
+                _regimeModels[kv.Key] = kv.Value;
+        }
+        finally
+        {
+            _lock.ExitWriteLock();
+        }
+
+        var loaded = string.Join(", ", _regimeModels.Keys.DefaultIfEmpty("none"));
+        _logger.LogInformation("[ML] Regime specialists active: [{Loaded}]", loaded);
     }
 
     /// <summary>
@@ -263,22 +357,38 @@ public sealed class MlInferenceService : IDisposable
                 return null;
             }
 
-            var isHeuristic = _activeModel.FileFormat.Equals("heuristic", StringComparison.OrdinalIgnoreCase);
+            // Regime routing: prefer specialist model for current regime, fall back to global
+            var regimeKey = features.RegimeLabel switch { 1 => "BULLISH", -1 => "BEARISH", _ => "NEUTRAL" };
+            var regimeSlot = _regimeModels.TryGetValue(regimeKey, out var slot) ? slot : null;
+
+            var activeModel = regimeSlot?.Model ?? _activeModel;
+            var activeInferFunc = regimeSlot?.InferFunc ?? _inferFunc;
+            var activeFeatureList = regimeSlot?.FeatureList ?? _activeFeatureList;
+            var activeCalibCurve = regimeSlot?.CalibrationCurve ?? _calibrationCurve;
+            var usingSpecialist = regimeSlot != null;
+
+            var isHeuristic = activeModel.FileFormat.Equals("heuristic", StringComparison.OrdinalIgnoreCase);
             var sw = Stopwatch.StartNew();
-            var input = features.ToFloatArray(_activeFeatureList);
+            var input = features.ToFloatArray(activeFeatureList);
 
             _logger.LogDebug(
-                "[ML] Running inference | Model={Version} | IsHeuristic={IsHeuristic} | Features={Count} | EvalId={EvalId}",
-                _activeModel.ModelVersion, isHeuristic, input.Length, features.EvaluationId);
+                "[ML] Running inference | Model={Version} | Regime={Regime} | Specialist={Specialist} | " +
+                "IsHeuristic={IsHeuristic} | Features={Count} | EvalId={EvalId}",
+                activeModel.ModelVersion, regimeKey, usingSpecialist, isHeuristic, input.Length, features.EvaluationId);
 
-            var (winProb, calibrated) = _inferFunc(input);
+            var (winProb, calibratedRaw) = activeInferFunc(input);
+            // Apply regime-specific calibration curve if available, otherwise use global
+            var calibrated = usingSpecialist
+                ? ApplyCalibrationCurve(winProb, activeCalibCurve)
+                : ApplyCalibration(winProb);
             var threshold = ComputeRecommendedThreshold(features);
             sw.Stop();
 
             _logger.LogInformation(
-                "[ML] Inference complete | Model={Version} | WinProb={WinProb:P1} | Calibrated={Calibrated:P1} | " +
+                "[ML] Inference complete | Model={Version} | Regime={Regime} | Specialist={Specialist} | " +
+                "WinProb={WinProb:P1} | Calibrated={Calibrated:P1} | " +
                 "Threshold={Threshold:F0} | LatencyUs={LatencyUs} | Mode={Mode} | IsHeuristic={IsHeuristic}",
-                _activeModel.ModelVersion, winProb, calibrated, threshold,
+                activeModel.ModelVersion, regimeKey, usingSpecialist, winProb, calibrated, threshold,
                 (int)sw.Elapsed.TotalMicroseconds, mode, isHeuristic);
 
             var rawProb = Math.Clamp(winProb, 0f, 1f);
@@ -291,8 +401,8 @@ public sealed class MlInferenceService : IDisposable
             {
                 PredictionId = Guid.NewGuid(),
                 EvaluationId = features.EvaluationId,
-                ModelVersion = _activeModel.ModelVersion,
-                ModelType = _activeModel.ModelType,
+                ModelVersion = activeModel.ModelVersion,
+                ModelType = activeModel.ModelType,
                 Timeframe = features.Timeframe,
                 RawWinProbability = Math.Clamp((decimal)rawProb, 0, 1),
                 CalibratedWinProbability = Math.Clamp((decimal)effectiveProb, 0, 1),
@@ -534,6 +644,7 @@ public sealed class MlInferenceService : IDisposable
         };
     }
 
+    /// <summary>Instance-level calibration using the global model's curve.</summary>
     private float ApplyCalibration(float rawProbability)
     {
         if (_calibrationCurve == null || _calibrationCurve.Count == 0)
@@ -562,6 +673,29 @@ public sealed class MlInferenceService : IDisposable
             return Math.Clamp(interpolated, 0f, 1f);
         }
 
+        return Math.Clamp(last.Calibrated, 0f, 1f);
+    }
+
+    /// <summary>Static calibration helper used by regime-specialist slots (passed calibration curve).</summary>
+    private static float ApplyCalibrationCurve(float rawProbability, List<CalibrationPoint>? curve)
+    {
+        if (curve == null || curve.Count == 0)
+            return Math.Clamp(rawProbability, 0f, 1f);
+
+        var clamped = Math.Clamp(rawProbability, 0f, 1f);
+        if (clamped <= curve[0].Raw) return Math.Clamp(curve[0].Calibrated, 0f, 1f);
+        var last = curve[^1];
+        if (clamped >= last.Raw) return Math.Clamp(last.Calibrated, 0f, 1f);
+
+        for (var i = 1; i < curve.Count; i++)
+        {
+            var lower = curve[i - 1];
+            var upper = curve[i];
+            if (clamped > upper.Raw) continue;
+            if (Math.Abs(upper.Raw - lower.Raw) < 1e-6f) return Math.Clamp(upper.Calibrated, 0f, 1f);
+            var t = (clamped - lower.Raw) / (upper.Raw - lower.Raw);
+            return Math.Clamp(lower.Calibrated + t * (upper.Calibrated - lower.Calibrated), 0f, 1f);
+        }
         return Math.Clamp(last.Calibrated, 0f, 1f);
     }
 
@@ -771,6 +905,9 @@ public sealed class MlInferenceService : IDisposable
             _inferFunc = null;
             _activeModel = null;
             _activeFeatureList = null;
+            foreach (var slot in _regimeModels.Values)
+                slot.OnnxSession?.Dispose();
+            _regimeModels.Clear();
         }
         finally
         {

@@ -1,5 +1,6 @@
 using EthSignal.Domain.Models;
 using EthSignal.Infrastructure.Engine;
+using EthSignal.Infrastructure.Engine.ML;
 using FluentAssertions;
 
 namespace EthSignal.Tests.Engine;
@@ -55,6 +56,61 @@ public class SignalEngineTests
         TriggeredConditions = ["all"],
         DisqualifyingConditions = []
     };
+
+    private static MlPrediction MakePrediction(decimal calibratedWinProbability, int recommendedThreshold = 60) => new()
+    {
+        PredictionId = Guid.NewGuid(),
+        EvaluationId = Guid.NewGuid(),
+        ModelVersion = "model-v1",
+        ModelType = "outcome_predictor",
+        RawWinProbability = calibratedWinProbability,
+        CalibratedWinProbability = calibratedWinProbability,
+        PredictionConfidence = (int)Math.Round(calibratedWinProbability * 100m),
+        RecommendedThreshold = recommendedThreshold,
+        ExpectedValueR = 0.5m,
+        InferenceLatencyUs = 25,
+        IsActive = true,
+        Mode = MlMode.ACTIVE,
+        InferenceMode = MlInferenceMode.TRAINED_ACTIVE
+    };
+
+    private static (SignalRecommendation Rec, SignalDecision Dec) MakePrecomputedSignal(int confidenceScore = 70)
+    {
+        var rec = new SignalRecommendation
+        {
+            Symbol = "ETHUSD",
+            Timeframe = "5m",
+            SignalTimeUtc = new DateTimeOffset(2026, 3, 17, 10, 5, 0, TimeSpan.Zero),
+            Direction = SignalDirection.BUY,
+            EntryPrice = 2100m,
+            TpPrice = 2115m,
+            SlPrice = 2090m,
+            ConfidenceScore = confidenceScore,
+            Regime = Regime.BULLISH,
+            StrategyVersion = "v3.1",
+            Reasons = ["rule-based signal"]
+        };
+
+        var dec = new SignalDecision
+        {
+            Symbol = "ETHUSD",
+            Timeframe = "5m",
+            DecisionTimeUtc = new DateTimeOffset(2026, 3, 17, 10, 5, 0, TimeSpan.Zero),
+            BarTimeUtc = new DateTimeOffset(2026, 3, 17, 10, 0, 0, TimeSpan.Zero),
+            DecisionType = SignalDirection.BUY,
+            OutcomeCategory = OutcomeCategory.SIGNAL_GENERATED,
+            ReasonCodes = [],
+            ReasonDetails = ["rule-based signal"],
+            IndicatorSnapshot = new Dictionary<string, decimal>(),
+            ConfidenceScore = confidenceScore,
+            UsedRegime = Regime.BULLISH,
+            UsedRegimeTimestamp = new DateTimeOffset(2026, 3, 17, 10, 0, 0, TimeSpan.Zero),
+            SourceMode = SourceMode.LIVE,
+            ParameterSetId = "v3.1"
+        };
+
+        return (rec, dec);
+    }
 
     /// <summary>P4-T1: BUY signal generation with bullish regime + valid 5m setup.</summary>
     [Fact]
@@ -260,5 +316,78 @@ public class SignalEngineTests
 
         effective.Should().Be(0.52m);
         reason.Should().Contain("legacy");
+    }
+
+    [Fact]
+    public void EvaluateWithMl_ShadowMode_AnnotatesButKeepsRuleSignal()
+    {
+        var regime = MakeRegime(Regime.BULLISH);
+        var snap = MakeSnap(closeMid: 2100, ema20: 2090, rsi: 52, macdHist: 0.5m,
+            adx: 25, vwap: 2080, volSma20: 100, spread: 1m);
+        var candle = MakeCandle(2100, vol: 150);
+        var p = StrategyParameters.Default with { MlMode = MlMode.SHADOW };
+        var mlPrediction = MakePrediction(0.78m, recommendedThreshold: 65);
+
+        var (rec, dec) = SignalEngine.EvaluateWithMl(
+            "ETHUSD", regime, snap, null, candle, p, mlPrediction, null,
+            preComputed: MakePrecomputedSignal());
+
+        rec.Direction.Should().Be(SignalDirection.BUY);
+        dec.DecisionType.Should().Be(SignalDirection.BUY);
+        dec.MlPrediction.Should().NotBeNull();
+        dec.BlendedConfidence.Should().BeGreaterThan(0);
+        dec.EffectiveThreshold.Should().Be(65);
+    }
+
+    [Fact]
+    public void EvaluateWithMl_ActiveMode_Filters_WhenWinProbabilityIsBelowGate()
+    {
+        var regime = MakeRegime(Regime.BULLISH);
+        var snap = MakeSnap(closeMid: 2100, ema20: 2090, rsi: 52, macdHist: 0.5m,
+            adx: 25, vwap: 2080, volSma20: 100, spread: 1m);
+        var candle = MakeCandle(2100, vol: 150);
+        var p = StrategyParameters.Default with
+        {
+            MlMode = MlMode.ACTIVE,
+            MlAccuracyFirstMode = false,
+            MlMinWinProbability = 0.55m
+        };
+        var mlPrediction = MakePrediction(0.40m, recommendedThreshold: 50);
+
+        var (rec, dec) = SignalEngine.EvaluateWithMl(
+            "ETHUSD", regime, snap, null, candle, p, mlPrediction, null,
+            preComputed: MakePrecomputedSignal());
+
+        rec.Direction.Should().Be(SignalDirection.NO_TRADE);
+        dec.DecisionType.Should().Be(SignalDirection.NO_TRADE);
+        dec.LifecycleState.Should().Be(SignalLifecycleState.ML_FILTERED);
+        dec.ReasonCodes.Should().Contain(RejectReasonCode.ML_GATE_FAILED);
+        dec.FinalBlockReason.Should().Contain("ML gate failed");
+    }
+
+    [Fact]
+    public void EvaluateWithMl_ActiveMode_KeepsSignal_WhenMlConfirms()
+    {
+        var regime = MakeRegime(Regime.BULLISH);
+        var snap = MakeSnap(closeMid: 2100, ema20: 2090, rsi: 52, macdHist: 0.5m,
+            adx: 25, vwap: 2080, volSma20: 100, spread: 1m);
+        var candle = MakeCandle(2100, vol: 150);
+        var p = StrategyParameters.Default with
+        {
+            MlMode = MlMode.ACTIVE,
+            MlAccuracyFirstMode = false,
+            MlMinWinProbability = 0.55m,
+            MlConfidenceBlendWeight = 0.5m
+        };
+        var mlPrediction = MakePrediction(0.80m, recommendedThreshold: 55);
+
+        var (rec, dec) = SignalEngine.EvaluateWithMl(
+            "ETHUSD", regime, snap, null, candle, p, mlPrediction, null,
+            preComputed: MakePrecomputedSignal());
+
+        rec.Direction.Should().Be(SignalDirection.BUY);
+        dec.DecisionType.Should().Be(SignalDirection.BUY);
+        dec.OutcomeCategory.Should().Be(OutcomeCategory.SIGNAL_GENERATED);
+        dec.BlendedConfidence.Should().BeGreaterThanOrEqualTo(55);
     }
 }

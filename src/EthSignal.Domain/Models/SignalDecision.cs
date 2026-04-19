@@ -28,7 +28,8 @@ public enum RejectReasonCode
     VOLUME_TOO_LOW,
     MAX_OPEN_PER_TIMEFRAME,
     MAX_OPEN_PER_DIRECTION,
-    SLOT_CAPACITY_REACHED
+    SLOT_CAPACITY_REACHED,
+    EVALUATION_EXCEPTION
 }
 
 /// <summary>FR-1: Signal lifecycle states — explicit multi-stage lifecycle for each evaluated opportunity.</summary>
@@ -68,7 +69,8 @@ public enum OutcomeCategory
     SIGNAL_GENERATED,
     STRATEGY_NO_TRADE,
     OPERATIONAL_BLOCKED,
-    CONTEXT_NOT_READY
+    CONTEXT_NOT_READY,
+    EVALUATION_ERROR
 }
 
 /// <summary>Decision source for warm-start vs live vs replay tagging.</summary>

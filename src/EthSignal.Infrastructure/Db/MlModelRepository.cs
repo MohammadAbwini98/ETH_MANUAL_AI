@@ -15,6 +15,9 @@ public sealed class MlModelRepository : IMlModelRepository
     }
 
     public async Task<MlModelMetadata?> GetActiveModelAsync(string modelType, CancellationToken ct = default)
+        => await GetActiveModelAsync(modelType, "ALL", ct);
+
+    public async Task<MlModelMetadata?> GetActiveModelAsync(string modelType, string regimeScope, CancellationToken ct = default)
     {
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
@@ -24,13 +27,15 @@ public sealed class MlModelRepository : IMlModelRepository
                    train_start_utc, train_end_utc, training_sample_count, feature_count,
                    feature_list_json, auc_roc, brier_score, ece, log_loss,
                    fold_metrics_json, feature_importance_json, status,
-                   created_at_utc, activated_at_utc, retired_at_utc, retired_reason
+                   created_at_utc, activated_at_utc, retired_at_utc, retired_reason,
+                   COALESCE(regime_scope, 'ALL')
             FROM ""ETH"".ml_models
-            WHERE model_type = @type AND LOWER(status) = 'active'
+            WHERE model_type = @type AND UPPER(regime_scope) = UPPER(@scope) AND LOWER(status) = 'active'
             ORDER BY activated_at_utc DESC NULLS LAST
             LIMIT 1;", conn);
 
         cmd.Parameters.AddWithValue("type", modelType);
+        cmd.Parameters.AddWithValue("scope", regimeScope);
 
         await using var reader = await cmd.ExecuteReaderAsync(ct);
         if (!await reader.ReadAsync(ct)) return null;
@@ -47,7 +52,8 @@ public sealed class MlModelRepository : IMlModelRepository
                    train_start_utc, train_end_utc, training_sample_count, feature_count,
                    feature_list_json, auc_roc, brier_score, ece, log_loss,
                    fold_metrics_json, feature_importance_json, status,
-                   created_at_utc, activated_at_utc, retired_at_utc, retired_reason
+                   created_at_utc, activated_at_utc, retired_at_utc, retired_reason,
+                   COALESCE(regime_scope, 'ALL')
             FROM ""ETH"".ml_models
             WHERE id = @id;", conn);
 
@@ -68,7 +74,8 @@ public sealed class MlModelRepository : IMlModelRepository
                    train_start_utc, train_end_utc, training_sample_count, feature_count,
                    feature_list_json, auc_roc, brier_score, ece, log_loss,
                    fold_metrics_json, feature_importance_json, status,
-                   created_at_utc, activated_at_utc, retired_at_utc, retired_reason
+                   created_at_utc, activated_at_utc, retired_at_utc, retired_reason,
+                   COALESCE(regime_scope, 'ALL')
             FROM ""ETH"".ml_models
             ORDER BY created_at_utc DESC;", conn);
 
@@ -89,11 +96,13 @@ public sealed class MlModelRepository : IMlModelRepository
                 (model_type, model_version, file_path, file_format,
                  train_start_utc, train_end_utc, training_sample_count, feature_count,
                  feature_list_json, auc_roc, brier_score, ece, log_loss,
-                 fold_metrics_json, feature_importance_json, status, created_at_utc)
+                 fold_metrics_json, feature_importance_json, status, created_at_utc,
+                 regime_scope)
             VALUES (@type, @ver, @path, @fmt,
                     @ts, @te, @cnt, @fc,
                     @fl, @auc, @brier, @ece, @ll,
-                    @fm, @fi, @status, NOW())
+                    @fm, @fi, @status, NOW(),
+                    @scope)
             RETURNING id;", conn);
 
         cmd.Parameters.AddWithValue("type", model.ModelType);
@@ -112,6 +121,7 @@ public sealed class MlModelRepository : IMlModelRepository
         cmd.Parameters.Add(new NpgsqlParameter("fm", NpgsqlDbType.Jsonb) { Value = model.FoldMetricsJson });
         cmd.Parameters.Add(new NpgsqlParameter("fi", NpgsqlDbType.Jsonb) { Value = model.FeatureImportanceJson });
         cmd.Parameters.AddWithValue("status", model.Status.ToString().ToLowerInvariant());
+        cmd.Parameters.AddWithValue("scope", model.RegimeScope);
 
         return (long)(await cmd.ExecuteScalarAsync(ct))!;
     }
@@ -162,7 +172,8 @@ public sealed class MlModelRepository : IMlModelRepository
             CreatedAtUtc = reader.GetFieldValue<DateTimeOffset>(17),
             ActivatedAtUtc = reader.IsDBNull(18) ? null : reader.GetFieldValue<DateTimeOffset>(18),
             RetiredAtUtc = reader.IsDBNull(19) ? null : reader.GetFieldValue<DateTimeOffset>(19),
-            RetiredReason = reader.IsDBNull(20) ? null : reader.GetString(20)
+            RetiredReason = reader.IsDBNull(20) ? null : reader.GetString(20),
+            RegimeScope = reader.FieldCount > 21 && !reader.IsDBNull(21) ? reader.GetString(21) : "ALL"
         };
 
         return MlModelMetadataSidecarReader.Enrich(model);

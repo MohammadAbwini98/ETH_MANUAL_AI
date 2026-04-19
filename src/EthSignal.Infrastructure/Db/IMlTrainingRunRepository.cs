@@ -24,6 +24,7 @@ public interface IMlTrainingRunRepository
     Task UpdateAsync(long id, string status, int? sampleCount, long? resultModelId, string? errorText, int? durationSeconds, CancellationToken ct = default);
     Task<IReadOnlyList<MlTrainingRunRecord>> GetRecentAsync(int limit = 20, CancellationToken ct = default);
     Task<MlTrainingRunRecord?> GetLatestSuccessfulAsync(CancellationToken ct = default);
+    Task<MlTrainingRunRecord?> GetLatestCompletedAsync(CancellationToken ct = default);
     Task<int> GetLabeledSampleCountAsync(CancellationToken ct = default);
     Task<(int wins, int losses)> GetWinLossCountsAsync(CancellationToken ct = default);
     Task<int> GetNewOutcomesSinceAsync(DateTimeOffset since, CancellationToken ct = default);

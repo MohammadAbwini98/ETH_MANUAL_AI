@@ -149,10 +149,10 @@ echo "  Latest meta:  $LATEST_META"
 echo "  Latest model: ${LATEST_MODEL:-N/A}"
 echo ""
 
-# Step 3: Validate model (non-fatal — pipeline continues even on validation failure)
+# Step 3: Validate model (fatal — invalid artifacts must stop the pipeline)
 echo "▸ Step 3: Validating model..."
 if [ -f validate_model.py ]; then
-    "$PYTHON" validate_model.py --meta "$LATEST_META" || true
+    "$PYTHON" validate_model.py --meta "$LATEST_META"
 else
     echo "  SKIPPED: validate_model.py not found"
 fi
@@ -187,11 +187,70 @@ echo ""
 # Uses register_model.py (direct DB write) — does NOT require the app to be running.
 echo "▸ Step 6: Registering model in DB..."
 if [ -f register_model.py ]; then
-    "$PYTHON" register_model.py --meta "$LATEST_META" || \
-        echo "  WARNING: DB registration failed — model saved to $LATEST_META for manual registration."
+    "$PYTHON" register_model.py --meta "$LATEST_META"
 else
     echo "  SKIPPED: register_model.py not found"
 fi
+echo ""
+
+# ─── Steps 7–9: Regime-specific sub-models (Recommendation 2) ─────────────────
+# Train one specialist per regime (BEARISH / BULLISH / NEUTRAL).
+# Each is independently validated and registered; failures are non-fatal so that
+# insufficient data in one regime does not block the global model from running.
+echo "▸ Steps 7–9: Training regime-specific specialists..."
+for REGIME in BEARISH BULLISH NEUTRAL; do
+    echo ""
+    echo "  ── Regime: $REGIME ──"
+
+    # Train
+    set +e
+    "$PYTHON" train_outcome_predictor.py \
+        --data "$DATA_DIR/training_data.csv" \
+        --output "$MODEL_DIR/" \
+        --folds 5 \
+        --model lightgbm \
+        --regime "$REGIME"
+    REGIME_TRAIN_EXIT=$?
+    set -e
+
+    if [ "$REGIME_TRAIN_EXIT" -eq 2 ]; then
+        echo "  INFO: $REGIME specialist skipped — insufficient data (< 50 samples). Continuing."
+        continue
+    elif [ "$REGIME_TRAIN_EXIT" -ne 0 ]; then
+        echo "  WARN: $REGIME specialist training failed (exit $REGIME_TRAIN_EXIT). Continuing with global model only."
+        continue
+    fi
+
+    # Find the latest regime artifact
+    REGIME_LOWER=$(echo "$REGIME" | tr '[:upper:]' '[:lower:]')
+    REGIME_META=$(ls -t "$MODEL_DIR"/outcome_predictor_${REGIME}_*_meta.json 2>/dev/null | head -1 || true)
+    if [ -z "$REGIME_META" ]; then
+        echo "  WARN: No $REGIME meta file found after training — skipping registration."
+        continue
+    fi
+
+    # Recalibrate regime specialist if train_recalibrator.py exists
+    REGIME_MODEL=$(ls -t "$MODEL_DIR"/outcome_predictor_${REGIME}_*.onnx 2>/dev/null | head -1 || true)
+    if [ -f train_recalibrator.py ] && [ -n "$REGIME_MODEL" ]; then
+        "$PYTHON" train_recalibrator.py \
+            --data "$DATA_DIR/training_data.csv" \
+            --model "$REGIME_MODEL" \
+            --output "$MODEL_DIR/" \
+            --regime "$REGIME" || \
+            echo "  INFO: $REGIME recalibrator skipped (too few samples)."
+    fi
+
+    # Register regime specialist in DB (non-fatal — quality-gate rejections skip the specialist only)
+    if [ -f register_model.py ]; then
+        set +e
+        "$PYTHON" register_model.py --meta "$REGIME_META" --regime "$REGIME"
+        REGIME_REG_EXIT=$?
+        set -e
+        if [ "$REGIME_REG_EXIT" -ne 0 ]; then
+            echo "  INFO: $REGIME specialist not registered (quality gate or DB error, exit $REGIME_REG_EXIT) — continuing."
+        fi
+    fi
+done
 echo ""
 
 echo "═══════════════════════════════════════════════════════"
@@ -199,8 +258,10 @@ echo " Pipeline complete!"
 echo " Models saved to: $MODEL_DIR/"
 echo ""
 echo " Next steps:"
-echo "   1. Model is auto-registered in DB (step 6 above)"
+echo "   1. Global model + any regime specialists auto-registered in DB"
 echo "   2. Verify in SHADOW mode via dashboard ML panel"
 echo "   3. Monitor 50+ signals in shadow"
 echo "   4. Activate: POST /api/admin/ml/models/{id}/activate"
+echo "   5. Regime specialists load automatically — no extra activation needed."
+echo "      Each regime uses its specialist if active; falls back to global model."
 echo "═══════════════════════════════════════════════════════"

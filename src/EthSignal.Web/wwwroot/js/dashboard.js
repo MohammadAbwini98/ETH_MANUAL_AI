@@ -18,6 +18,9 @@ function toAmmanShort(isoStr) {
 const $ = id => document.getElementById(id);
 function fmt(v, d = 2) { return v != null ? Number(v).toFixed(d) : '--'; }
 function fmtPct(v) { return v != null ? Number(v).toFixed(1) + '%' : '--'; }
+
+// Current ML Mode — updated by refreshActiveParameterSet(), used by loadMlModelRegistry()
+let _currentMlMode = null; // 'DISABLED' | 'SHADOW' | 'ACTIVE' | null (unknown)
 function escapeHtml(value) {
     return String(value ?? '')
         .replace(/&/g, '&amp;')
@@ -1359,7 +1362,9 @@ async function refreshAll() {
             refreshSignal(), refreshPerformance(), loadHistory(), loadBlockedHistory(), loadGeneratedHistory(),
             refreshMlHealth(), refreshMlPerformance(), refreshMlPredictions(),
             refreshMlDiagnostics(), refreshMlFeatureSnapshot(), refreshDecisionSummary(), refreshTrainerStatus(), refreshHistorySync(),
-            refreshAdaptiveStatus(), refreshActiveParameterSet()
+            refreshAdaptiveStatus(), refreshActiveParameterSet(),
+            loadMlModelRegistry(),
+            updateRegimeSpecialistStatus()
         ]);
     } catch (e) { console.error('Refresh error:', e); }
     try { await refreshCharts(); } catch (e) { console.warn('Chart refresh error:', e); }
@@ -1374,6 +1379,7 @@ setInterval(() => { refreshHistorySync().catch(() => { }); }, 5000);
 setInterval(() => { refreshPerformance(); loadHistory(); loadBlockedHistory(); loadGeneratedHistory(); refreshDecisionSummary(); }, 15000);
 setInterval(() => { refreshMlHealth(); refreshMlPerformance(); refreshMlPredictions(); refreshMlDiagnostics(); refreshMlFeatureSnapshot(); refreshTrainerStatus(); }, 30000);
 setInterval(() => { refreshAdaptiveStatus(); refreshActiveParameterSet(); }, 15000);
+setInterval(() => { loadMlModelRegistry().catch(() => {}); updateRegimeSpecialistStatus().catch(() => {}); }, 60000);
 
 // Initialize after DOM is ready
 async function initDashboard() {
@@ -1885,30 +1891,278 @@ async function switchMlMode(mode) {
     }
 }
 
-async function activateModel28() {
-    if (!confirm('Activate model 28 now?')) return;
+// ─── Regime Specialist Training ────────────────────────
 
-    const btn = $('ml-activate-28-btn');
-    const prevText = btn?.textContent;
-    if (btn) {
-        btn.disabled = true;
-        btn.textContent = 'Activating...';
+const REGIME_SCOPES = ['BEARISH', 'BULLISH', 'NEUTRAL'];
+
+/**
+ * Called by the "Train & Activate Regime Models" button.
+ * Kicks off the full training pipeline (which includes regime steps 7-9),
+ * then polls until it finishes — models are auto-promoted by the server.
+ */
+async function trainAndActivateRegimeModels() {
+    const btn = $('ml-regime-train-btn');
+    const progress = $('ml-regime-train-progress');
+
+    if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
+    if (progress) { progress.style.display = 'block'; progress.textContent = 'Triggering training pipeline…'; }
+
+    try {
+        const resp = await fetch('/api/admin/ml/training/trigger', { method: 'POST' });
+        const body = await resp.json().catch(() => null);
+
+        if (resp.status === 409) {
+            if (progress) progress.textContent = 'Training already in progress — polling for completion…';
+        } else if (resp.status === 202) {
+            if (progress) progress.textContent = 'Pipeline started — training global + regime models…';
+        } else if (resp.status === 403) {
+            alert('This action is loopback-only. Open the dashboard on localhost.');
+            return;
+        } else {
+            alert('Failed to trigger training: ' + (body?.error || resp.status));
+            return;
+        }
+
+        // Poll training status until it finishes
+        await pollTrainingUntilDone(progress);
+
+        // Reload everything once done
+        await Promise.all([loadMlModelRegistry(), refreshMlHealth(), refreshLatestCandidateHint()]);
+        await updateRegimeSpecialistStatus();
+
+    } catch (e) {
+        alert('Error: ' + e.message);
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Train & Activate Regime Models'; }
+        // Keep progress visible for 10s then hide
+        setTimeout(() => { if (progress) progress.style.display = 'none'; }, 10000);
+    }
+}
+
+async function pollTrainingUntilDone(progressEl) {
+    const MAX_POLLS = 120;  // 10 minutes max (5s intervals)
+    for (let i = 0; i < MAX_POLLS; i++) {
+        await new Promise(r => setTimeout(r, 5000));
+        try {
+            const r = await fetch('/api/admin/ml/training/status');
+            if (!r.ok) continue;
+            const s = await r.json();
+
+            if (s.isRunning) {
+                const elapsed = s.runStartedAt
+                    ? Math.round((Date.now() - new Date(s.runStartedAt).getTime()) / 1000)
+                    : '?';
+                if (progressEl) progressEl.textContent = `Training in progress… ${elapsed}s elapsed`;
+            } else {
+                const status = String(s.lastStatus || '').toLowerCase();
+                if (progressEl) {
+                    if (status === 'success') {
+                        progressEl.style.color = 'var(--green)';
+                        progressEl.textContent = '✓ Training complete — regime specialists activated automatically.';
+                    } else if (status === 'skipped') {
+                        progressEl.style.color = 'var(--yellow)';
+                        progressEl.textContent = '⚠ Skipped — insufficient labeled data (need 200+ global, 50+ per regime).';
+                    } else {
+                        progressEl.style.color = 'var(--red)';
+                        progressEl.textContent = `✗ Training ended: ${status || 'unknown'}`;
+                    }
+                }
+                return;
+            }
+        } catch { /* keep polling */ }
+    }
+    if (progressEl) progressEl.textContent = 'Timed out polling — check trainer status below.';
+}
+
+/**
+ * Reads the model registry and updates the regime status mini-panel
+ * in the ML Mode card (● ACTIVE / ○ none per scope).
+ */
+async function updateRegimeSpecialistStatus() {
+    const el = $('ml-regime-status');
+    if (!el) return;
+
+    try {
+        const resp = await fetch('/api/admin/ml/models');
+        if (!resp.ok) { el.textContent = 'unavailable'; return; }
+        const models = await resp.json();
+        if (!Array.isArray(models)) { el.textContent = 'unavailable'; return; }
+
+        const activeByScope = {};
+        for (const m of models) {
+            const scope = String(m.regimeScope || 'ALL').toUpperCase();
+            const status = String(m.status || '').toUpperCase();
+            if (status === 'ACTIVE' && scope !== 'ALL') {
+                activeByScope[scope] = m.modelVersion || `#${m.id}`;
+            }
+        }
+
+        el.innerHTML = REGIME_SCOPES.map(scope => {
+            const ver = activeByScope[scope];
+            const dot = ver ? '●' : '○';
+            const color = ver ? 'var(--green)' : 'var(--text-sub)';
+            const label = ver ? `<span style="color:var(--text-sub)">${escapeHtml(ver.slice(-8))}</span>` : 'not trained';
+            return `<span style="color:${color}">${dot} ${scope}</span> ${label}<br>`;
+        }).join('');
+    } catch {
+        el.textContent = 'unavailable';
+    }
+}
+
+// ─── ML Models Registry ────────────────────────────────
+
+const SCOPE_COLORS = { ALL: 'var(--blue)', BULLISH: 'var(--green)', BEARISH: 'var(--red)', NEUTRAL: 'var(--yellow)' };
+const STATUS_BADGE = {
+    ACTIVE:    '<span class="badge badge-win">ACTIVE</span>',
+    CANDIDATE: '<span class="badge badge-neutral">CANDIDATE</span>',
+    SHADOW:    '<span class="badge" style="background:var(--bg-header);color:var(--yellow);border:1px solid var(--yellow)">SHADOW</span>',
+    RETIRED:   '<span class="badge badge-loss">RETIRED</span>',
+    TRAINING:  '<span class="badge badge-neutral">TRAINING</span>',
+};
+
+async function loadMlModelRegistry() {
+    const tbody = $('ml-registry-tbody');
+    const countEl = $('ml-registry-count');
+    if (!tbody) return;
+
+    // Ensure ML mode is known before rendering — fetch if not yet set
+    if (_currentMlMode === null) {
+        try {
+            const pr = await fetch('/api/admin/parameter-sets/active');
+            if (pr.ok) {
+                const pd = await pr.json();
+                const mlModeMap = { 0: 'DISABLED', 1: 'SHADOW', 2: 'ACTIVE' };
+                _currentMlMode = mlModeMap[(pd.parameters || pd)?.mlMode] || null;
+            }
+        } catch { /* non-fatal — banner will just be hidden */ }
     }
 
     try {
-        const r = await fetch('/api/admin/ml/models/28/activate', { method: 'POST' });
+        const resp = await fetch('/api/admin/ml/models');
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const models = await resp.json();
+
+        if (!Array.isArray(models) || models.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="10" style="color:var(--text-dim);text-align:center">No models registered</td></tr>';
+            if (countEl) countEl.textContent = '0 models';
+            return;
+        }
+
+        if (countEl) countEl.textContent = `${models.length} model${models.length !== 1 ? 's' : ''}`;
+
+        // Mode banner — shows current ML Mode so "active" status in the table is not confused with trading mode
+        const modeBar = $('ml-registry-mode-bar');
+        if (modeBar) {
+            if (_currentMlMode === 'ACTIVE') {
+                modeBar.style.display = 'block';
+                modeBar.style.background = 'rgba(63,185,80,.1)';
+                modeBar.innerHTML = '<span style="color:var(--green)">● ML Mode: ACTIVE</span> — loaded models are gating live trades';
+            } else if (_currentMlMode === 'SHADOW') {
+                modeBar.style.display = 'block';
+                modeBar.style.background = 'rgba(227,179,65,.07)';
+                modeBar.innerHTML = '<span style="color:var(--yellow)">● ML Mode: SHADOW</span> — loaded models run inference only, not gating trades. "Active" status = loaded for inference.';
+            } else if (_currentMlMode === 'DISABLED') {
+                modeBar.style.display = 'block';
+                modeBar.style.background = 'rgba(248,81,73,.07)';
+                modeBar.innerHTML = '<span style="color:var(--text-dim)">○ ML Mode: DISABLED</span> — inference is off. Models remain loaded but are not called.';
+            } else {
+                modeBar.style.display = 'none';
+            }
+        }
+
+        // Sort: ALL scope first, then by regime, then by ID desc within scope
+        const scopeOrder = { ALL: 0, BULLISH: 1, BEARISH: 2, NEUTRAL: 3 };
+        models.sort((a, b) => {
+            const sa = scopeOrder[String(a.regimeScope || 'ALL').toUpperCase()] ?? 9;
+            const sb = scopeOrder[String(b.regimeScope || 'ALL').toUpperCase()] ?? 9;
+            if (sa !== sb) return sa - sb;
+            return (Number(b.id) || 0) - (Number(a.id) || 0);
+        });
+
+        tbody.innerHTML = models.map(m => {
+            const scope = String(m.regimeScope || 'ALL').toUpperCase();
+            const status = String(m.status || '').toUpperCase();
+            const scopeColor = SCOPE_COLORS[scope] || 'var(--text)';
+            const statusBadge = STATUS_BADGE[status] || `<span class="badge badge-neutral">${status}</span>`;
+            const auc = m.aucRoc != null ? Number(m.aucRoc).toFixed(4) : '—';
+            const brier = m.brierScore != null ? Number(m.brierScore).toFixed(4) : '—';
+            const ece = m.expectedCalibrationError != null && Number(m.expectedCalibrationError) > 0
+                ? Number(m.expectedCalibrationError).toFixed(4) : '—';
+            const samples = m.trainingSampleCount ?? '—';
+            const activated = m.activatedAtUtc ? toAmmanShort(m.activatedAtUtc) : '—';
+            const version = m.modelVersion || `#${m.id}`;
+
+            let actionCell = '—';
+            if (status === 'CANDIDATE' || status === 'SHADOW') {
+                actionCell = `<button class="btn btn-sm btn-outline-success" style="font-size:.7rem;padding:1px 8px"
+                    onclick="activateModelById(${m.id}, '${escapeHtml(version)}')" id="ml-reg-activate-${m.id}">
+                    Activate
+                </button>`;
+            } else if (status === 'ACTIVE') {
+                if (_currentMlMode === 'ACTIVE') {
+                    actionCell = '<span style="color:var(--green);font-size:.72rem">● Running</span>';
+                } else if (_currentMlMode === 'SHADOW') {
+                    actionCell = '<span style="color:var(--yellow);font-size:.72rem">● Shadow</span>';
+                } else if (_currentMlMode === 'DISABLED') {
+                    actionCell = '<span style="color:var(--text-dim);font-size:.72rem">○ Loaded</span>';
+                } else {
+                    actionCell = '<span style="color:var(--text-dim);font-size:.72rem">● Loaded</span>';
+                }
+            }
+
+            const rowStyle = status === 'ACTIVE' ? 'background:rgba(63,185,80,.08)' :
+                             status === 'RETIRED' ? 'opacity:.5' : '';
+
+            return `<tr style="${rowStyle}">
+                <td style="font-family:monospace">${m.id}</td>
+                <td style="color:${scopeColor};font-weight:600">${scope}</td>
+                <td style="font-family:monospace;font-size:.72rem">${escapeHtml(version)}</td>
+                <td>${statusBadge}</td>
+                <td style="color:${Number(m.aucRoc)>=0.62?'var(--green)':Number(m.aucRoc)>=0.58?'var(--yellow)':'var(--red)'}">${auc}</td>
+                <td style="color:${Number(m.brierScore)<=0.26?'var(--green)':Number(m.brierScore)<=0.30?'var(--yellow)':'var(--red)'}">${brier}</td>
+                <td>${ece}</td>
+                <td>${samples}</td>
+                <td style="font-size:.7rem;color:var(--text-sub)">${activated}</td>
+                <td>${actionCell}</td>
+            </tr>`;
+        }).join('');
+
+    } catch (e) {
+        tbody.innerHTML = `<tr><td colspan="10" style="color:var(--red)">Failed to load models: ${escapeHtml(e.message)}</td></tr>`;
+    }
+}
+
+async function activateModelById(id, version) {
+    if (!confirm(`Activate model ${version} (id=${id})?`)) return;
+
+    const btn = document.getElementById(`ml-reg-activate-${id}`);
+    if (btn) { btn.disabled = true; btn.textContent = 'Activating…'; }
+
+    try {
+        const r = await fetch(`/api/admin/ml/models/${id}/activate`, { method: 'POST' });
         const body = await r.json().catch(() => null);
 
         if (r.ok) {
-            alert(body?.message || 'Model 28 activated.');
-            await refreshMlHealth();
-            await refreshMlPerformance();
-            await refreshMlPredictions();
+            const msg = body?.message || `Model ${version} activated.`;
+            // Show inline success instead of an alert to keep UX smooth
+            if (btn) {
+                btn.className = 'btn btn-sm btn-success';
+                btn.style.cssText = 'font-size:.7rem;padding:1px 8px';
+                btn.textContent = '✓ Done';
+                setTimeout(() => { btn.disabled = false; }, 2000);
+            }
+            // Refresh affected panels
+            await Promise.all([
+                loadMlModelRegistry(),
+                refreshMlHealth(),
+                refreshMlPerformance(),
+                refreshLatestCandidateHint(),
+            ]);
             return;
         }
 
         if (r.status === 403) {
-            alert('Activation API is loopback-only. Open this dashboard on localhost.');
+            alert('Activation is loopback-only. Open this dashboard on localhost.');
             return;
         }
 
@@ -1917,9 +2171,9 @@ async function activateModel28() {
     } catch (e) {
         alert('Activation error: ' + e.message);
     } finally {
-        if (btn) {
+        if (btn && btn.textContent === 'Activating…') {
             btn.disabled = false;
-            btn.textContent = prevText || 'Activate Model 28';
+            btn.textContent = 'Activate';
         }
     }
 }
@@ -2046,23 +2300,27 @@ async function refreshAdaptiveStatus() {
 
         const conditions = d.conditionDetails || [];
         if (conditions.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="5" style="color:var(--text-dim);text-align:center">No conditions tracked yet</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="5" style="color:var(--text-dim);text-align:center">No conditions tracked yet — outcomes accumulate as live signals resolve</td></tr>';
             return;
         }
 
+        const totalOutcomes = conditions.reduce((s, c) => s + c.outcomeCount, 0);
         tbody.innerHTML = conditions
             .sort((a, b) => b.outcomeCount - a.outcomeCount)
             .map(c => {
-                const wrColor = c.winRate >= 0.55 ? 'var(--green)' : c.winRate >= 0.45 ? 'var(--yellow)' : 'var(--red)';
-                const expColor = c.expectancy >= 0.15 ? 'var(--green)' : c.expectancy >= 0 ? 'var(--yellow)' : 'var(--red)';
+                const lowData = c.outcomeCount < 5;
+                const wrColor = lowData ? 'var(--text-dim)' : c.winRate >= 0.55 ? 'var(--green)' : c.winRate >= 0.45 ? 'var(--yellow)' : 'var(--red)';
+                const expColor = lowData ? 'var(--text-dim)' : c.expectancy >= 0.15 ? 'var(--green)' : c.expectancy >= 0 ? 'var(--yellow)' : 'var(--red)';
+                const lowBadge = lowData ? ' <span style="font-size:.6rem;color:var(--yellow);opacity:.7">(low data)</span>' : '';
                 return `<tr>
-                    <td style="font-family:monospace;font-size:.7rem">${escapeHtml(c.conditionKey)}</td>
-                    <td>${c.outcomeCount}</td>
+                    <td style="font-family:monospace;font-size:.7rem;color:var(--text)">${escapeHtml(c.conditionKey)}${lowBadge}</td>
+                    <td style="color:var(--text)">${c.outcomeCount}</td>
                     <td style="color:${wrColor}">${(c.winRate * 100).toFixed(1)}%</td>
                     <td style="color:${expColor}">${Number(c.expectancy).toFixed(3)}R</td>
-                    <td>${c.hasRetrospectiveOverlay ? '<span style="color:var(--purple)">●</span>' : '–'}</td>
+                    <td>${c.hasRetrospectiveOverlay ? '<span style="color:var(--purple)">●</span>' : '<span style="color:var(--text-dim)">–</span>'}</td>
                 </tr>`;
-            }).join('');
+            }).join('')
+            + `<tr><td colspan="5" style="font-size:.65rem;color:var(--text-dim);text-align:right;padding-top:.3rem">${totalOutcomes} live outcomes tracked across ${conditions.length} conditions — accumulates as signals resolve</td></tr>`;
     } catch (e) {
         console.warn('Adaptive status refresh error:', e);
     }
@@ -2099,7 +2357,8 @@ async function refreshActiveParameterSet() {
 
         // ML config
         const mlModeMap = { 0: 'DISABLED', 1: 'SHADOW', 2: 'ACTIVE' };
-        setText('ps-ml-mode', mlModeMap[p.mlMode] || p.mlMode || '--');
+        _currentMlMode = mlModeMap[p.mlMode] || null;
+        setText('ps-ml-mode', _currentMlMode || p.mlMode || '--');
         setText('ps-acc-first', p.mlAccuracyFirstMode ? 'ON' : 'OFF');
         setText('ps-min-win-prob', p.mlAccuracyFirstMinWinProbability != null ? (Number(p.mlAccuracyFirstMinWinProbability) * 100).toFixed(0) + '%' : '--');
 

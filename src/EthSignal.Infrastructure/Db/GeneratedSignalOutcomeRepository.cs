@@ -26,11 +26,11 @@ public sealed class GeneratedSignalOutcomeRepository : IGeneratedSignalOutcomeRe
         await using var cmd = new NpgsqlCommand(@"
             INSERT INTO ""ETH"".generated_signal_outcomes
                 (decision_id, evaluation_id, symbol, timeframe, signal_time_utc,
-                 evaluated_at_utc, bars_observed, tp_hit, sl_hit, outcome_label,
+                 evaluated_at_utc, bars_observed, tp_hit, sl_hit, partial_win, outcome_label,
                  pnl_r, mfe_price, mae_price, mfe_r, mae_r, closed_at_utc, updated_at_utc)
             VALUES
                 (@decision_id, @evaluation_id, @symbol, @timeframe, @signal_time_utc,
-                 @evaluated_at_utc, @bars_observed, @tp_hit, @sl_hit, @outcome_label,
+                 @evaluated_at_utc, @bars_observed, @tp_hit, @sl_hit, @partial_win, @outcome_label,
                  @pnl_r, @mfe_price, @mae_price, @mfe_r, @mae_r, @closed_at_utc, NOW())
             ON CONFLICT (decision_id) DO UPDATE SET
                 evaluation_id = EXCLUDED.evaluation_id,
@@ -41,6 +41,7 @@ public sealed class GeneratedSignalOutcomeRepository : IGeneratedSignalOutcomeRe
                 bars_observed = EXCLUDED.bars_observed,
                 tp_hit = EXCLUDED.tp_hit,
                 sl_hit = EXCLUDED.sl_hit,
+                partial_win = EXCLUDED.partial_win,
                 outcome_label = EXCLUDED.outcome_label,
                 pnl_r = EXCLUDED.pnl_r,
                 mfe_price = EXCLUDED.mfe_price,
@@ -59,6 +60,7 @@ public sealed class GeneratedSignalOutcomeRepository : IGeneratedSignalOutcomeRe
         cmd.Parameters.Add(new("bars_observed", NpgsqlTypes.NpgsqlDbType.Integer));
         cmd.Parameters.Add(new("tp_hit", NpgsqlTypes.NpgsqlDbType.Boolean));
         cmd.Parameters.Add(new("sl_hit", NpgsqlTypes.NpgsqlDbType.Boolean));
+        cmd.Parameters.Add(new("partial_win", NpgsqlTypes.NpgsqlDbType.Boolean));
         cmd.Parameters.Add(new("outcome_label", NpgsqlTypes.NpgsqlDbType.Text));
         cmd.Parameters.Add(new("pnl_r", NpgsqlTypes.NpgsqlDbType.Numeric));
         cmd.Parameters.Add(new("mfe_price", NpgsqlTypes.NpgsqlDbType.Numeric));
@@ -81,6 +83,7 @@ public sealed class GeneratedSignalOutcomeRepository : IGeneratedSignalOutcomeRe
             cmd.Parameters["bars_observed"].Value = item.Outcome.BarsObserved;
             cmd.Parameters["tp_hit"].Value = item.Outcome.TpHit;
             cmd.Parameters["sl_hit"].Value = item.Outcome.SlHit;
+            cmd.Parameters["partial_win"].Value = item.Outcome.PartialWin;
             cmd.Parameters["outcome_label"].Value = item.Outcome.OutcomeLabel.ToString();
             cmd.Parameters["pnl_r"].Value = item.Outcome.PnlR;
             cmd.Parameters["mfe_price"].Value = item.Outcome.MfePrice;

@@ -71,8 +71,13 @@ public sealed class LiveTickProcessor
     // Dedupe cache for provisional (running-candle) signals
     private readonly HashSet<string> _provisionalSignalKeys = new();
     private DateTimeOffset? _lastScalpBarTime; // cooldown tracker for 1m scalp signals
+    private int _missedSignalDueToExceptionCount;
+    private DateTimeOffset? _lastEvaluationExceptionUtc;
 
     private sealed record MlEvaluationArtifacts(Guid EvaluationId, MlPrediction? Prediction);
+
+    public int MissedSignalDueToExceptionCount => Volatile.Read(ref _missedSignalDueToExceptionCount);
+    public DateTimeOffset? LastEvaluationExceptionUtc => _lastEvaluationExceptionUtc;
 
     // Convenience accessors for backward compatibility
     private IndicatorSnapshot? _latestSnap5m
@@ -890,6 +895,7 @@ public sealed class LiveTickProcessor
     private async Task TryGenerateSignal(string symbol, RichCandle closedCandle,
         IReadOnlyList<RichCandle> closedHistory, Timeframe tf, CancellationToken ct)
     {
+        MlEvaluationArtifacts? mlArtifacts = null;
         try
         {
             _logger.LogInformation("[LOG-TRACE] TryGenerateSignal: symbol={Symbol} tf={Tf} barTime={BarTime} close={Close} vol={Vol}", symbol, tf.Name, closedCandle.OpenTime.ToString("o"), closedCandle.MidClose, closedCandle.Volume);
@@ -897,6 +903,10 @@ public sealed class LiveTickProcessor
             var riskPolicy = p.ToRiskPolicy();
 
             var latestSnap = _latestSnaps.GetValueOrDefault(tf.Name);
+            var snap = latestSnap;
+            if (snap == null)
+                return;
+
             var prevSnap = _prevSnaps.GetValueOrDefault(tf.Name);
 
             // TF-4: Check regime freshness before evaluation
@@ -948,7 +958,7 @@ public sealed class LiveTickProcessor
             {
                 var recentSnaps = _recentSnapBuffer.Get(tf.Name);
                 var (adaptedParams, conditionClass) = _adaptiveService.AdaptParameters(
-                    p, latestSnap, _currentRegimeResult, closedCandle, tf, recentSnaps);
+                    p, snap, _currentRegimeResult, closedCandle, tf, recentSnaps);
                 p = adaptedParams;
                 riskPolicy = p.ToRiskPolicy();
                 currentConditionClass = conditionClass;
@@ -958,15 +968,15 @@ public sealed class LiveTickProcessor
             // TF-1: Use EvaluateWithMl for ML-enhanced signal generation
             // First run a quick rule-based pass to get direction/score for feature extraction
             var (preSignal, preDecision) = SignalEngine.EvaluateWithDecision(
-                symbol, tfRegime, latestSnap!, prevSnap, closedCandle, p,
+                symbol, tfRegime, snap, prevSnap, closedCandle, p,
                 SourceMode.LIVE, p.StrategyVersion, evaluationTf: tf);
-            var mlArtifacts = await RunMlInferenceAsync(
-                symbol, latestSnap!, prevSnap, closedCandle, tfRegime,
+            mlArtifacts = await RunMlInferenceAsync(
+                symbol, snap, prevSnap, closedCandle, tfRegime,
                 preSignal.Direction, preSignal.ConfidenceScore, p, tf, ct);
             var mlPrediction = mlArtifacts?.Prediction;
 
             var (signal, decision) = SignalEngine.EvaluateWithMl(
-                symbol, tfRegime, latestSnap!, prevSnap, closedCandle, p,
+                symbol, tfRegime, snap, prevSnap, closedCandle, p,
                 mlPrediction, _frequencyManager,
                 SourceMode.LIVE, p.StrategyVersion, evaluationTf: tf,
                 preComputed: (preSignal, preDecision));
@@ -1071,11 +1081,11 @@ public sealed class LiveTickProcessor
                         : closedCandle.MidHigh;
                 }
 
-                decimal spreadPct = latestSnap!.CloseMid > 0
-                    ? latestSnap.Spread / latestSnap.CloseMid : 0;
+                decimal spreadPct = snap.CloseMid > 0
+                    ? snap.Spread / snap.CloseMid : 0;
                 var estimatedEntry = RiskManager.EstimateLiveFillPrice(
                     signal.Direction,
-                    latestSnap.CloseMid,
+                    snap.CloseMid,
                     spreadPct,
                     p.LiveEntrySlippageBufferPct);
 
@@ -1090,7 +1100,7 @@ public sealed class LiveTickProcessor
                 {
                     Direction = signal.Direction,
                     EntryPrice = estimatedEntry,
-                    Atr = latestSnap.Atr14,
+                    Atr = snap.Atr14,
                     SpreadPct = spreadPct,
                     ConfidenceScore = signal.ConfidenceScore,
                     Regime = signal.Regime,
@@ -1131,13 +1141,14 @@ public sealed class LiveTickProcessor
                     };
                     await _decisionAuditRepo.InsertDecisionAsync(persistedDecision, ct);
 
-                    _ = _telegram.SendAsync(
-                        TelegramMessageFormatter.NewSignal(fullSignal, persistedDecision, _currentRegimeResult, p.OutcomeTimeoutBars), ct);
+                    NotifyTelegramInBackground(
+                        TelegramMessageFormatter.NewSignal(fullSignal, persistedDecision, _currentRegimeResult, p.OutcomeTimeoutBars),
+                        ct);
 
                     await LinkMlArtifactsAsync(mlArtifacts, fullSignal.SignalId, ct);
 
                     // P6-01: Persist signal features
-                    await InsertSignalFeaturesAsync(fullSignal, latestSnap!, closedCandle, ct);
+                    await InsertSignalFeaturesAsync(fullSignal, snap, closedCandle, ct);
 
                     _lastSignal = fullSignal;
                     _barsSinceLastSignal = 0;
@@ -1177,7 +1188,9 @@ public sealed class LiveTickProcessor
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Signal generation/evaluation failed");
+            if (mlArtifacts != null)
+                await FinalizeMlArtifactsAsync(mlArtifacts, MlEvaluationLinkStatus.NoSignalExpected, ct);
+            await RecordEvaluationExceptionAsync(symbol, tf, closedCandle.OpenTime, DecisionOrigin.CLOSED_BAR, ex, ct);
         }
         finally
         {
@@ -1236,7 +1249,7 @@ public sealed class LiveTickProcessor
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "1m-eval signal evaluation failed (non-fatal)");
+            _logger.LogError(ex, "1m-eval signal evaluation failed");
         }
         finally
         {
@@ -1258,6 +1271,7 @@ public sealed class LiveTickProcessor
     private async Task TryEvaluateScalpSignal(string symbol, RichCandle closed1mCandle,
         StrategyParameters p, CancellationToken ct)
     {
+        MlEvaluationArtifacts? scalpMlArtifacts = null;
         try
         {
             _logger.LogInformation("[LOG-TRACE] TryEvaluateScalpSignal: symbol={Symbol} barTime={BarTime} close={Close} vol={Vol}", symbol, closed1mCandle.OpenTime.ToString("o"), closed1mCandle.MidClose, closed1mCandle.Volume);
@@ -1354,11 +1368,8 @@ public sealed class LiveTickProcessor
             {
                 _logger.LogDebug("[1m] Scalp signal {Dir} score {Score} below scalp threshold {Threshold}",
                     signal.Direction, signal.ConfidenceScore, p.ScalpConfidenceThreshold);
-                if (decision != null)
-                {
-                    decision = decision with { Origin = DecisionOrigin.SCALP_1M };
-                    await _decisionAuditRepo.InsertDecisionAsync(decision, ct);
-                }
+                decision = decision with { Origin = DecisionOrigin.SCALP_1M };
+                await _decisionAuditRepo.InsertDecisionAsync(decision, ct);
                 return;
             }
 
@@ -1378,7 +1389,7 @@ public sealed class LiveTickProcessor
             // Run ML inference before operational/session gates so blocked scalp
             // decisions still get a persisted feature snapshot and can contribute
             // to ML diagnostics / trainer counts.
-            var scalpMlArtifacts = await RunMlInferenceAsync(
+            scalpMlArtifacts = await RunMlInferenceAsync(
                 symbol, snapshot, prevSnap, closed1mCandle, scalpRegime,
                 signal.Direction, signal.ConfidenceScore, p, Timeframe.M1, ct);
 
@@ -1420,7 +1431,7 @@ public sealed class LiveTickProcessor
             var sessionBlock = RiskManager.CheckSessionLimits(riskPolicy, openSignals.Count, todayOutcomes, isScalp: true);
             if (sessionBlock != null)
             {
-                var sessionDecision = decision with
+                var sessionDecision = decision! with
                 {
                     LifecycleState = SignalLifecycleState.SESSION_BLOCKED,
                     FinalBlockReason = sessionBlock
@@ -1496,11 +1507,12 @@ public sealed class LiveTickProcessor
                 await _signalRepo.InsertSignalAsync(fullSignal, ct);
 
                 // FR-1: Update decision to PERSISTED
-                var persistedDecision = decision with { LifecycleState = SignalLifecycleState.PERSISTED };
+                var persistedDecision = decision! with { LifecycleState = SignalLifecycleState.PERSISTED };
                 await _decisionAuditRepo.InsertDecisionAsync(persistedDecision, ct);
 
-                _ = _telegram.SendAsync(
-                    TelegramMessageFormatter.NewSignal(fullSignal, persistedDecision!, _currentRegimeResult, p.OutcomeTimeoutBars), ct);
+                NotifyTelegramInBackground(
+                    TelegramMessageFormatter.NewSignal(fullSignal, persistedDecision, _currentRegimeResult, p.OutcomeTimeoutBars),
+                    ct);
 
                 await LinkMlArtifactsAsync(scalpMlArtifacts, fullSignal.SignalId, ct);
 
@@ -1518,7 +1530,7 @@ public sealed class LiveTickProcessor
             {
                 _logger.LogInformation("[1m] Scalp signal {Dir} rejected by exit engine: {Reason}",
                     signal.Direction, scalpExitResult.RejectReason ?? "N/A");
-                var riskDecision = decision with
+                var riskDecision = decision! with
                 {
                     LifecycleState = SignalLifecycleState.RISK_BLOCKED,
                     FinalBlockReason = scalpExitResult.RejectReason ?? "Exit engine rejected"
@@ -1529,7 +1541,9 @@ public sealed class LiveTickProcessor
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "[1m] Scalp signal evaluation failed (non-fatal)");
+            if (scalpMlArtifacts != null)
+                await FinalizeMlArtifactsAsync(scalpMlArtifacts, MlEvaluationLinkStatus.NoSignalExpected, ct);
+            await RecordEvaluationExceptionAsync(symbol, Timeframe.M1, closed1mCandle.OpenTime, DecisionOrigin.SCALP_1M, ex, ct);
         }
     }
 
@@ -1539,6 +1553,7 @@ public sealed class LiveTickProcessor
     private async Task TryEvaluateRunningCandle(string symbol, RichCandle closed1mCandle,
         Timeframe tf, StrategyParameters p, CancellationToken ct)
     {
+        MlEvaluationArtifacts? mlArtifacts = null;
         try
         {
             _logger.LogInformation("[LOG-TRACE] TryEvaluateRunningCandle: symbol={Symbol} tf={Tf} barTime={BarTime} close={Close} vol={Vol}", symbol, tf.Name, closed1mCandle.OpenTime.ToString("o"), closed1mCandle.MidClose, closed1mCandle.Volume);
@@ -1599,6 +1614,7 @@ public sealed class LiveTickProcessor
             // Compute indicators on the combined history
             var runningSnap = IndicatorEngine.ComputeLatest(symbol, tf.Name, historyWithRunning, p);
             if (runningSnap == null) return;
+            var snap = runningSnap;
 
             var prevSnap = _latestSnaps.GetValueOrDefault(tf.Name);
 
@@ -1633,7 +1649,7 @@ public sealed class LiveTickProcessor
             {
                 var recentSnaps = _recentSnapBuffer.Get(tf.Name);
                 var (adaptedParams, conditionClass) = _adaptiveService.AdaptParameters(
-                    p, runningSnap, _currentRegimeResult, runningCandle, tf, recentSnaps);
+                    p, snap, _currentRegimeResult, runningCandle, tf, recentSnaps);
                 p = adaptedParams;
                 currentConditionClass = conditionClass;
                 adaptedParametersJson = MarketAdaptiveParameterService.BuildOverlayDiffsJson(baseParams, p);
@@ -1641,14 +1657,14 @@ public sealed class LiveTickProcessor
 
             // Evaluate signal using the running snapshot
             var (preSignal, preDecision) = SignalEngine.EvaluateWithDecision(
-                symbol, tfRegime, runningSnap, prevSnap, runningCandle, p,
+                symbol, tfRegime, snap, prevSnap, runningCandle, p,
                 SourceMode.LIVE, p.StrategyVersion, evaluationTf: tf);
-            var mlArtifacts = await RunMlInferenceAsync(
-                symbol, runningSnap, prevSnap, runningCandle, tfRegime,
+            mlArtifacts = await RunMlInferenceAsync(
+                symbol, snap, prevSnap, runningCandle, tfRegime,
                 preSignal.Direction, preSignal.ConfidenceScore, p, tf, ct);
             var mlPrediction = mlArtifacts?.Prediction;
             var (signal, decision) = SignalEngine.EvaluateWithMl(
-                symbol, tfRegime, runningSnap, prevSnap, runningCandle, p,
+                symbol, tfRegime, snap, prevSnap, runningCandle, p,
                 mlPrediction, _frequencyManager,
                 SourceMode.LIVE, p.StrategyVersion, evaluationTf: tf,
                 preComputed: (preSignal, preDecision));
@@ -1750,11 +1766,11 @@ public sealed class LiveTickProcessor
                     : runningCandle.MidHigh;
             }
 
-            decimal spreadPct = runningSnap.CloseMid > 0
-                ? runningSnap.Spread / runningSnap.CloseMid : 0;
+            decimal spreadPct = snap.CloseMid > 0
+                ? snap.Spread / snap.CloseMid : 0;
             var estimatedEntry = RiskManager.EstimateLiveFillPrice(
                 signal.Direction,
-                runningSnap.CloseMid,
+                snap.CloseMid,
                 spreadPct,
                 p.LiveEntrySlippageBufferPct);
 
@@ -1769,7 +1785,7 @@ public sealed class LiveTickProcessor
             {
                 Direction = signal.Direction,
                 EntryPrice = estimatedEntry,
-                Atr = runningSnap.Atr14,
+                Atr = snap.Atr14,
                 SpreadPct = spreadPct,
                 ConfidenceScore = signal.ConfidenceScore,
                 Regime = signal.Regime,
@@ -1804,7 +1820,7 @@ public sealed class LiveTickProcessor
                 var persistedDecision = decision with { LifecycleState = SignalLifecycleState.PERSISTED };
                 await _decisionAuditRepo.InsertDecisionAsync(persistedDecision, ct);
 
-                await InsertSignalFeaturesAsync(fullSignal, runningSnap, runningCandle, ct);
+                await InsertSignalFeaturesAsync(fullSignal, snap, runningCandle, ct);
                 await LinkMlArtifactsAsync(mlArtifacts, fullSignal.SignalId, ct);
 
                 _lastSignal = fullSignal;
@@ -1828,7 +1844,9 @@ public sealed class LiveTickProcessor
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "[{Tf}] 1m-eval running candle evaluation failed (non-fatal)", tf.Name);
+            if (mlArtifacts != null)
+                await FinalizeMlArtifactsAsync(mlArtifacts, MlEvaluationLinkStatus.NoSignalExpected, ct);
+            await RecordEvaluationExceptionAsync(symbol, tf, closed1mCandle.OpenTime, DecisionOrigin.PARTIAL_RUNNING, ex, ct);
         }
     }
 
@@ -2072,6 +2090,64 @@ public sealed class LiveTickProcessor
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to insert signal features for {SignalId}", signal.SignalId);
+        }
+    }
+
+    private void NotifyTelegramInBackground(string message, CancellationToken ct)
+    {
+        _telegram.SendAsync(message, ct).ContinueWith(
+            t => _logger.LogWarning(t.Exception, "[Telegram] Signal notification failed"),
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted,
+            TaskScheduler.Default);
+    }
+
+    private async Task RecordEvaluationExceptionAsync(
+        string symbol,
+        Timeframe tf,
+        DateTimeOffset barTimeUtc,
+        DecisionOrigin origin,
+        Exception ex,
+        CancellationToken ct)
+    {
+        Interlocked.Increment(ref _missedSignalDueToExceptionCount);
+        _lastEvaluationExceptionUtc = DateTimeOffset.UtcNow;
+
+        _marketState.RecordError($"Signal evaluation exception [{tf.Name}] {ex.Message}");
+        _logger.LogError(ex,
+            "[{Tf}] Signal evaluation failed; audit record persisted and opportunity marked as missed",
+            tf.Name);
+
+        var decision = new SignalDecision
+        {
+            Symbol = symbol,
+            Timeframe = tf.Name,
+            DecisionTimeUtc = DateTimeOffset.UtcNow,
+            BarTimeUtc = barTimeUtc,
+            DecisionType = SignalDirection.NO_TRADE,
+            OutcomeCategory = OutcomeCategory.EVALUATION_ERROR,
+            LifecycleState = SignalLifecycleState.EVALUATED,
+            FinalBlockReason = ex.Message,
+            Origin = origin,
+            UsedRegime = _currentRegimeResult?.Regime,
+            UsedRegimeTimestamp = _currentRegimeResult?.CandleOpenTimeUtc,
+            ReasonCodes = [RejectReasonCode.EVALUATION_EXCEPTION],
+            ReasonDetails = [$"[{tf.Name}] {ex.GetType().Name}: {ex.Message}"],
+            IndicatorSnapshot = new Dictionary<string, decimal>(),
+            ParameterSetId = _paramProvider.GetActive().StrategyVersion,
+            SourceMode = SourceMode.LIVE
+        };
+
+        try
+        {
+            await _decisionAuditRepo.InsertDecisionAsync(decision, ct);
+            _lastDecision = decision;
+        }
+        catch (Exception auditEx)
+        {
+            _logger.LogError(auditEx,
+                "[{Tf}] Failed to persist evaluation-error audit record after signal exception",
+                tf.Name);
         }
     }
 

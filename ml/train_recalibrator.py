@@ -62,8 +62,20 @@ def train_fold_model(model_library: str, X_train, y_train, X_val, y_val):
         return train_lightgbm(X_train, y_train, X_val, y_val)
 
 
-def main(data_path: str, model_path: str, output_dir: str):
+REGIME_LABEL_MAP = {"BEARISH": -1, "BULLISH": 1, "NEUTRAL": 0}
+
+
+def main(data_path: str, model_path: str, output_dir: str, regime: str | None = None):
     df = load_data(data_path)
+
+    if regime is not None:
+        regime_upper = regime.upper()
+        if regime_upper in REGIME_LABEL_MAP and "regime_label" in df.columns:
+            label_val = REGIME_LABEL_MAP[regime_upper]
+            df = df[df["regime_label"] == label_val].copy()
+            print(f"Regime filter '{regime_upper}': {len(df)} samples after filtering")
+        else:
+            print(f"WARN: regime='{regime}' not recognised or 'regime_label' column missing — using full dataset")
 
     # Need at least 4 samples to split into any folds at all.
     if len(df) < 4:
@@ -177,6 +189,7 @@ def main(data_path: str, model_path: str, output_dir: str):
 
     os.makedirs(output_dir, exist_ok=True)
     version = datetime.now(timezone.utc).strftime("v%Y%m%d_%H%M%S")
+    regime_prefix = f"{regime.upper()}_" if regime else ""
 
     lookup_raw = np.linspace(0, 1, GRID_POINTS)
     lookup_iso = iso_reg.predict(lookup_raw)
@@ -208,13 +221,13 @@ def main(data_path: str, model_path: str, output_dir: str):
         "trained_at_utc": datetime.now(timezone.utc).isoformat(),
     }
 
-    out_path = os.path.join(output_dir, f"recalibrator_{version}.json")
+    out_path = os.path.join(output_dir, f"recalibrator_{regime_prefix}{version}.json")
     with open(out_path, "w") as f:
         json.dump(output, f, indent=2)
 
     import joblib
 
-    pkl_path = os.path.join(output_dir, f"recalibrator_{version}.pkl")
+    pkl_path = os.path.join(output_dir, f"recalibrator_{regime_prefix}{version}.pkl")
     joblib.dump(iso_reg, pkl_path)
 
     print(f"\nCalibration table saved to {out_path}")
@@ -226,6 +239,7 @@ if __name__ == "__main__":
     parser.add_argument("--data", required=True, help="Training data path")
     parser.add_argument("--model", required=True, help="Trained outcome predictor model path")
     parser.add_argument("--output", default="models/", help="Output directory")
+    parser.add_argument("--regime", default=None, help="Regime scope filter: BEARISH, BULLISH, or NEUTRAL")
     args = parser.parse_args()
 
-    main(args.data, args.model, args.output)
+    main(args.data, args.model, args.output, regime=args.regime)

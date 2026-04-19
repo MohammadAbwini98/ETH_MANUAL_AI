@@ -669,4 +669,20 @@ public class MlDataDiagnosticsServiceTests
                 ClosedAtUtc = label == OutcomeLabel.PENDING ? null : DateTimeOffset.UtcNow.AddMinutes(10)
             }
         };
+
+    [Fact]
+    public async Task GetReportAsync_InvalidScope_ThrowsArgumentException()
+    {
+        var service = new MlDataDiagnosticsService(
+            Mock.Of<IMlDataDiagnosticsRepository>(),
+            Mock.Of<IMlModelRepository>(),
+            CreateBlockedHistoryService(),
+            CreateGeneratedHistoryService(),
+            NullLogger<MlDataDiagnosticsService>.Instance);
+
+        var act = () => service.GetReportAsync("ETHUSD", "INVALID", 0.55m, CancellationToken.None);
+
+        await act.Should().ThrowAsync<ArgumentException>()
+            .WithMessage("*Invalid scope*");
+    }
 }

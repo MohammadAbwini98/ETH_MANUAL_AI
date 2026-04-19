@@ -45,10 +45,11 @@ public sealed class MlModelPromotionService
     public async Task<MlModelPromotionResult> PromoteBestModelAsync(
         string modelType,
         CancellationToken ct = default,
-        MlPromotionContext? context = null)
+        MlPromotionContext? context = null,
+        string regimeScope = "ALL")
     {
         var models = await _modelRepo.GetAllAsync(ct);
-        var decision = EvaluatePromotion(modelType, models, context);
+        var decision = EvaluatePromotion(modelType, models, context, regimeScope);
         LastPromotionBlockReason = decision.ShouldActivate ? null : decision.Reason;
         if (!decision.ShouldActivate || decision.SelectedModel is null)
         {
@@ -95,10 +96,12 @@ public sealed class MlModelPromotionService
     public MlModelPromotionDecision EvaluatePromotion(
         string modelType,
         IReadOnlyList<MlModelMetadata> models,
-        MlPromotionContext? context = null)
+        MlPromotionContext? context = null,
+        string regimeScope = "ALL")
     {
         var relevant = models
-            .Where(m => string.Equals(m.ModelType, modelType, StringComparison.OrdinalIgnoreCase))
+            .Where(m => string.Equals(m.ModelType, modelType, StringComparison.OrdinalIgnoreCase)
+                     && string.Equals(m.RegimeScope, regimeScope, StringComparison.OrdinalIgnoreCase))
             .ToList();
 
         var currentActive = relevant
@@ -215,17 +218,21 @@ public sealed class MlModelPromotionService
         else if (!_fileExists(model.FilePath))
             blockers.Add($"model file missing on disk: {model.FilePath}");
 
-        // 3. Sample count gates
-        if (model.TrainingSampleCount < MinTrainingSamples)
-            blockers.Add($"training samples {model.TrainingSampleCount} < {MinTrainingSamples}");
+        // 3. Sample count gates — relaxed for regime specialists (they cover ~1/3 of market conditions)
+        var isRegimeSpecific = !string.Equals(model.RegimeScope, "ALL", StringComparison.OrdinalIgnoreCase);
+        var minSamples = isRegimeSpecific ? 50 : MinTrainingSamples;
+        var maxEce = isRegimeSpecific ? 0.30m : MaxExpectedCalibrationError;
+
+        if (model.TrainingSampleCount < minSamples)
+            blockers.Add($"training samples {model.TrainingSampleCount} < {minSamples}");
 
         // 4. Accuracy metrics
         if (model.AucRoc < MinAucRoc)
             blockers.Add($"AUC {model.AucRoc:F4} < {MinAucRoc:F2}");
         if (model.BrierScore > MaxBrierScore)
             blockers.Add($"Brier {model.BrierScore:F4} > {MaxBrierScore:F2}");
-        if (model.ExpectedCalibrationError > 0m && model.ExpectedCalibrationError > MaxExpectedCalibrationError)
-            blockers.Add($"ECE {model.ExpectedCalibrationError:F4} > {MaxExpectedCalibrationError:F2}");
+        if (model.ExpectedCalibrationError > 0m && model.ExpectedCalibrationError > maxEce)
+            blockers.Add($"ECE {model.ExpectedCalibrationError:F4} > {maxEce:F2}");
 
         // 5. Fold metrics must be present (null/empty/{}/[] all count as incomplete)
         if (!HasFoldMetrics(model.FoldMetricsJson))
@@ -234,8 +241,8 @@ public sealed class MlModelPromotionService
         // 6. Context-driven gates (only enforced when caller supplied them)
         if (context != null)
         {
-            if (context.LabeledSamples.HasValue && context.LabeledSamples.Value < MinTrainingSamples)
-                blockers.Add($"clean labeled samples {context.LabeledSamples.Value} < {MinTrainingSamples}");
+            if (context.LabeledSamples.HasValue && context.LabeledSamples.Value < minSamples)
+                blockers.Add($"clean labeled samples {context.LabeledSamples.Value} < {minSamples}");
             if (context.Wins.HasValue && context.Wins.Value < MinWinSamples)
                 blockers.Add($"WIN samples {context.Wins.Value} < {MinWinSamples}");
             if (context.Losses.HasValue && context.Losses.Value < MinLossSamples)

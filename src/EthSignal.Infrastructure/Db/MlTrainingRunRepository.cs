@@ -92,6 +92,24 @@ public sealed class MlTrainingRunRepository : IMlTrainingRunRepository
         return ReadRun(reader);
     }
 
+    public async Task<MlTrainingRunRecord?> GetLatestCompletedAsync(CancellationToken ct = default)
+    {
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(ct);
+        await using var cmd = new NpgsqlCommand(@"
+            SELECT id, model_type, trigger, data_start_utc, data_end_utc, sample_count,
+                   fold_count, embargo_bars, status, result_model_id, error_text,
+                   started_at_utc, finished_at_utc, duration_seconds
+            FROM ""ETH"".ml_training_runs
+            WHERE status <> 'running'
+              AND finished_at_utc IS NOT NULL
+            ORDER BY finished_at_utc DESC
+            LIMIT 1;", conn);
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        if (!await reader.ReadAsync(ct)) return null;
+        return ReadRun(reader);
+    }
+
     public async Task<int> GetLabeledSampleCountAsync(CancellationToken ct = default)
     {
         await using var conn = new NpgsqlConnection(_connectionString);
@@ -111,8 +129,10 @@ public sealed class MlTrainingRunRepository : IMlTrainingRunRepository
                 SELECT f.evaluation_id, b.outcome_label
                 FROM ""ETH"".ml_feature_snapshots f
                 JOIN ""ETH"".blocked_signal_outcomes b ON b.evaluation_id = f.evaluation_id
+                JOIN ""ETH"".signal_decision_audit d ON d.evaluation_id = b.evaluation_id
                 WHERE f.feature_version = @feature_version
                   AND COALESCE(f.timeframe, '') <> '1m'
+                  AND d.outcome_category = 'OPERATIONAL_BLOCKED'
                   AND b.outcome_label IN ('WIN','LOSS')
                   AND COALESCE((f.features_json ->> 'direction_encoded')::INT, 0) <> 0
                 UNION
@@ -149,8 +169,10 @@ public sealed class MlTrainingRunRepository : IMlTrainingRunRepository
                 SELECT f.evaluation_id, b.outcome_label
                 FROM ""ETH"".ml_feature_snapshots f
                 JOIN ""ETH"".blocked_signal_outcomes b ON b.evaluation_id = f.evaluation_id
+                JOIN ""ETH"".signal_decision_audit d ON d.evaluation_id = b.evaluation_id
                 WHERE f.feature_version = @feature_version
                   AND COALESCE(f.timeframe, '') <> '1m'
+                  AND d.outcome_category = 'OPERATIONAL_BLOCKED'
                   AND b.outcome_label IN ('WIN','LOSS')
                   AND COALESCE((f.features_json ->> 'direction_encoded')::INT, 0) <> 0
                 UNION
@@ -191,8 +213,10 @@ public sealed class MlTrainingRunRepository : IMlTrainingRunRepository
                 SELECT f.evaluation_id, b.outcome_label, b.evaluated_at_utc
                 FROM ""ETH"".ml_feature_snapshots f
                 JOIN ""ETH"".blocked_signal_outcomes b ON b.evaluation_id = f.evaluation_id
+                JOIN ""ETH"".signal_decision_audit d ON d.evaluation_id = b.evaluation_id
                 WHERE f.feature_version = @feature_version
                   AND COALESCE(f.timeframe, '') <> '1m'
+                  AND d.outcome_category = 'OPERATIONAL_BLOCKED'
                   AND b.outcome_label IN ('WIN','LOSS')
                   AND COALESCE((f.features_json ->> 'direction_encoded')::INT, 0) <> 0
                 UNION

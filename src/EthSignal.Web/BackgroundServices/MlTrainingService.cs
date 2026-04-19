@@ -143,26 +143,28 @@ public sealed class MlTrainingService : BackgroundService
         }
 
         var p = _paramProvider.GetActive();
-        var lastSuccess = await _trainingRepo.GetLatestSuccessfulAsync(ct);
-
-        // Drift-triggered retraining
-        var modelVersion = _inferenceService.ActiveModelVersion ?? "none";
-        var drift = _driftDetector.CheckDrift(p, modelVersion);
-        if (drift.DriftDetected)
-            return "drift";
-
-        // Time-based: max days since last training
-        if (lastSuccess == null)
+        var lastCompleted = await _trainingRepo.GetLatestCompletedAsync(ct);
+        if (lastCompleted == null)
             return "initial";
 
-        var timeSinceLast = DateTimeOffset.UtcNow - lastSuccess.FinishedAtUtc!.Value;
+        var timeSinceLast = DateTimeOffset.UtcNow - lastCompleted.FinishedAtUtc!.Value;
+        var newOutcomes = await _trainingRepo.GetNewOutcomesSinceAsync(lastCompleted.FinishedAtUtc!.Value, ct);
+
+        // Drift-triggered retraining: only re-run when something materially changed
+        // since the last completed attempt, otherwise the same drifting dataset can
+        // trigger a failed training loop every 5 minutes.
+        var modelVersion = _inferenceService.ActiveModelVersion ?? "none";
+        var drift = _driftDetector.CheckDrift(p, modelVersion);
+        if (drift.DriftDetected
+            && (timeSinceLast >= RetrainInterval || newOutcomes >= p.MlRetrainSignalThreshold))
+            return "drift";
 
         // Hourly periodic retraining
         if (timeSinceLast >= RetrainInterval)
             return $"hourly ({timeSinceLast.TotalMinutes:F0}m since last run)";
 
-        // New outcomes threshold since last training
-        var newOutcomes = await _trainingRepo.GetNewOutcomesSinceAsync(lastSuccess.FinishedAtUtc!.Value, ct);
+        // New outcomes threshold since the last completed run. Using the latest
+        // completed attempt prevents immediate retraining on the same failed batch.
         if (newOutcomes >= p.MlRetrainSignalThreshold)
             return $"threshold ({newOutcomes} new outcomes)";
 
@@ -279,6 +281,7 @@ public sealed class MlTrainingService : BackgroundService
                 }
                 else
                 {
+                    // Promote global (ALL-scope) model
                     var promotion = await _modelPromotionService.PromoteBestModelAsync("outcome_predictor", ct);
 
                     await _trainingRepo.UpdateAsync(runId, "success", samples, newest.Id, null, (int)sw.Elapsed.TotalSeconds, ct);
@@ -289,22 +292,52 @@ public sealed class MlTrainingService : BackgroundService
                     if (promotion.Activated && promotion.SelectedModel != null)
                     {
                         _logger.LogInformation(
-                            "[MLTrainer] Auto-promoted model {Version} after training | Reason={Reason}",
-                            promotion.SelectedModel.ModelVersion,
-                            promotion.Reason);
+                            "[MLTrainer] Auto-promoted global model {Version} after training | Reason={Reason}",
+                            promotion.SelectedModel.ModelVersion, promotion.Reason);
                     }
                     else
                     {
                         _logger.LogInformation(
-                            "[MLTrainer] Promotion check kept the current model after training | Reason={Reason}",
+                            "[MLTrainer] Promotion check kept the current global model after training | Reason={Reason}",
                             promotion.Reason);
                     }
 
-                    // Auto-reload if a new model was registered or promoted.
-                    if (promotion.Activated)
+                    // ENH-1: Auto-promote regime specialists (BEARISH / BULLISH / NEUTRAL).
+                    // Non-fatal: a specialist may not exist yet if the regime had < 50 samples.
+                    bool anySpecialistActivated = false;
+                    foreach (var scope in new[] { "BEARISH", "BULLISH", "NEUTRAL" })
+                    {
+                        try
+                        {
+                            var regimePromotion = await _modelPromotionService.PromoteBestModelAsync(
+                                "outcome_predictor", ct, regimeScope: scope);
+                            if (regimePromotion.Activated && regimePromotion.SelectedModel != null)
+                            {
+                                anySpecialistActivated = true;
+                                _logger.LogInformation(
+                                    "[MLTrainer] Auto-promoted {Scope} specialist {Version} | Reason={Reason}",
+                                    scope, regimePromotion.SelectedModel.ModelVersion, regimePromotion.Reason);
+                            }
+                            else
+                            {
+                                _logger.LogDebug(
+                                    "[MLTrainer] No {Scope} specialist promoted after training | Reason={Reason}",
+                                    scope, regimePromotion.Reason);
+                            }
+                        }
+                        catch (Exception regEx)
+                        {
+                            _logger.LogWarning(regEx,
+                                "[MLTrainer] Regime specialist promotion failed for scope={Scope} — continuing", scope);
+                        }
+                    }
+
+                    // Reload inference service if global model or any specialist changed
+                    if (promotion.Activated || anySpecialistActivated)
                     {
                         await _inferenceService.LoadActiveModelAsync(ct);
-                        _logger.LogInformation("[MLTrainer] Inference service reloaded after training");
+                        _logger.LogInformation("[MLTrainer] Inference service reloaded — global={GlobalActivated} specialists={SpecialistsActivated}",
+                            promotion.Activated, anySpecialistActivated);
                     }
                 }
             }

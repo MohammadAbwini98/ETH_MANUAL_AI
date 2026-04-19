@@ -70,6 +70,7 @@ _LINKED_BASE = """
         o.pnl_r,
         o.tp_hit,
         o.sl_hit,
+        COALESCE(o.closed_at_utc, o.evaluated_at_utc) AS resolved_at_utc,
         o.bars_observed,
         o.mfe_r,
         o.mae_r
@@ -106,11 +107,13 @@ _BLOCKED_BASE = """
         b.pnl_r,
         b.tp_hit,
         b.sl_hit,
+        COALESCE(b.closed_at_utc, b.evaluated_at_utc) AS resolved_at_utc,
         b.bars_observed,
         b.mfe_r,
         b.mae_r
     FROM "ETH".ml_feature_snapshots f
     JOIN "ETH".blocked_signal_outcomes b ON b.evaluation_id = f.evaluation_id
+    JOIN "ETH".signal_decision_audit d ON d.evaluation_id = b.evaluation_id
     LEFT JOIN LATERAL (
         SELECT
             p1.calibrated_win_probability,
@@ -122,6 +125,7 @@ _BLOCKED_BASE = """
     ) p ON true
     WHERE f.feature_version = :version
       AND COALESCE(f.timeframe, '') <> '1m'
+      AND d.outcome_category = 'OPERATIONAL_BLOCKED'
       AND b.outcome_label IN ('WIN', 'LOSS')
       {date_clause}
     ORDER BY COALESCE(f.timestamp_utc, f.created_at_utc) ASC
@@ -140,6 +144,7 @@ _GENERATED_BASE = """
         g.pnl_r,
         g.tp_hit,
         g.sl_hit,
+        COALESCE(g.closed_at_utc, g.evaluated_at_utc) AS resolved_at_utc,
         g.bars_observed,
         g.mfe_r,
         g.mae_r
@@ -177,6 +182,7 @@ _PROXIMITY_BASE = """
         o.pnl_r,
         o.tp_hit,
         o.sl_hit,
+        COALESCE(o.closed_at_utc, o.evaluated_at_utc) AS resolved_at_utc,
         o.bars_observed,
         o.mfe_r,
         o.mae_r
@@ -383,11 +389,14 @@ def export_training_data(
         # trainable threshold. Keeps the guarded tier logic intact but removes
         # the silent drop where export emits fewer rows than diagnostics
         # reports as "trainable" labeled samples.
-        effective_include_fallback = False
-        if include_proximity_fallback:
+        effective_include_fallback = include_proximity_fallback or len(df_linked) < int(auto_fallback_threshold)
+        summary["auto_fallback_triggered"] = bool(
+            not include_proximity_fallback and len(df_linked) < int(auto_fallback_threshold)
+        )
+        if summary["auto_fallback_triggered"]:
             print(
-                "  WARN: Proximity fallback is disabled for v3.0+ exports. "
-                "Only direct signal-linked feature snapshots are exported."
+                f"  Auto-enabled proximity fallback: linked rows {len(df_linked)} "
+                f"< threshold {int(auto_fallback_threshold)}"
             )
 
         df_proximity = pd.DataFrame()
@@ -537,11 +546,31 @@ def export_training_data(
                   f"Check that ml_feature_snapshots.timeframe is populated correctly.")
 
     result = pd.concat([
-        df[["evaluation_id", "signal_id", "feature_time", "feature_timeframe", "calibrated_win_probability"]],
+        df[[
+            "evaluation_id",
+            "signal_id",
+            "feature_time",
+            "feature_timeframe",
+            "calibrated_win_probability",
+            "resolved_at_utc",
+        ]],
         features_df,
         df[["outcome_label", "pnl_r", "tp_hit", "sl_hit", "bars_observed", "mfe_r", "mae_r"]],
     ], axis=1)
     result = result.rename(columns={"feature_timeframe": "timeframe"})
+
+    feature_snapshot_utc = pd.to_datetime(result["feature_time"], utc=True, errors="coerce")
+    resolved_at_utc = pd.to_datetime(result["resolved_at_utc"], utc=True, errors="coerce")
+    if feature_snapshot_utc.isna().any() or resolved_at_utc.isna().any():
+        raise AssertionError("Data leakage check failed: missing feature/outcome timestamps in export")
+
+    leakage_mask = feature_snapshot_utc >= resolved_at_utc
+    if leakage_mask.any():
+        sample = result.loc[leakage_mask, ["evaluation_id", "signal_id", "feature_time", "resolved_at_utc"]].head(5)
+        raise AssertionError(
+            "Data leakage: feature snapshot must precede outcome resolution. "
+            f"Sample rows: {sample.to_dict(orient='records')}"
+        )
 
     result["target"] = (result["outcome_label"] == "WIN").astype(int)
 

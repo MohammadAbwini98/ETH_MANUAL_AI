@@ -39,6 +39,15 @@ public sealed record MlModelMetadata
     // ─── Feature importance ─────────────────────────────
     public required string FeatureImportanceJson { get; init; }
 
+    // ─── Regime scope ────────────────────────────────────────
+    /// <summary>
+    /// Market-regime scope this model was trained on.
+    /// "ALL" = global model trained on all regimes (default fallback).
+    /// "BEARISH" / "BULLISH" / "NEUTRAL" = regime-specific specialist.
+    /// MlInferenceService loads all four slots and routes by current regime label.
+    /// </summary>
+    public string RegimeScope { get; init; } = "ALL";
+
     // ─── Lifecycle ──────────────────────────────────────
     public required MlModelStatus Status { get; init; }
     public DateTimeOffset CreatedAtUtc { get; init; } = DateTimeOffset.UtcNow;

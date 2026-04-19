@@ -93,7 +93,8 @@ public static class OutcomeEvaluator
                                 return MakeOutcome(signal.SignalId, i + 1, OutcomeLabel.WIN,
                                     blended, mfePrice, maePrice,
                                     (mfePrice - entry) / stopDist,
-                                    (entry - maePrice) / stopDist, candleCloseTime);
+                                    (entry - maePrice) / stopDist, candleCloseTime,
+                                    tpHit: true);
                             }
                         }
                     }
@@ -106,7 +107,8 @@ public static class OutcomeEvaluator
                             return MakeOutcome(signal.SignalId, i + 1, OutcomeLabel.WIN,
                                 blended, mfePrice, maePrice,
                                 (mfePrice - entry) / stopDist,
-                                (entry - maePrice) / stopDist, candleCloseTime);
+                                (entry - maePrice) / stopDist, candleCloseTime,
+                                tpHit: true);
                         }
                     }
                     else if (tp1Hit && tp2Hit && high >= tp3)
@@ -115,7 +117,8 @@ public static class OutcomeEvaluator
                         return MakeOutcome(signal.SignalId, i + 1, OutcomeLabel.WIN,
                             blended, mfePrice, maePrice,
                             (mfePrice - entry) / stopDist,
-                            (entry - maePrice) / stopDist, candleCloseTime);
+                            (entry - maePrice) / stopDist, candleCloseTime,
+                            tpHit: true);
                     }
 
                     if (low <= activeSl)
@@ -127,14 +130,16 @@ public static class OutcomeEvaluator
                             return MakeOutcome(signal.SignalId, i + 1, OutcomeLabel.WIN,
                                 partialPnl, mfePrice, maePrice,
                                 (mfePrice - entry) / stopDist,
-                                (entry - maePrice) / stopDist, candleCloseTime);
+                                (entry - maePrice) / stopDist, candleCloseTime,
+                                tpHit: true, slHit: true, partialWin: true);
                         }
                         // SL hit before TP1 — full loss
                         decimal pnl = stopDist > 0 ? (sl - entry) / stopDist : 0;
                         return MakeOutcome(signal.SignalId, i + 1, OutcomeLabel.LOSS,
                             pnl, mfePrice, maePrice,
                             (mfePrice - entry) / stopDist,
-                            (entry - maePrice) / stopDist, candleCloseTime);
+                            (entry - maePrice) / stopDist, candleCloseTime,
+                            slHit: true);
                     }
                 }
                 else
@@ -160,7 +165,8 @@ public static class OutcomeEvaluator
                             pnl, mfePrice, maePrice,
                             stopDist > 0 ? (mfePrice - entry) / stopDist : 0,
                             stopDist > 0 ? (entry - maePrice) / stopDist : 0,
-                            candleCloseTime);
+                            candleCloseTime,
+                            tpHit: true);
                     }
                     if (slHit)
                     {
@@ -169,7 +175,8 @@ public static class OutcomeEvaluator
                             pnl, mfePrice, maePrice,
                             stopDist > 0 ? (mfePrice - entry) / stopDist : 0,
                             stopDist > 0 ? (entry - maePrice) / stopDist : 0,
-                            candleCloseTime);
+                            candleCloseTime,
+                            slHit: true);
                     }
                 }
             }
@@ -194,7 +201,8 @@ public static class OutcomeEvaluator
                                 return MakeOutcome(signal.SignalId, i + 1, OutcomeLabel.WIN,
                                     blended, mfePrice, maePrice,
                                     (entry - mfePrice) / stopDist,
-                                    (maePrice - entry) / stopDist, candleCloseTime);
+                                    (maePrice - entry) / stopDist, candleCloseTime,
+                                    tpHit: true);
                             }
                         }
                     }
@@ -207,7 +215,8 @@ public static class OutcomeEvaluator
                             return MakeOutcome(signal.SignalId, i + 1, OutcomeLabel.WIN,
                                 blended, mfePrice, maePrice,
                                 (entry - mfePrice) / stopDist,
-                                (maePrice - entry) / stopDist, candleCloseTime);
+                                (maePrice - entry) / stopDist, candleCloseTime,
+                                tpHit: true);
                         }
                     }
                     else if (tp1Hit && tp2Hit && low <= tp3)
@@ -216,7 +225,8 @@ public static class OutcomeEvaluator
                         return MakeOutcome(signal.SignalId, i + 1, OutcomeLabel.WIN,
                             blended, mfePrice, maePrice,
                             (entry - mfePrice) / stopDist,
-                            (maePrice - entry) / stopDist, candleCloseTime);
+                            (maePrice - entry) / stopDist, candleCloseTime,
+                            tpHit: true);
                     }
 
                     if (high >= activeSl)
@@ -227,13 +237,15 @@ public static class OutcomeEvaluator
                             return MakeOutcome(signal.SignalId, i + 1, OutcomeLabel.WIN,
                                 partialPnl, mfePrice, maePrice,
                                 (entry - mfePrice) / stopDist,
-                                (maePrice - entry) / stopDist, candleCloseTime);
+                                (maePrice - entry) / stopDist, candleCloseTime,
+                                tpHit: true, slHit: true, partialWin: true);
                         }
                         decimal pnl = stopDist > 0 ? (entry - sl) / stopDist : 0;
                         return MakeOutcome(signal.SignalId, i + 1, OutcomeLabel.LOSS,
                             pnl, mfePrice, maePrice,
                             (entry - mfePrice) / stopDist,
-                            (maePrice - entry) / stopDist, candleCloseTime);
+                            (maePrice - entry) / stopDist, candleCloseTime,
+                            slHit: true);
                     }
                 }
                 else
@@ -259,7 +271,8 @@ public static class OutcomeEvaluator
                             pnl, mfePrice, maePrice,
                             stopDist > 0 ? (entry - mfePrice) / stopDist : 0,
                             stopDist > 0 ? (maePrice - entry) / stopDist : 0,
-                            candleCloseTime);
+                            candleCloseTime,
+                            tpHit: true);
                     }
                     if (slHit)
                     {
@@ -268,7 +281,8 @@ public static class OutcomeEvaluator
                             pnl, mfePrice, maePrice,
                             stopDist > 0 ? (entry - mfePrice) / stopDist : 0,
                             stopDist > 0 ? (maePrice - entry) / stopDist : 0,
-                            candleCloseTime);
+                            candleCloseTime,
+                            slHit: true);
                     }
                 }
             }
@@ -296,7 +310,9 @@ public static class OutcomeEvaluator
                 totalPnl, mfePrice, maePrice,
                 stopDist > 0 ? (isBuy ? (mfePrice - entry) : (entry - mfePrice)) / stopDist : 0,
                 stopDist > 0 ? (isBuy ? (entry - maePrice) : (maePrice - entry)) / stopDist : 0,
-                expiredTime2);
+                expiredTime2,
+                tpHit: true,
+                partialWin: true);
         }
 
         // Timeout — expired (we observed timeoutBars candles with no TP/SL hit)
@@ -399,7 +415,8 @@ public static class OutcomeEvaluator
                     pnl, mfePrice, maePrice,
                     stopDist > 0 ? (isBuy ? (mfePrice - entry) : (entry - mfePrice)) / stopDist : 0,
                     stopDist > 0 ? (isBuy ? (entry - maePrice) : (maePrice - entry)) / stopDist : 0,
-                    closedAt);
+                    closedAt,
+                    tpHit: true);
             }
 
             decimal lossPnl = stopDist > 0 ? (isBuy ? (sl - entry) : (entry - sl)) / stopDist : 0;
@@ -407,7 +424,8 @@ public static class OutcomeEvaluator
                 lossPnl, mfePrice, maePrice,
                 stopDist > 0 ? (isBuy ? (mfePrice - entry) : (entry - mfePrice)) / stopDist : 0,
                 stopDist > 0 ? (isBuy ? (entry - maePrice) : (maePrice - entry)) / stopDist : 0,
-                closedAt);
+                closedAt,
+                slHit: true);
         }
 
         return null;
@@ -415,12 +433,16 @@ public static class OutcomeEvaluator
 
     private static SignalOutcome MakeOutcome(Guid signalId, int bars, OutcomeLabel label,
         decimal pnlR, decimal mfePrice, decimal maePrice, decimal mfeR, decimal maeR,
-        DateTimeOffset? closedAt) => new()
+        DateTimeOffset? closedAt, bool tpHit = false, bool slHit = false, bool partialWin = false) => new()
         {
             SignalId = signalId,
+            // Use the actual resolution timestamp when available so recomputing
+            // historical outcomes does not make old labels look "new" again.
+            EvaluatedAtUtc = closedAt ?? DateTimeOffset.UtcNow,
             BarsObserved = bars,
-            TpHit = label == OutcomeLabel.WIN,
-            SlHit = label == OutcomeLabel.LOSS,
+            TpHit = tpHit,
+            SlHit = slHit,
+            PartialWin = partialWin,
             OutcomeLabel = label,
             PnlR = pnlR,
             MfePrice = mfePrice,

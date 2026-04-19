@@ -7,6 +7,7 @@ using EthSignal.Infrastructure.Engine;
 using EthSignal.Infrastructure.Engine.ML;
 using EthSignal.Web.BackgroundServices;
 using FluentAssertions;
+using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
@@ -205,6 +206,29 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
     }
 
     [Fact]
+    public async Task Admin_Endpoint_Rejects_NonLoopback_RemoteIp()
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, "/api/admin/ml/health");
+        request.Headers.Add("X-Test-Remote-Ip", "8.8.8.8");
+
+        var response = await _client.SendAsync(request);
+
+        response.StatusCode.Should().Be(HttpStatusCode.Forbidden);
+    }
+
+    [Fact]
+    public async Task Admin_Endpoint_DoesNotTrust_XForwardedFor_Loopback_Header()
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, "/api/admin/ml/health");
+        request.Headers.Add("X-Test-Remote-Ip", "8.8.8.8");
+        request.Headers.Add("X-Forwarded-For", "127.0.0.1");
+
+        var response = await _client.SendAsync(request);
+
+        response.StatusCode.Should().Be(HttpStatusCode.Forbidden);
+    }
+
+    [Fact]
     public async Task Dashboard_Latest_Uses_Actual_Latest_Signal_Across_Timeframes()
     {
         var latestOverall = new SignalRecommendation
@@ -329,7 +353,28 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
                 services.AddSingleton(CreateMockBlockedSignalHistoryService());
                 services.AddSingleton(CreateMockGeneratedSignalHistoryService());
                 services.AddSingleton(CreateSeededCandleSyncState());
+                services.AddSingleton<IStartupFilter, TestRemoteIpStartupFilter>();
             });
+        }
+
+        private sealed class TestRemoteIpStartupFilter : IStartupFilter
+        {
+            public Action<IApplicationBuilder> Configure(Action<IApplicationBuilder> next)
+                => app =>
+                {
+                    app.Use(async (ctx, nextMiddleware) =>
+                    {
+                        if (ctx.Request.Headers.TryGetValue("X-Test-Remote-Ip", out var values)
+                            && IPAddress.TryParse(values.FirstOrDefault(), out var parsed))
+                        {
+                            ctx.Connection.RemoteIpAddress = parsed;
+                        }
+
+                        await nextMiddleware();
+                    });
+
+                    next(app);
+                };
         }
 
         private static IReadOnlyList<CandleSyncStatusRow> SeedSyncRows()

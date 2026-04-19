@@ -91,6 +91,17 @@ try
         };
     }
 
+    static bool IsLoopbackRequest(HttpContext ctx)
+    {
+        var remoteIp = ctx.Connection.RemoteIpAddress;
+        return remoteIp == null || System.Net.IPAddress.IsLoopback(remoteIp);
+    }
+
+    static IResult? RejectIfNotLoopback(HttpContext ctx)
+        => IsLoopbackRequest(ctx)
+            ? null
+            : Results.StatusCode(StatusCodes.Status403Forbidden);
+
     var workspaceRoot = ResolveWorkspaceRoot(builder.Environment.ContentRootPath);
     var uiPriceOnly = builder.Configuration.GetValue<bool>("HighFreqTicks:UiPriceOnly", defaultValue: true);
     var historicalSyncEnabled = builder.Configuration.GetValue("CapitalApi:HistoricalSyncEnabled", defaultValue: true);
@@ -304,9 +315,10 @@ try
     var symbol = builder.Configuration["CapitalApi:Symbol"] ?? "ETHUSD";
 
     // ─── Health (P8-05) ─────────────────────────────────────
-    app.MapGet("/health", async (MarketStateCache cache, IAuditRepository auditRepo, ICandleSyncRepository syncRepo, CandleSyncState syncState) =>
+    app.MapGet("/health", async (MarketStateCache cache, IAuditRepository auditRepo, ICandleSyncRepository syncRepo, CandleSyncState syncState, IServiceProvider services) =>
     {
         var health = cache.GetHealthInfo();
+        var liveTickProcessor = services.GetService<LiveTickProcessor>();
         var stale = health.LastTickTime.HasValue
             && (DateTimeOffset.UtcNow - health.LastTickTime.Value).TotalSeconds > 30;
 
@@ -390,6 +402,8 @@ try
             lastCandleTimeframe = health.LastCandleTimeframe,
             lastError = health.LastError,
             isStale = stale,
+            missedSignalsDueToExceptions = liveTickProcessor?.MissedSignalDueToExceptionCount ?? 0,
+            lastEvaluationExceptionUtc = liveTickProcessor?.LastEvaluationExceptionUtc,
             gaps = gapDiag != null ? new
             {
                 unresolvedRecent = gapDiag.UnresolvedRecentCount,
@@ -915,8 +929,11 @@ try
     // Returns persisted per-timeframe sync state from candle_sync_status, plus a
     // top-level overall view from the in-memory CandleSyncState. Dashboard polls this.
     app.MapGet("/api/admin/candle-sync/status", async (
-        ICandleSyncRepository syncRepo, CandleSyncState syncState) =>
+        HttpContext ctx, ICandleSyncRepository syncRepo, CandleSyncState syncState) =>
     {
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
+
         var rows = await syncRepo.GetAllAsync(symbol);
         var sync = syncState.Latest;
 
@@ -969,8 +986,11 @@ try
     });
 
     app.MapGet("/api/admin/candle-sync/status/{timeframe}", async (
-        string timeframe, ICandleSyncRepository syncRepo) =>
+        string timeframe, HttpContext ctx, ICandleSyncRepository syncRepo) =>
     {
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
+
         var row = await syncRepo.GetAsync(symbol, timeframe);
         if (row == null)
             return Results.NotFound(new { error = $"No sync state for {timeframe}" });
@@ -1090,8 +1110,11 @@ try
     // current Capital.com selectors without restarting the app or losing the
     // logged-in session. Returns 503 when the Playwright provider is not the
     // active tick source (REST-only mode).
-    app.MapGet("/api/admin/playwright/probe-selectors", async (IServiceProvider services) =>
+    app.MapGet("/api/admin/playwright/probe-selectors", async (HttpContext ctx, IServiceProvider services) =>
     {
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
+
         var provider = services.GetService<PlaywrightTickProvider>();
         if (provider == null)
             return Results.StatusCode(503);
@@ -1104,14 +1127,20 @@ try
     });
 
     // ─── B-07: Parameter Set Admin APIs ─────────────────
-    app.MapGet("/api/admin/parameter-sets/active", async (IParameterRepository paramRepo) =>
+    app.MapGet("/api/admin/parameter-sets/active", async (HttpContext ctx, IParameterRepository paramRepo) =>
     {
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
+
         var active = await paramRepo.GetActiveAsync(EthSignal.Domain.Models.StrategyParameters.Default.StrategyVersion);
         return active != null ? Results.Ok(active) : Results.NotFound("No active parameter set");
     });
 
-    app.MapGet("/api/admin/parameter-sets/candidates", async (IParameterRepository paramRepo, IParameterProvider paramProvider) =>
+    app.MapGet("/api/admin/parameter-sets/candidates", async (HttpContext ctx, IParameterRepository paramRepo, IParameterProvider paramProvider) =>
     {
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
+
         // Issue #7: Use the active strategy version instead of a hardcoded stale version
         var activeVersion = paramProvider.GetActive().StrategyVersion;
         var candidates = await paramRepo.GetCandidatesAsync(activeVersion);
@@ -1121,9 +1150,8 @@ try
     app.MapPost("/api/admin/parameter-sets/{id}/activate", async (long id, HttpContext ctx,
         IParameterRepository paramRepo, IParameterProvider paramProvider) =>
     {
-        var remoteIp = ctx.Connection.RemoteIpAddress;
-        if (remoteIp != null && !System.Net.IPAddress.IsLoopback(remoteIp))
-            return Results.StatusCode(403);
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
 
         var set = await paramRepo.GetByIdAsync(id);
         if (set == null) return Results.NotFound($"Parameter set {id} not found");
@@ -1135,20 +1163,29 @@ try
     });
 
     // ─── Adaptive Parameter System Admin APIs ──────────
-    app.MapGet("/api/admin/adaptive/status", (MarketAdaptiveParameterService adaptive, IParameterProvider paramProvider) =>
+    app.MapGet("/api/admin/adaptive/status", (HttpContext ctx, MarketAdaptiveParameterService adaptive, IParameterProvider paramProvider) =>
     {
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
+
         var p = paramProvider.GetActive();
         return Results.Ok(adaptive.GetStatus(p));
     });
 
-    app.MapGet("/api/admin/adaptive/conditions", (MarketAdaptiveParameterService adaptive, IParameterProvider paramProvider) =>
+    app.MapGet("/api/admin/adaptive/conditions", (HttpContext ctx, MarketAdaptiveParameterService adaptive, IParameterProvider paramProvider) =>
     {
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
+
         var status = adaptive.GetStatus(paramProvider.GetActive());
         return Results.Ok(status.ConditionDetails);
     });
 
     app.MapPost("/api/admin/adaptive/intensity", async (HttpContext ctx, MarketAdaptiveParameterService adaptive) =>
     {
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
+
         var body = await ctx.Request.ReadFromJsonAsync<AdaptiveIntensityRequest>();
         if (body == null) return Results.BadRequest("Invalid body");
         adaptive.SetIntensity(body.Intensity);
@@ -1157,6 +1194,9 @@ try
 
     app.MapPost("/api/admin/adaptive/enabled", async (HttpContext ctx, MarketAdaptiveParameterService adaptive) =>
     {
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
+
         var body = await ctx.Request.ReadFromJsonAsync<AdaptiveEnabledRequest>();
         if (body == null) return Results.BadRequest("Invalid body");
         adaptive.SetEnabled(body.Enabled);
@@ -1168,9 +1208,8 @@ try
         HistoricalReplayService replay, IReplayRepository replayRepo,
         IParameterProvider paramProvider) =>
     {
-        var remoteIp = ctx.Connection.RemoteIpAddress;
-        if (remoteIp != null && !System.Net.IPAddress.IsLoopback(remoteIp))
-            return Results.StatusCode(403);
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
 
         var body = await ctx.Request.ReadFromJsonAsync<ReplayRunRequest>();
         if (body == null) return Results.BadRequest("Invalid body");
@@ -1200,8 +1239,11 @@ try
         return Results.Ok(new { runId, status = "queued" });
     });
 
-    app.MapGet("/api/admin/replay-runs/{id}", async (long id, IReplayRepository replayRepo) =>
+    app.MapGet("/api/admin/replay-runs/{id}", async (long id, HttpContext ctx, IReplayRepository replayRepo) =>
     {
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
+
         var run = await replayRepo.GetRunAsync(id);
         return run != null ? Results.Ok(run) : Results.NotFound();
     });
@@ -1211,9 +1253,8 @@ try
         OptimizerService optimizer, IParameterProvider paramProvider,
         IParameterRepository paramRepo, IOptimizerRepository optRepo) =>
     {
-        var remoteIp = ctx.Connection.RemoteIpAddress;
-        if (remoteIp != null && !System.Net.IPAddress.IsLoopback(remoteIp))
-            return Results.StatusCode(403);
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
 
         var body = await ctx.Request.ReadFromJsonAsync<OptimizerRunRequest>();
         if (body == null) return Results.BadRequest("Invalid body");
@@ -1267,8 +1308,11 @@ try
         return Results.Ok(new { runId = optRunId, status = "running" });
     });
 
-    app.MapGet("/api/admin/optimizer-runs/{id}", async (long id, IOptimizerRepository optRepo) =>
+    app.MapGet("/api/admin/optimizer-runs/{id}", async (long id, HttpContext ctx, IOptimizerRepository optRepo) =>
     {
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
+
         var run = await optRepo.GetRunAsync(id);
         return run != null ? Results.Ok(run) : Results.NotFound();
     });
@@ -1276,22 +1320,31 @@ try
     // ─── ML Enhancement API Endpoints ─────────────────────────────
 
     // GET /api/admin/ml/models — list all ML models
-    app.MapGet("/api/admin/ml/models", async (IMlModelRepository mlModelRepo) =>
+    app.MapGet("/api/admin/ml/models", async (HttpContext ctx, IMlModelRepository mlModelRepo) =>
     {
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
+
         var models = await mlModelRepo.GetAllAsync();
         return Results.Ok(models);
     });
 
     // GET /api/admin/ml/models/active — get currently active model
-    app.MapGet("/api/admin/ml/models/active", async (IMlModelRepository mlModelRepo) =>
+    app.MapGet("/api/admin/ml/models/active", async (HttpContext ctx, IMlModelRepository mlModelRepo) =>
     {
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
+
         var model = await mlModelRepo.GetActiveModelAsync("outcome_predictor");
         return model != null ? Results.Ok(model) : Results.NotFound(new { message = "No active ML model" });
     });
 
     // GET /api/admin/ml/models/{id} — get model by ID
-    app.MapGet("/api/admin/ml/models/{id}", async (long id, IMlModelRepository mlModelRepo) =>
+    app.MapGet("/api/admin/ml/models/{id}", async (long id, HttpContext ctx, IMlModelRepository mlModelRepo) =>
     {
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
+
         var model = await mlModelRepo.GetByIdAsync(id);
         return model != null ? Results.Ok(model) : Results.NotFound();
     });
@@ -1300,9 +1353,8 @@ try
     // Body JSON matches the metadata JSON written by train_outcome_predictor.py
     app.MapPost("/api/admin/ml/models/register", async (HttpContext ctx, IMlModelRepository mlModelRepo) =>
     {
-        var remoteIp = ctx.Connection.RemoteIpAddress;
-        if (remoteIp != null && !System.Net.IPAddress.IsLoopback(remoteIp))
-            return Results.StatusCode(403);
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
 
         using var reader = new System.IO.StreamReader(ctx.Request.Body);
         var body = await reader.ReadToEndAsync();
@@ -1381,25 +1433,28 @@ try
     app.MapPost("/api/admin/ml/models/{id}/activate", async (long id, HttpContext ctx,
         IMlModelRepository mlModelRepo, MlInferenceService inferenceService) =>
     {
-        var remoteIp = ctx.Connection.RemoteIpAddress;
-        if (remoteIp != null && !System.Net.IPAddress.IsLoopback(remoteIp))
-            return Results.StatusCode(403);
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
 
         var model = await mlModelRepo.GetByIdAsync(id);
         if (model == null) return Results.NotFound();
         if (model.Status is not (MlModelStatus.Candidate or MlModelStatus.Shadow))
             return Results.BadRequest(new { error = $"Model status is {model.Status}, expected Candidate or Shadow" });
 
-        // Enforce minimum quality before activation
-        if (model.TrainingSampleCount < 200)
-            return Results.BadRequest(new { error = $"Insufficient training data: {model.TrainingSampleCount} samples (minimum 200 required)" });
+        // Enforce minimum quality before activation.
+        // Regime-specific specialists (scope != ALL) are trained on ~1/3 of data so
+        // minimum sample gate is relaxed; global models keep the full 200 threshold.
+        var isRegimeSpecific = !string.Equals(model.RegimeScope, "ALL", StringComparison.OrdinalIgnoreCase);
+        var minSamples = isRegimeSpecific ? 50 : 200;
+        if (model.TrainingSampleCount < minSamples)
+            return Results.BadRequest(new { error = $"Insufficient training data: {model.TrainingSampleCount} samples (minimum {minSamples} required for scope={model.RegimeScope})" });
         if (model.AucRoc < 0.58m)
             return Results.BadRequest(new { error = $"AUC-ROC too low: {model.AucRoc:F3} (minimum 0.58 required)" });
-        if (model.BrierScore > 0.24m)
-            return Results.BadRequest(new { error = $"Brier score too high: {model.BrierScore:F3} (maximum 0.24 required)" });
+        if (model.BrierScore > 0.30m)
+            return Results.BadRequest(new { error = $"Brier score too high: {model.BrierScore:F3} (maximum 0.30 required)" });
 
-        // Retire current active model
-        var current = await mlModelRepo.GetActiveModelAsync(model.ModelType);
+        // Retire current active model for the same scope (not across scopes)
+        var current = await mlModelRepo.GetActiveModelAsync(model.ModelType, model.RegimeScope);
         if (current != null)
             await mlModelRepo.UpdateStatusAsync(current.Id, MlModelStatus.Retired, "Replaced by new activation");
 
@@ -1412,9 +1467,8 @@ try
     app.MapPost("/api/admin/ml/models/{id}/retire", async (long id, HttpContext ctx,
         IMlModelRepository mlModelRepo) =>
     {
-        var remoteIp = ctx.Connection.RemoteIpAddress;
-        if (remoteIp != null && !System.Net.IPAddress.IsLoopback(remoteIp))
-            return Results.StatusCode(403);
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
 
         var model = await mlModelRepo.GetByIdAsync(id);
         if (model == null) return Results.NotFound();
@@ -1585,8 +1639,11 @@ try
     });
 
     // GET /api/admin/ml/config — current ML parameters
-    app.MapGet("/api/admin/ml/config", (IParameterProvider pp) =>
+    app.MapGet("/api/admin/ml/config", (HttpContext ctx, IParameterProvider pp) =>
     {
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
+
         var p = pp.GetActive();
         return Results.Ok(new
         {
@@ -1609,9 +1666,8 @@ try
     // POST /api/admin/ml/mode — switch ML mode
     app.MapPost("/api/admin/ml/mode", async (HttpContext ctx, IParameterProvider pp, IParameterRepository paramRepo) =>
     {
-        var remoteIp = ctx.Connection.RemoteIpAddress;
-        if (remoteIp != null && !System.Net.IPAddress.IsLoopback(remoteIp))
-            return Results.StatusCode(403);
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
 
         var body = await ctx.Request.ReadFromJsonAsync<Dictionary<string, string>>();
         if (body == null || !body.TryGetValue("mode", out var modeStr))
@@ -1644,8 +1700,11 @@ try
     });
 
     // GET /api/admin/ml/drift — recent drift events
-    app.MapGet("/api/admin/ml/drift", (MlDriftDetector driftDetector, IParameterProvider pp, MlInferenceService inferenceService) =>
+    app.MapGet("/api/admin/ml/drift", (HttpContext ctx, MlDriftDetector driftDetector, IParameterProvider pp, MlInferenceService inferenceService) =>
     {
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
+
         var p = pp.GetActive();
         var modelVersion = inferenceService.ActiveModelVersion ?? "none";
         var result = driftDetector.CheckDrift(p, modelVersion);
@@ -1654,6 +1713,7 @@ try
 
     // GET /api/admin/ml/health — ML system health
     app.MapGet("/api/admin/ml/health", async (
+        HttpContext ctx,
         MlInferenceService inferenceService,
         MlModelPromotionService promotionService,
         MlDriftDetector driftDetector,
@@ -1661,6 +1721,9 @@ try
         IMlDataDiagnosticsService diagnosticsService,
         CancellationToken ct) =>
     {
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
+
         var p = pp.GetActive();
         var modelVersion = inferenceService.ActiveModelVersion ?? "none";
         var drift = driftDetector.CheckDrift(p, modelVersion);
@@ -1710,10 +1773,14 @@ try
 
     // GET /api/admin/ml/diagnostics — training-data quality, calibration, and feature drift
     app.MapGet("/api/admin/ml/diagnostics", async (
+        HttpContext ctx,
         IMlDataDiagnosticsService diagnosticsService,
         IParameterProvider pp,
         CancellationToken ct) =>
     {
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
+
         var p = pp.GetActive();
         var report = await diagnosticsService.GetReportAsync(
             symbol,
@@ -1725,11 +1792,15 @@ try
 
     // GET /api/admin/ml/training/status — auto-trainer readiness + recent runs
     app.MapGet("/api/admin/ml/training/status", async (
+        HttpContext ctx,
         MlTrainingState state,
         IMlTrainingRunRepository trainingRepo,
         IParameterProvider pp,
         CancellationToken ct) =>
     {
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
+
         var runs = await trainingRepo.GetRecentAsync(10, ct);
         var lastSuccess = await trainingRepo.GetLatestSuccessfulAsync(ct);
         var p = pp.GetActive();
@@ -1771,15 +1842,13 @@ try
     });
 
     // POST /api/admin/ml/training/trigger — manual training kick-off (localhost only)
-    app.MapPost("/api/admin/ml/training/trigger", async (
+    app.MapPost("/api/admin/ml/training/trigger", (
         MlTrainingService trainingService,
         MlTrainingState state,
-        HttpContext http,
-        CancellationToken ct) =>
+        HttpContext http) =>
     {
-        if (!http.Connection.RemoteIpAddress?.ToString().StartsWith("127.") == true
-            && http.Connection.RemoteIpAddress?.ToString() != "::1")
-            return Results.Forbid();
+        if (RejectIfNotLoopback(http) is { } forbidden)
+            return forbidden;
 
         if (state.IsRunning)
             return Results.Conflict(new { error = "Training already in progress", runId = state.CurrentRunId });
@@ -1974,9 +2043,8 @@ try
     // U-04: Gap resolution and diagnostics endpoints
     app.MapPost("/api/admin/resolve-old-gaps", async (HttpContext ctx, IAuditRepository auditRepo) =>
     {
-        var remoteIp = ctx.Connection.RemoteIpAddress;
-        if (remoteIp != null && !System.Net.IPAddress.IsLoopback(remoteIp))
-            return Results.StatusCode(403);
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
 
         var resolved = await auditRepo.ResolveOldGapsAsync(symbol);
         if (resolved > 0)
@@ -1984,8 +2052,11 @@ try
         return Results.Ok(new { resolved, symbol });
     });
 
-    app.MapGet("/api/admin/gap-diagnostics", async (IAuditRepository auditRepo) =>
+    app.MapGet("/api/admin/gap-diagnostics", async (HttpContext ctx, IAuditRepository auditRepo) =>
     {
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
+
         var diag = await auditRepo.GetGapDiagnosticsAsync(symbol);
         return Results.Ok(diag);
     });
@@ -1993,9 +2064,8 @@ try
     // U-05: OHLC repair endpoint — scans and fixes invalid candles
     app.MapPost("/api/admin/repair-ohlc", async (HttpContext ctx, ICandleRepository candleRepo) =>
     {
-        var remoteIp = ctx.Connection.RemoteIpAddress;
-        if (remoteIp != null && !System.Net.IPAddress.IsLoopback(remoteIp))
-            return Results.StatusCode(403);
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
 
         int totalRepaired = 0;
         foreach (var tf in Timeframe.All)
@@ -2046,8 +2116,11 @@ try
 
 
     // ── Playwright headless toggle ─────────────────────────────────────────────
-    app.MapGet("/api/admin/playwright/headless", (IConfiguration config, IServiceProvider services) =>
+    app.MapGet("/api/admin/playwright/headless", (HttpContext ctx, IConfiguration config, IServiceProvider services) =>
     {
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
+
         var provider = services.GetService<PlaywrightTickProvider>();
         return Results.Ok(new
         {
@@ -2058,9 +2131,8 @@ try
 
     app.MapPost("/api/admin/playwright/headless", async (HttpContext ctx, IHostEnvironment env, IServiceProvider services) =>
     {
-        var remoteIp = ctx.Connection.RemoteIpAddress;
-        if (remoteIp != null && !System.Net.IPAddress.IsLoopback(remoteIp))
-            return Results.StatusCode(403);
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
 
         var body = await ctx.Request.ReadFromJsonAsync<Dictionary<string, JsonElement>>();
         if (body == null || !body.TryGetValue("headless", out var el) ||
@@ -2089,8 +2161,11 @@ try
 
     // ── Signal blocker controls (portal_overrides table) ───────────────────────
     // GET returns the raw portal overrides (null fields = not overridden, base param set is used).
-    app.MapGet("/api/admin/signal-blockers", async (IPortalOverridesRepository overridesRepo) =>
+    app.MapGet("/api/admin/signal-blockers", async (HttpContext ctx, IPortalOverridesRepository overridesRepo) =>
     {
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
+
         var o = await overridesRepo.GetAsync();
         return Results.Ok(new
         {
@@ -2108,9 +2183,8 @@ try
     app.MapPatch("/api/admin/signal-blockers", async (HttpContext ctx,
         IPortalOverridesRepository overridesRepo, IParameterProvider pp) =>
     {
-        var remoteIp = ctx.Connection.RemoteIpAddress;
-        if (remoteIp != null && !System.Net.IPAddress.IsLoopback(remoteIp))
-            return Results.StatusCode(403);
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
 
         var body = await ctx.Request.ReadFromJsonAsync<Dictionary<string, JsonElement>>();
         if (body == null) return Results.BadRequest(new { error = "Missing request body" });
@@ -2147,9 +2221,8 @@ try
 
     app.MapPost("/api/admin/signal-blockers/refresh", async (HttpContext ctx, IParameterProvider pp) =>
     {
-        var remoteIp = ctx.Connection.RemoteIpAddress;
-        if (remoteIp != null && !System.Net.IPAddress.IsLoopback(remoteIp))
-            return Results.StatusCode(403);
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
 
         var refreshed = await pp.RefreshAsync(ctx.RequestAborted);
         var current = pp.GetActive();

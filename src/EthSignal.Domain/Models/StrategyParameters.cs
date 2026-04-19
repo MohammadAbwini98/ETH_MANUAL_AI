@@ -225,6 +225,8 @@ public sealed record StrategyParameters
     // ─── Exit Engine (Structure-Aware TP/SL) ────────────
     /// <summary>Max SL distance as % of entry price. Rejects setups with too-wide stops.</summary>
     public decimal ExitMaxStopDistancePct { get; init; } = 0.05m;
+    /// <summary>Min SL distance as % of entry price. Prevents unrealistically tight stops.</summary>
+    public decimal MinStopDistancePct { get; init; } = 0.002m;
 
     /// <summary>Multi-target TP1 in R-multiples (early partial profit).</summary>
     public decimal ExitTp1RMultiple { get; init; } = 1.0m;
@@ -311,8 +313,18 @@ public sealed record StrategyParameters
             return "Confidence thresholds must be > 0";
         if (OutcomeTimeoutBars <= 0)
             return "OutcomeTimeoutBars must be > 0";
+        if (IntradayTimeoutBars <= 0)
+            return "IntradayTimeoutBars must be > 0";
         if (WarmUpPeriod < EmaSlowPeriod)
             return $"WarmUpPeriod({WarmUpPeriod}) must be >= EmaSlowPeriod({EmaSlowPeriod})";
+        if (ExitTp1RMultiple >= ExitTp2RMultiple || ExitTp2RMultiple >= ExitTp3RMultiple)
+            return "Exit TP multiples must be strictly ascending";
+        if (ExitScalpTp1RMultiple >= ExitScalpTp2RMultiple || ExitScalpTp2RMultiple >= ExitScalpTp3RMultiple)
+            return "Scalp exit TP multiples must be strictly ascending";
+        if (MinStopDistancePct <= 0)
+            return "MinStopDistancePct must be > 0";
+        if (MinStopDistancePct >= ExitMaxStopDistancePct)
+            return $"MinStopDistancePct({MinStopDistancePct}) must be < ExitMaxStopDistancePct({ExitMaxStopDistancePct})";
         return null;
     }
 
