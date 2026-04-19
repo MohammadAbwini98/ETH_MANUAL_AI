@@ -696,6 +696,10 @@ let generatedCurrentPage = 1;
 const GENERATED_PAGE_SIZE = 20;
 let generatedSortCol = 'time';
 let generatedSortDir = 'desc';
+let executedTradesData = [];
+let executedTradesCurrentPage = 1;
+const EXECUTED_TRADES_PAGE_SIZE = 25;
+let executedTradesTotal = 0;
 
 async function loadHistory() {
     const data = await fetchJson(`/api/signals/history?limit=500&page=1`);
@@ -768,6 +772,22 @@ function getOutcomeLabel(item) {
     if (item.outcome?.outcomeLabel) return item.outcome.outcomeLabel;
     if (item.signal?.status === 'OPEN') return 'OPEN';
     return item.signal?.status || 'OPEN';
+}
+
+async function executeCandidate(path, label) {
+    if (!confirm(`Execute this ${label} on Capital.com DEMO?`)) return;
+    try {
+        const response = await fetch(path, { method: 'POST' });
+        const payload = await response.json().catch(() => null);
+        if (!response.ok) {
+            alert(payload?.message || payload?.failureReason || payload?.error || `Execution failed (${response.status})`);
+            return;
+        }
+        await Promise.all([loadExecutedTrades(), refreshTradingSummary()]);
+        alert(payload?.message || 'Execution request submitted.');
+    } catch (e) {
+        alert(`Execution failed: ${e.message}`);
+    }
 }
 
 function applyClientFilters(items) {
@@ -869,7 +889,8 @@ function renderHistory() {
             <td>${s.confidenceScore}</td>
             <td><span class="badge ${oCls}" style="font-size:.72rem">${lbl}</span></td>
             <td class="${pnlCls}">${pnl}</td>
-            <td>${expiryHtml}</td>`;
+            <td>${expiryHtml}</td>
+            <td><button class="btn btn-sm btn-outline-primary" onclick="executeCandidate('/api/executed-trades/execute-signal/${s.signalId}', 'recommended signal')">Execute</button></td>`;
         tbody.appendChild(tr);
     }
 
@@ -990,7 +1011,8 @@ function renderBlockedHistory() {
             <td title="${reason}" style="max-width:260px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${reason}${fallbackBadge}</td>
             <td><span class="badge ${oCls}" style="font-size:.72rem">${lbl}</span></td>
             <td class="${pnlCls}">${pnl}</td>
-            <td>${expiryHtml}</td>`;
+            <td>${expiryHtml}</td>
+            <td><button class="btn btn-sm btn-outline-primary" onclick="executeCandidate('/api/executed-trades/execute-blocked/${s.signalId}', 'blocked signal')">Execute</button></td>`;
         tbody.appendChild(tr);
     }
 
@@ -1111,7 +1133,8 @@ function renderGeneratedHistory() {
             <td title="${exitTitle}" style="max-width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${exitModel}${fallbackBadge}</td>
             <td><span class="badge ${oCls}" style="font-size:.72rem">${lbl}</span></td>
             <td class="${pnlCls}">${pnl}</td>
-            <td>${expiryHtml}</td>`;
+            <td>${expiryHtml}</td>
+            <td><button class="btn btn-sm btn-outline-primary" onclick="executeCandidate('/api/executed-trades/execute-generated/${s.signalId}', 'generated signal')">Execute</button></td>`;
         tbody.appendChild(tr);
     }
 
@@ -1123,6 +1146,184 @@ function renderGeneratedHistory() {
 function changeGeneratedPage(delta) {
     generatedCurrentPage = Math.max(1, generatedCurrentPage + delta);
     renderGeneratedHistory();
+}
+
+function executionStatusBadgeClass(status) {
+    switch ((status || '').toUpperCase()) {
+        case 'OPEN': return 'badge-win';
+        case 'CLOSED': return 'badge-neutral';
+        case 'SUBMITTED':
+        case 'PENDING':
+        case 'CLOSEREQUESTED': return 'badge-pending';
+        case 'FAILED':
+        case 'REJECTED':
+        case 'VALIDATIONFAILED':
+        case 'CLOSEFAILED': return 'badge-loss';
+        default: return 'badge-expired';
+    }
+}
+
+function tradingSummaryText(id, value) {
+    const el = $(id);
+    if (!el) return;
+    el.textContent = value ?? '--';
+}
+
+function tradeStatusAllowsForceClose(status) {
+    const normalized = String(status || '').toUpperCase();
+    return normalized === 'OPEN' || normalized === 'SUBMITTED' || normalized === 'CLOSEREQUESTED';
+}
+
+function buildExecutedTradesQuery() {
+    const qs = new URLSearchParams();
+    const fromDate = $('exec-filter-date-from')?.value;
+    const toDate = $('exec-filter-date-to')?.value;
+    const instrument = $('exec-filter-instrument')?.value?.trim();
+    const direction = $('exec-filter-dir')?.value;
+    const timeframe = $('exec-filter-tf')?.value;
+    const sourceType = $('exec-filter-source')?.value;
+    const status = $('exec-filter-status')?.value;
+
+    if (fromDate) qs.set('from', new Date(`${fromDate}T00:00:00`).toISOString());
+    if (toDate) qs.set('to', new Date(`${toDate}T23:59:59.999`).toISOString());
+    if (instrument) qs.set('instrument', instrument);
+    if (direction) qs.set('direction', direction);
+    if (timeframe) qs.set('timeframe', timeframe);
+    if (sourceType) qs.set('sourceType', sourceType);
+    if (status) qs.set('status', status);
+    qs.set('limit', String(EXECUTED_TRADES_PAGE_SIZE));
+    qs.set('page', String(executedTradesCurrentPage));
+    return qs;
+}
+
+async function refreshTradingSummary() {
+    const [account, stats, health] = await Promise.all([
+        fetchJson('/api/trading/account-summary'),
+        fetchJson('/api/trading/execution-stats'),
+        fetchJson('/api/trading/health')
+    ]);
+
+    tradingSummaryText('trade-available', account?.available != null ? fmt(account.available) : '--');
+    tradingSummaryText('trade-equity', account?.equity != null ? fmt(account.equity) : '--');
+    tradingSummaryText('trade-funds', account?.funds != null ? fmt(account.funds) : '--');
+    tradingSummaryText('trade-margin', account?.margin != null ? fmt(account.margin) : '--');
+    tradingSummaryText('trade-currency', account?.currency || stats?.currency || '--');
+    tradingSummaryText('trade-open', stats?.openTrades ?? account?.openPositions ?? '--');
+    tradingSummaryText('trade-total', stats?.totalExecuted ?? '--');
+    tradingSummaryText('trade-wins', stats?.wins ?? '--');
+    tradingSummaryText('trade-losses', stats?.losses ?? '--');
+    tradingSummaryText('trade-pnl', stats?.totalPnl != null ? `${fmt(stats.totalPnl)} ${stats.currency || account?.currency || ''}`.trim() : '--');
+    tradingSummaryText('trade-winrate', stats?.winRate != null ? fmtPct(stats.winRate) : '--');
+    tradingSummaryText('trade-failed', stats?.failedExecutions ?? '--');
+
+    const demoEl = $('trade-demo-indicator');
+    if (demoEl) {
+        const accountName = account?.accountName || health?.accountName || '--';
+        const isDemo = account?.isDemo === true && health?.demoOnly === true;
+        demoEl.textContent = isDemo ? `${accountName} · DEMO` : `${accountName} · NOT DEMO`;
+        demoEl.style.color = isDemo ? 'var(--green)' : 'var(--red)';
+        demoEl.style.fontWeight = '700';
+    }
+
+    const sessionEl = $('trade-session-status');
+    if (sessionEl) {
+        const ready = health?.sessionReady === true;
+        sessionEl.textContent = ready ? 'READY' : 'NOT READY';
+        sessionEl.style.color = ready ? 'var(--green)' : 'var(--yellow)';
+    }
+
+    tradingSummaryText('trade-last-sync', health?.lastSyncUtc ? toAmmanShort(health.lastSyncUtc) : '--');
+    tradingSummaryText('trade-order-note', health?.latestOrderNote || '--');
+
+    const errorEl = $('trade-broker-error');
+    if (errorEl) {
+        errorEl.textContent = health?.latestBrokerError || '--';
+        errorEl.style.color = health?.latestBrokerError ? 'var(--red)' : 'var(--text-sub)';
+    }
+}
+
+function renderExecutedTrades() {
+    const tbody = $('executed-trades-body');
+    if (!tbody) return;
+
+    tbody.innerHTML = '';
+    for (const trade of executedTradesData) {
+        const directionCls = dirClass(trade.direction);
+        const statusCls = executionStatusBadgeClass(trade.status);
+        const pnl = trade.pnl != null ? `${trade.pnl >= 0 ? '+' : ''}${fmt(trade.pnl, 2)}` : '--';
+        const pnlCls = trade.pnl > 0 ? 'buy' : trade.pnl < 0 ? 'sell' : '';
+        const canForceClose = tradeStatusAllowsForceClose(trade.status) && !!trade.executedTradeId;
+
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+            <td style="font-size:.7rem;font-family:monospace;color:var(--text)">${escapeHtml(trade.signalId || '--')}</td>
+            <td><span class="badge badge-neutral" style="font-size:.68rem">${escapeHtml(trade.sourceType || '--')}</span></td>
+            <td>${escapeHtml(trade.instrument || trade.symbol || '--')}</td>
+            <td class="${directionCls}">${escapeHtml(trade.direction || '--')}</td>
+            <td><span class="badge badge-neutral" style="font-size:.68rem">${escapeHtml(trade.timeframe || '--')}</span></td>
+            <td>${trade.recommendedEntryPrice != null ? fmt(trade.recommendedEntryPrice) : '--'}</td>
+            <td>${trade.actualEntryPrice != null ? fmt(trade.actualEntryPrice) : '--'}</td>
+            <td class="buy">${trade.tpPrice != null ? fmt(trade.tpPrice) : '--'}</td>
+            <td class="sell">${trade.slPrice != null ? fmt(trade.slPrice) : '--'}</td>
+            <td>${trade.executedSize != null && Number(trade.executedSize) > 0 ? fmt(trade.executedSize, 4) : (trade.requestedSize != null ? fmt(trade.requestedSize, 4) : '--')}</td>
+            <td><span class="badge ${statusCls}" style="font-size:.72rem">${escapeHtml(trade.status || '--')}</span></td>
+            <td>${trade.openedAtUtc ? toAmmanShort(trade.openedAtUtc) : '--'}</td>
+            <td>${trade.closedAtUtc ? toAmmanShort(trade.closedAtUtc) : '--'}</td>
+            <td class="${pnlCls}">${pnl}</td>
+            <td>${escapeHtml(trade.accountCurrency || '--')}</td>
+            <td style="font-size:.7rem;font-family:monospace;color:var(--text)">${escapeHtml(trade.dealReference || '--')}</td>
+            <td title="${escapeHtml(trade.errorDetails || trade.failureReason || '--')}" style="max-width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(trade.failureReason || '--')}</td>
+            <td>${canForceClose
+                ? `<button class="btn btn-sm btn-outline-danger" onclick="forceCloseExecutedTrade(${trade.executedTradeId})">Force Close</button>`
+                : '<span style="color:var(--text-sub)">--</span>'}</td>`;
+        tbody.appendChild(tr);
+    }
+
+    if (executedTradesData.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="18" class="text-center" style="color:var(--text)">No executed trades found</td></tr>';
+    }
+
+    const totalPages = Math.max(1, Math.ceil(executedTradesTotal / EXECUTED_TRADES_PAGE_SIZE));
+    $('exec-page-info').textContent = `Page ${executedTradesCurrentPage} of ${totalPages} (${executedTradesTotal} trades)`;
+    $('exec-prev-page').disabled = executedTradesCurrentPage <= 1;
+    $('exec-next-page').disabled = executedTradesCurrentPage >= totalPages;
+}
+
+async function loadExecutedTrades() {
+    const data = await fetchJson(`/api/executed-trades?${buildExecutedTradesQuery().toString()}`);
+    if (!data) return;
+    executedTradesData = data.trades || [];
+    executedTradesTotal = data.total || 0;
+    renderExecutedTrades();
+}
+
+function onExecutedTradeFilterChange() {
+    executedTradesCurrentPage = 1;
+    loadExecutedTrades().catch(() => { });
+}
+
+function changeExecutedTradePage(delta) {
+    executedTradesCurrentPage = Math.max(1, executedTradesCurrentPage + delta);
+    loadExecutedTrades().catch(() => { });
+}
+
+async function forceCloseExecutedTrade(id) {
+    if (!confirm(`Force close executed trade #${id}?`)) return;
+    try {
+        const response = await fetch(`/api/executed-trades/${id}/force-close`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ requestedBy: 'dashboard', reason: 'Manual force-close from dashboard' })
+        });
+        const payload = await response.json().catch(() => null);
+        if (!response.ok) {
+            alert(payload?.message || payload?.error || `Force close failed (${response.status})`);
+            return;
+        }
+        await Promise.all([loadExecutedTrades(), refreshTradingSummary()]);
+    } catch (e) {
+        alert(`Force close failed: ${e.message}`);
+    }
 }
 
 // Update expiry timers every second
@@ -1360,6 +1561,7 @@ async function refreshAll() {
         await Promise.all([
             refreshQuote(), refreshIndicators(), refreshRegime(),
             refreshSignal(), refreshPerformance(), loadHistory(), loadBlockedHistory(), loadGeneratedHistory(),
+            loadExecutedTrades(), refreshTradingSummary(),
             refreshMlHealth(), refreshMlPerformance(), refreshMlPredictions(),
             refreshMlDiagnostics(), refreshMlFeatureSnapshot(), refreshDecisionSummary(), refreshTrainerStatus(), refreshHistorySync(),
             refreshAdaptiveStatus(), refreshActiveParameterSet(),
@@ -1376,7 +1578,7 @@ setInterval(refreshQuote, 200);
 setInterval(() => { refreshIndicators(); refreshRegime(); refreshSignal(); }, 1000);
 setInterval(() => { refreshCharts().catch(() => { }); }, 2000);
 setInterval(() => { refreshHistorySync().catch(() => { }); }, 5000);
-setInterval(() => { refreshPerformance(); loadHistory(); loadBlockedHistory(); loadGeneratedHistory(); refreshDecisionSummary(); }, 15000);
+setInterval(() => { refreshPerformance(); loadHistory(); loadBlockedHistory(); loadGeneratedHistory(); loadExecutedTrades(); refreshTradingSummary(); refreshDecisionSummary(); }, 15000);
 setInterval(() => { refreshMlHealth(); refreshMlPerformance(); refreshMlPredictions(); refreshMlDiagnostics(); refreshMlFeatureSnapshot(); refreshTrainerStatus(); }, 30000);
 setInterval(() => { refreshAdaptiveStatus(); refreshActiveParameterSet(); }, 15000);
 setInterval(() => { loadMlModelRegistry().catch(() => {}); updateRegimeSpecialistStatus().catch(() => {}); }, 60000);

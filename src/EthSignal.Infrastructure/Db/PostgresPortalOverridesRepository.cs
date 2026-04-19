@@ -64,6 +64,7 @@ public sealed class PostgresPortalOverridesRepository : IPortalOverridesReposito
             DailyLossCapPercent = TryGetDecimal(settings, "dailyLossCapPercent"),
             MaxConsecutiveLossesPerDay = TryGetInt(settings, "maxConsecutiveLossesPerDay"),
             ScalpMaxConsecutiveLossesPerDay = TryGetInt(settings, "scalpMaxConsecutiveLossesPerDay"),
+            RecommendedSignalExecutionEnabled = TryGetBool(settings, "recommendedSignalExecutionEnabled"),
             UpdatedAt = updatedAt,
             UpdatedBy = updatedBy
         };
@@ -71,18 +72,11 @@ public sealed class PostgresPortalOverridesRepository : IPortalOverridesReposito
 
     public async Task SaveAsync(PortalOverrides overrides, CancellationToken ct = default)
     {
-        var settings = new Dictionary<string, object?>();
-        if (overrides.MaxOpenPositions.HasValue) settings["maxOpenPositions"] = overrides.MaxOpenPositions.Value;
-        if (overrides.MaxOpenPerTimeframe.HasValue) settings["maxOpenPerTimeframe"] = overrides.MaxOpenPerTimeframe.Value;
-        if (overrides.MaxOpenPerDirection.HasValue) settings["maxOpenPerDirection"] = overrides.MaxOpenPerDirection.Value;
-        if (overrides.DailyLossCapPercent.HasValue) settings["dailyLossCapPercent"] = overrides.DailyLossCapPercent.Value;
-        if (overrides.MaxConsecutiveLossesPerDay.HasValue) settings["maxConsecutiveLossesPerDay"] = overrides.MaxConsecutiveLossesPerDay.Value;
-        if (overrides.ScalpMaxConsecutiveLossesPerDay.HasValue) settings["scalpMaxConsecutiveLossesPerDay"] = overrides.ScalpMaxConsecutiveLossesPerDay.Value;
-
-        var json = JsonSerializer.Serialize(settings, JsonOpts);
-
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
+
+        var existing = await LoadRawSettingsAsync(conn, ct);
+        var json = JsonSerializer.Serialize(BuildMergedSettings(existing, overrides), JsonOpts);
 
         await using var cmd = new NpgsqlCommand(@"
             INSERT INTO ""ETH"".portal_overrides (id, settings, updated_at, updated_by)
@@ -106,10 +100,59 @@ public sealed class PostgresPortalOverridesRepository : IPortalOverridesReposito
         return null;
     }
 
+    private static bool? TryGetBool(Dictionary<string, JsonElement> d, string key)
+    {
+        if (d.TryGetValue(key, out var v) && (v.ValueKind is JsonValueKind.True or JsonValueKind.False))
+            return v.GetBoolean();
+        return null;
+    }
+
     private static decimal? TryGetDecimal(Dictionary<string, JsonElement> d, string key)
     {
         if (d.TryGetValue(key, out var v) && v.ValueKind == JsonValueKind.Number
             && v.TryGetDecimal(out var dec)) return dec;
         return null;
+    }
+
+    internal static Dictionary<string, object?> BuildMergedSettings(
+        Dictionary<string, JsonElement> existing,
+        PortalOverrides overrides)
+    {
+        var settings = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (key, value) in existing)
+            settings[key] = DeserializeJsonElement(value);
+
+        if (overrides.MaxOpenPositions.HasValue) settings["maxOpenPositions"] = overrides.MaxOpenPositions.Value;
+        if (overrides.MaxOpenPerTimeframe.HasValue) settings["maxOpenPerTimeframe"] = overrides.MaxOpenPerTimeframe.Value;
+        if (overrides.MaxOpenPerDirection.HasValue) settings["maxOpenPerDirection"] = overrides.MaxOpenPerDirection.Value;
+        if (overrides.DailyLossCapPercent.HasValue) settings["dailyLossCapPercent"] = overrides.DailyLossCapPercent.Value;
+        if (overrides.MaxConsecutiveLossesPerDay.HasValue) settings["maxConsecutiveLossesPerDay"] = overrides.MaxConsecutiveLossesPerDay.Value;
+        if (overrides.ScalpMaxConsecutiveLossesPerDay.HasValue) settings["scalpMaxConsecutiveLossesPerDay"] = overrides.ScalpMaxConsecutiveLossesPerDay.Value;
+        if (overrides.RecommendedSignalExecutionEnabled.HasValue) settings["recommendedSignalExecutionEnabled"] = overrides.RecommendedSignalExecutionEnabled.Value;
+
+        return settings;
+    }
+
+    private static object? DeserializeJsonElement(JsonElement value)
+        => value.ValueKind switch
+        {
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            JsonValueKind.String => value.GetString(),
+            JsonValueKind.Number when value.TryGetInt32(out var i) => i,
+            JsonValueKind.Number when value.TryGetDecimal(out var d) => d,
+            JsonValueKind.Null => null,
+            _ => JsonSerializer.Deserialize<object>(value.GetRawText(), JsonOpts)
+        };
+
+    private static async Task<Dictionary<string, JsonElement>> LoadRawSettingsAsync(NpgsqlConnection conn, CancellationToken ct)
+    {
+        await using var cmd = new NpgsqlCommand(@"SELECT settings FROM ""ETH"".portal_overrides WHERE id = 1;", conn);
+        var result = await cmd.ExecuteScalarAsync(ct);
+        if (result is not string json || string.IsNullOrWhiteSpace(json))
+            return new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
+
+        return JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(json, JsonOpts)
+            ?? new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
     }
 }

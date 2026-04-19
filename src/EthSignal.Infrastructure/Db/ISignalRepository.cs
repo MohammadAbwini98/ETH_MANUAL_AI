@@ -6,6 +6,7 @@ public interface ISignalRepository
 {
     Task InsertSignalAsync(SignalRecommendation signal, CancellationToken ct = default);
     Task InsertOutcomeAsync(SignalOutcome outcome, CancellationToken ct = default);
+    Task<SignalRecommendation?> GetSignalByIdAsync(Guid signalId, CancellationToken ct = default);
     Task<SignalRecommendation?> GetLatestSignalAsync(string symbol, CancellationToken ct = default);
     Task<SignalRecommendation?> GetLatestSignalBeforeAsync(string symbol, DateTimeOffset before, CancellationToken ct = default);
     Task<SignalRecommendation?> GetLatestPrimaryTimeframeSignalAsync(string symbol, string primaryTimeframe, CancellationToken ct = default);

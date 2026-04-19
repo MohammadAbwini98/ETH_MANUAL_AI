@@ -300,6 +300,121 @@ public sealed class DbMigrator : IDbMigrator
         await Exec(conn, @"ALTER TABLE ""ETH"".blocked_signal_outcomes ADD COLUMN IF NOT EXISTS partial_win BOOLEAN NOT NULL DEFAULT FALSE;", ct);
         await Exec(conn, @"ALTER TABLE ""ETH"".generated_signal_outcomes ADD COLUMN IF NOT EXISTS partial_win BOOLEAN NOT NULL DEFAULT FALSE;", ct);
 
+        await Exec(conn, @"
+            CREATE TABLE IF NOT EXISTS ""ETH"".executed_trades (
+                executed_trade_id         BIGSERIAL   PRIMARY KEY,
+                signal_id                 UUID        NOT NULL,
+                evaluation_id             UUID,
+                source_type               TEXT        NOT NULL,
+                symbol                    TEXT        NOT NULL,
+                instrument                TEXT        NOT NULL,
+                timeframe                 TEXT        NOT NULL,
+                direction                 TEXT        NOT NULL,
+                recommended_entry_price   NUMERIC     NOT NULL DEFAULT 0,
+                actual_entry_price        NUMERIC     NOT NULL DEFAULT 0,
+                tp_price                  NUMERIC     NOT NULL DEFAULT 0,
+                sl_price                  NUMERIC     NOT NULL DEFAULT 0,
+                requested_size            NUMERIC     NOT NULL DEFAULT 0,
+                executed_size             NUMERIC     NOT NULL DEFAULT 0,
+                deal_reference            TEXT,
+                deal_id                   TEXT,
+                status                    TEXT        NOT NULL DEFAULT 'Pending',
+                account_currency          TEXT        NOT NULL DEFAULT '',
+                opened_at_utc             TIMESTAMPTZ,
+                closed_at_utc             TIMESTAMPTZ,
+                pnl                       NUMERIC,
+                failure_reason            TEXT,
+                error_details             TEXT,
+                force_closed              BOOLEAN     NOT NULL DEFAULT FALSE,
+                close_source              TEXT,
+                created_at_utc            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at_utc            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );", ct);
+
+        await Exec(conn, @"
+            CREATE INDEX IF NOT EXISTS idx_executed_trades_source_signal
+            ON ""ETH"".executed_trades (signal_id, source_type, created_at_utc DESC);", ct);
+
+        await Exec(conn, @"
+            CREATE INDEX IF NOT EXISTS idx_executed_trades_status
+            ON ""ETH"".executed_trades (status, created_at_utc DESC);", ct);
+
+        await Exec(conn, @"
+            CREATE TABLE IF NOT EXISTS ""ETH"".execution_attempts (
+                attempt_id                BIGSERIAL   PRIMARY KEY,
+                executed_trade_id         BIGINT      REFERENCES ""ETH"".executed_trades(executed_trade_id) ON DELETE SET NULL,
+                signal_id                 UUID        NOT NULL,
+                source_type               TEXT        NOT NULL,
+                attempt_type              TEXT        NOT NULL,
+                success                   BOOLEAN     NOT NULL DEFAULT FALSE,
+                summary                   TEXT,
+                error_details             TEXT,
+                broker_payload            TEXT,
+                created_at_utc            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );", ct);
+
+        await Exec(conn, @"
+            CREATE INDEX IF NOT EXISTS idx_execution_attempts_trade
+            ON ""ETH"".execution_attempts (executed_trade_id, created_at_utc DESC);", ct);
+
+        await Exec(conn, @"
+            CREATE TABLE IF NOT EXISTS ""ETH"".execution_events (
+                event_id                  BIGSERIAL   PRIMARY KEY,
+                executed_trade_id         BIGINT      REFERENCES ""ETH"".executed_trades(executed_trade_id) ON DELETE SET NULL,
+                signal_id                 UUID        NOT NULL,
+                source_type               TEXT        NOT NULL,
+                event_type                TEXT        NOT NULL,
+                message                   TEXT        NOT NULL,
+                details_json              JSONB       NOT NULL DEFAULT '{}'::jsonb,
+                created_at_utc            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );", ct);
+
+        await Exec(conn, @"
+            CREATE INDEX IF NOT EXISTS idx_execution_events_trade
+            ON ""ETH"".execution_events (executed_trade_id, created_at_utc DESC);", ct);
+
+        await Exec(conn, @"
+            CREATE TABLE IF NOT EXISTS ""ETH"".account_snapshots (
+                snapshot_id               BIGSERIAL   PRIMARY KEY,
+                account_id                TEXT        NOT NULL,
+                account_name              TEXT        NOT NULL DEFAULT '',
+                currency                  TEXT        NOT NULL,
+                balance                   NUMERIC     NOT NULL DEFAULT 0,
+                equity                    NUMERIC     NOT NULL DEFAULT 0,
+                available                 NUMERIC     NOT NULL DEFAULT 0,
+                margin                    NUMERIC     NOT NULL DEFAULT 0,
+                funds                     NUMERIC     NOT NULL DEFAULT 0,
+                open_positions            INT         NOT NULL DEFAULT 0,
+                is_demo                   BOOLEAN     NOT NULL DEFAULT FALSE,
+                hedging_mode              BOOLEAN     NOT NULL DEFAULT FALSE,
+                captured_at_utc           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );", ct);
+
+        await Exec(conn, @"ALTER TABLE ""ETH"".account_snapshots ADD COLUMN IF NOT EXISTS account_name TEXT NOT NULL DEFAULT '';", ct);
+
+        await Exec(conn, @"
+            CREATE INDEX IF NOT EXISTS idx_account_snapshots_time
+            ON ""ETH"".account_snapshots (captured_at_utc DESC);", ct);
+
+        await Exec(conn, @"
+            CREATE TABLE IF NOT EXISTS ""ETH"".close_trade_actions (
+                close_action_id           BIGSERIAL   PRIMARY KEY,
+                executed_trade_id         BIGINT      NOT NULL REFERENCES ""ETH"".executed_trades(executed_trade_id) ON DELETE CASCADE,
+                requested_by              TEXT        NOT NULL,
+                reason                    TEXT,
+                success                   BOOLEAN     NOT NULL DEFAULT FALSE,
+                message                   TEXT        NOT NULL,
+                deal_reference            TEXT,
+                deal_id                   TEXT,
+                close_level               NUMERIC,
+                pnl                       NUMERIC,
+                created_at_utc            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );", ct);
+
+        await Exec(conn, @"
+            CREATE INDEX IF NOT EXISTS idx_close_trade_actions_trade
+            ON ""ETH"".close_trade_actions (executed_trade_id, created_at_utc DESC);", ct);
+
         // B-14: Migrate reasons_json from TEXT to JSONB
         if (await ColumnExistsAsync(conn, "signals", "reasons_json", ct))
         {

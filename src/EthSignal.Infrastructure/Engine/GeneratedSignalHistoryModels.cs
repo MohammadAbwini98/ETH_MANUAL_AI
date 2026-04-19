@@ -54,4 +54,8 @@ public interface IGeneratedSignalHistoryService
         int offset,
         int? hours = null,
         CancellationToken ct = default);
+    Task<GeneratedSignalWithOutcome?> GetBySignalIdAsync(
+        string symbol,
+        Guid signalId,
+        CancellationToken ct = default);
 }

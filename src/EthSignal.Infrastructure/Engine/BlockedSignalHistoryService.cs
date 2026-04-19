@@ -56,6 +56,17 @@ public sealed class BlockedSignalHistoryService : IBlockedSignalHistoryService
         };
     }
 
+    public async Task<BlockedSignalWithOutcome?> GetBySignalIdAsync(
+        string symbol,
+        Guid signalId,
+        CancellationToken ct = default)
+    {
+        var row = await GetBlockedDecisionRowByIdAsync(symbol, signalId, ct);
+        if (row == null)
+            return null;
+        return await BuildBlockedSignalAsync(row, ct);
+    }
+
     private async Task<List<BlockedSignalWithOutcome>> BuildBlockedSignalsAsync(
         IReadOnlyList<BlockedDecisionRow> rows,
         CancellationToken ct)
@@ -153,6 +164,69 @@ public sealed class BlockedSignalHistoryService : IBlockedSignalHistoryService
               AND COALESCE(candidate_direction, decision_type) IN ('BUY', 'SELL');", conn);
         cmd.Parameters.AddWithValue("symbol", symbol);
         return (int)(await cmd.ExecuteScalarAsync(ct))!;
+    }
+
+    private async Task<BlockedDecisionRow?> GetBlockedDecisionRowByIdAsync(
+        string symbol,
+        Guid signalId,
+        CancellationToken ct)
+    {
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(ct);
+
+        await using var cmd = new NpgsqlCommand(@"
+            SELECT
+                id,
+                evaluation_id,
+                symbol,
+                decision_time_utc,
+                bar_time_utc,
+                timeframe,
+                decision_type,
+                candidate_direction,
+                regime,
+                parameter_set_id,
+                confidence_score,
+                reason_details_json,
+                indicators_json,
+                source_mode,
+                lifecycle_state,
+                final_block_reason,
+                origin,
+                effective_runtime_parameters_json
+            FROM ""ETH"".signal_decision_audit
+            WHERE symbol = @symbol
+              AND id = @signalId
+              AND outcome_category = 'OPERATIONAL_BLOCKED'
+              AND COALESCE(candidate_direction, decision_type) IN ('BUY', 'SELL')
+            LIMIT 1;", conn);
+        cmd.Parameters.AddWithValue("symbol", symbol);
+        cmd.Parameters.AddWithValue("signalId", signalId);
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        if (!await reader.ReadAsync(ct))
+            return null;
+
+        return new BlockedDecisionRow
+        {
+            DecisionId = reader.GetGuid(0),
+            EvaluationId = reader.GetGuid(1),
+            Symbol = reader.GetString(2),
+            DecisionTimeUtc = reader.GetFieldValue<DateTimeOffset>(3),
+            BarTimeUtc = reader.GetFieldValue<DateTimeOffset>(4),
+            Timeframe = reader.GetString(5),
+            DecisionType = reader.GetString(6),
+            CandidateDirection = reader.IsDBNull(7) ? null : reader.GetString(7),
+            Regime = reader.IsDBNull(8) ? null : reader.GetString(8),
+            ParameterSetId = reader.IsDBNull(9) ? null : reader.GetString(9),
+            ConfidenceScore = reader.GetInt32(10),
+            ReasonDetailsJson = reader.GetString(11),
+            IndicatorsJson = reader.GetString(12),
+            SourceMode = reader.GetString(13),
+            LifecycleState = reader.GetString(14),
+            FinalBlockReason = reader.IsDBNull(15) ? null : reader.GetString(15),
+            Origin = reader.IsDBNull(16) ? null : reader.GetString(16),
+            EffectiveRuntimeParametersJson = reader.IsDBNull(17) ? null : reader.GetString(17)
+        };
     }
 
     private async Task<BlockedSignalWithOutcome?> BuildBlockedSignalAsync(BlockedDecisionRow row, CancellationToken ct)

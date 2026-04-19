@@ -1303,6 +1303,7 @@
                                         <th data-col="pnl" onclick="sortHistory('pnl')">PnL (R) <span
                                                 class="sort-icon"></span></th>
                                         <th>Expiry</th>
+                                        <th>Execute</th>
                                     </tr>
                                 </thead>
                                 <tbody id="signal-history"></tbody>
@@ -1403,6 +1404,7 @@
                                         <th data-col="pnl" onclick="sortBlockedHistory('pnl')">PnL (R) <span
                                                 class="sort-icon"></span></th>
                                         <th>Expiry</th>
+                                        <th>Execute</th>
                                     </tr>
                                 </thead>
                                 <tbody id="blocked-signal-history"></tbody>
@@ -1503,6 +1505,7 @@
                                         <th data-col="pnl" onclick="sortGeneratedHistory('pnl')">PnL (R) <span
                                                 class="sort-icon"></span></th>
                                         <th>Expiry</th>
+                                        <th>Execute</th>
                                     </tr>
                                 </thead>
                                 <tbody id="generated-signal-history"></tbody>
@@ -1517,9 +1520,117 @@
                 </div>
             </div>
         </div>
+
+        <!-- Row 11: Executed Signals / Trades -->
+        <div class="row g-2 mt-1">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <span>Executed Signals / Trades</span>
+                        <small style="color:var(--text-sub)">Capital.com demo execution records linked back to their originating signal category</small>
+                    </div>
+                    <div class="card-body py-2" style="border-bottom:1px solid var(--border);font-size:.8rem">
+                        <div class="row text-center g-2">
+                            <div class="col-lg-1 col-md-2 col-4"><span class="stat-label">Avail</span><br><span class="stat-val" id="trade-available">--</span></div>
+                            <div class="col-lg-1 col-md-2 col-4"><span class="stat-label">Equity</span><br><span class="stat-val" id="trade-equity">--</span></div>
+                            <div class="col-lg-1 col-md-2 col-4"><span class="stat-label">Funds</span><br><span class="stat-val" id="trade-funds">--</span></div>
+                            <div class="col-lg-1 col-md-2 col-4"><span class="stat-label">Margin</span><br><span class="stat-val" id="trade-margin">--</span></div>
+                            <div class="col-lg-1 col-md-2 col-4"><span class="stat-label">Currency</span><br><span class="stat-val" id="trade-currency">--</span></div>
+                            <div class="col-lg-1 col-md-2 col-4"><span class="stat-label">Open</span><br><span class="stat-val" id="trade-open">--</span></div>
+                            <div class="col-lg-1 col-md-2 col-4"><span class="stat-label">Executed</span><br><span class="stat-val" id="trade-total">--</span></div>
+                            <div class="col-lg-1 col-md-2 col-4"><span class="stat-label">Wins</span><br><span class="stat-val" id="trade-wins" style="color:var(--green)">--</span></div>
+                            <div class="col-lg-1 col-md-2 col-4"><span class="stat-label">Losses</span><br><span class="stat-val" id="trade-losses" style="color:var(--red)">--</span></div>
+                            <div class="col-lg-1 col-md-2 col-4"><span class="stat-label">PnL</span><br><span class="stat-val" id="trade-pnl">--</span></div>
+                            <div class="col-lg-1 col-md-2 col-4"><span class="stat-label">Win Rate</span><br><span class="stat-val" id="trade-winrate">--</span></div>
+                            <div class="col-lg-1 col-md-2 col-4"><span class="stat-label">Failed</span><br><span class="stat-val" id="trade-failed">--</span></div>
+                        </div>
+                        <div class="mt-2" style="font-size:.74rem;color:var(--text-sub);display:flex;gap:14px;flex-wrap:wrap">
+                            <span>Account: <span id="trade-demo-indicator">--</span></span>
+                            <span>Session: <span id="trade-session-status">--</span></span>
+                            <span>Last Sync: <span id="trade-last-sync">--</span></span>
+                            <span>Broker Note: <span id="trade-order-note">--</span></span>
+                            <span>Broker Error: <span id="trade-broker-error">--</span></span>
+                        </div>
+                    </div>
+                    <div class="card-header d-flex justify-content-between align-items-center" style="border-top:none">
+                        <span style="font-size:.78rem;color:var(--text-sub)">Executed Trades</span>
+                        <div class="d-flex gap-2 align-items-center flex-wrap">
+                            <label style="font-size:.75rem;color:var(--text-sub);white-space:nowrap">From</label>
+                            <input type="date" class="filter-input" id="exec-filter-date-from" style="width:130px" onchange="onExecutedTradeFilterChange()">
+                            <label style="font-size:.75rem;color:var(--text-sub);white-space:nowrap">To</label>
+                            <input type="date" class="filter-input" id="exec-filter-date-to" style="width:130px" onchange="onExecutedTradeFilterChange()">
+                            <input type="text" class="filter-input" id="exec-filter-instrument" style="width:110px" placeholder="Instrument" oninput="onExecutedTradeFilterChange()">
+                            <select class="filter-input" id="exec-filter-dir" style="width:80px" onchange="onExecutedTradeFilterChange()">
+                                <option value="">All Dir</option>
+                                <option value="BUY">BUY</option>
+                                <option value="SELL">SELL</option>
+                            </select>
+                            <select class="filter-input" id="exec-filter-tf" style="width:80px" onchange="onExecutedTradeFilterChange()">
+                                <option value="">All TF</option>
+                                <option value="1m">1m</option>
+                                <option value="5m">5m</option>
+                                <option value="15m">15m</option>
+                                <option value="30m">30m</option>
+                                <option value="1h">1h</option>
+                                <option value="4h">4h</option>
+                            </select>
+                            <select class="filter-input" id="exec-filter-source" style="width:110px" onchange="onExecutedTradeFilterChange()">
+                                <option value="">All Source</option>
+                                <option value="Recommended">Recommended</option>
+                                <option value="Generated">Generated</option>
+                                <option value="Blocked">Blocked</option>
+                            </select>
+                            <select class="filter-input" id="exec-filter-status" style="width:120px" onchange="onExecutedTradeFilterChange()">
+                                <option value="">All Status</option>
+                                <option value="Open">Open</option>
+                                <option value="Closed">Closed</option>
+                                <option value="Failed">Failed</option>
+                                <option value="Rejected">Rejected</option>
+                                <option value="ValidationFailed">ValidationFailed</option>
+                                <option value="CloseFailed">CloseFailed</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="card-body p-0">
+                        <div class="signal-tbl-wrap">
+                            <table class="table table-sm table-dark table-hover mb-0" id="executed-trades-table">
+                                <thead>
+                                    <tr>
+                                        <th>SignalId</th>
+                                        <th>Source</th>
+                                        <th>Instrument</th>
+                                        <th>Direction</th>
+                                        <th>TF</th>
+                                        <th>Recommended Entry</th>
+                                        <th>Executed Entry</th>
+                                        <th>TP</th>
+                                        <th>SL</th>
+                                        <th>Size</th>
+                                        <th>Status</th>
+                                        <th>Open Time</th>
+                                        <th>Close Time</th>
+                                        <th>PnL</th>
+                                        <th>Currency</th>
+                                        <th>Deal Reference</th>
+                                        <th>Failure Reason</th>
+                                        <th>Force Close</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="executed-trades-body"></tbody>
+                            </table>
+                        </div>
+                        <div class="pagination-controls">
+                            <button id="exec-prev-page" onclick="changeExecutedTradePage(-1)" disabled>&laquo; Prev</button>
+                            <span id="exec-page-info">Page 1</span>
+                            <button id="exec-next-page" onclick="changeExecutedTradePage(1)">Next &raquo;</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
 
-    <script src="js/dashboard.js?v=17"></script>
+    <script src="js/dashboard.js?v=18"></script>
 </body>
 
 </html>

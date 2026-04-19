@@ -54,4 +54,8 @@ public interface IBlockedSignalHistoryService
         int pageSize,
         int offset,
         CancellationToken ct = default);
+    Task<BlockedSignalWithOutcome?> GetBySignalIdAsync(
+        string symbol,
+        Guid signalId,
+        CancellationToken ct = default);
 }

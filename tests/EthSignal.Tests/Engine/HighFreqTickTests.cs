@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using EthSignal.Domain.Models;
 using EthSignal.Infrastructure.Apis;
 using EthSignal.Infrastructure.Engine;
+using EthSignal.Infrastructure.Trading;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -475,6 +476,8 @@ internal sealed class StubCapitalClient : ICapitalClient
     private readonly SpotPrice? _price;
     public StubCapitalClient(SpotPrice? price) => _price = price;
 
+    public bool IsDemoEnvironment => true;
+
     public Task AuthenticateAsync(CancellationToken ct = default) => Task.CompletedTask;
 
     public Task<SpotPrice> GetSpotPriceAsync(string epic, CancellationToken ct = default) =>
@@ -486,6 +489,68 @@ internal sealed class StubCapitalClient : ICapitalClient
 
     public Task<Sentiment> GetSentimentAsync(string marketId, CancellationToken ct = default) =>
         Task.FromResult(new Sentiment(55m, 45m));
+
+    public Task EnsureDemoReadyAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task<CapitalMarketInfo> GetMarketInfoAsync(string epic, CancellationToken ct = default) =>
+        Task.FromResult(new CapitalMarketInfo
+        {
+            Epic = epic,
+            Symbol = epic,
+            InstrumentName = epic,
+            Currency = "USD",
+            Tradeable = true,
+            Bid = _price?.Bid ?? 2100m,
+            Offer = _price?.Ask ?? 2101m,
+            DecimalPlaces = 2,
+            MinDealSize = 0.1m,
+            MinSizeIncrement = 0.1m,
+            MinStopOrProfitDistance = 1m,
+            MinStopOrProfitDistanceUnit = "POINTS",
+            MarginFactor = 50m,
+            MarginFactorUnit = "PERCENTAGE"
+        });
+
+    public Task<CapitalAccountInfo> GetAccountInfoAsync(CancellationToken ct = default) =>
+        Task.FromResult(new CapitalAccountInfo
+        {
+            AccountId = "demo",
+            AccountName = "DEMOAI",
+            Currency = "USD",
+            Balance = 10000m,
+            Available = 9000m,
+            ProfitLoss = 0m,
+            Equity = 10000m,
+            HedgingMode = false,
+            IsDemo = true
+        });
+
+    public Task<CapitalOpenPositionResult> PlacePositionAsync(CapitalPlacePositionRequest request, CancellationToken ct = default) =>
+        Task.FromResult(new CapitalOpenPositionResult
+        {
+            DealReference = Guid.NewGuid().ToString("N"),
+            Note = "stub"
+        });
+
+    public Task<CapitalDealConfirmation> ConfirmDealAsync(string dealReference, CancellationToken ct = default) =>
+        Task.FromResult(new CapitalDealConfirmation
+        {
+            DealReference = dealReference,
+            DealId = Guid.NewGuid().ToString("N"),
+            Accepted = true,
+            Status = "ACCEPTED",
+            DealStatus = "OPENED"
+        });
+
+    public Task<IReadOnlyList<CapitalPositionSnapshot>> GetOpenPositionsAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<CapitalPositionSnapshot>>(Array.Empty<CapitalPositionSnapshot>());
+
+    public Task<CapitalClosePositionResult> ClosePositionAsync(CapitalClosePositionRequest request, CancellationToken ct = default) =>
+        Task.FromResult(new CapitalClosePositionResult
+        {
+            DealReference = Guid.NewGuid().ToString("N"),
+            Note = "closed"
+        });
 
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 }

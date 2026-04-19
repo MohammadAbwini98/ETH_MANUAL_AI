@@ -7,6 +7,13 @@ namespace EthSignal.Tests.Engine;
 public class StrategyParametersTests
 {
     [Fact]
+    public void Default_MlMode_Is_Shadow_And_Does_Not_AutoActivate()
+    {
+        StrategyParameters.Default.MlMode.Should().Be(MlMode.SHADOW);
+        StrategyParameters.Default.MlAutoActivateOnStartup.Should().BeFalse();
+    }
+
+    [Fact]
     public void Validate_Fails_When_ExitTpMultiples_AreNotAscending()
     {
         var result = (StrategyParameters.Default with

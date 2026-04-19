@@ -8,6 +8,7 @@ using EthSignal.Infrastructure.Engine;
 using EthSignal.Infrastructure.Engine.ML;
 using EthSignal.Infrastructure;
 using EthSignal.Infrastructure.Notifications;
+using EthSignal.Infrastructure.Trading;
 using EthSignal.Web.BackgroundServices;
 using Npgsql;
 using Serilog;
@@ -120,6 +121,18 @@ try
     var apiKey = builder.Configuration["CAPITAL_API_KEY"] ?? capitalSection["ApiKey"] ?? "";
     var identifier = builder.Configuration["CAPITAL_IDENTIFIER"] ?? capitalSection["Identifier"] ?? "";
     var password = builder.Configuration["CAPITAL_PASSWORD"] ?? capitalSection["Password"] ?? "";
+    var tradingEnabled = builder.Configuration.GetValue("CapitalTrading:Enabled", false);
+    var preferredDemoAccountName = builder.Configuration["CAPITAL_TRADING_PREFERRED_DEMO_ACCOUNT_NAME"]
+        ?? builder.Configuration["CapitalTrading:PreferredDemoAccountName"]
+        ?? "DEMOAI";
+
+    if (tradingEnabled
+        && !baseUrl.Contains("demo-api-capital.backend-capital.com", StringComparison.OrdinalIgnoreCase))
+    {
+        throw new InvalidOperationException(
+            "CapitalTrading:Enabled requires the Capital.com DEMO base URL. " +
+            "Set CAPITAL_BASE_URL or CapitalApi:BaseUrl to https://demo-api-capital.backend-capital.com.");
+    }
 
     if (!uiPriceOnly || historicalSyncEnabled)
     {
@@ -164,9 +177,11 @@ try
             "Example: 'Host=localhost;Port=5432;Database=ETH_BASE;Username=postgres;Password=...'");
 
     // DI
-    builder.Services.AddSingleton<ICapitalClient>(sp =>
-        new CapitalClient(baseUrl, apiKey, identifier, password,
+    builder.Services.AddSingleton<CapitalClient>(sp =>
+        new CapitalClient(baseUrl, apiKey, identifier, password, preferredDemoAccountName,
             sp.GetRequiredService<ILogger<CapitalClient>>()));
+    builder.Services.AddSingleton<ICapitalClient>(sp => sp.GetRequiredService<CapitalClient>());
+    builder.Services.AddSingleton<ICapitalTradingClient>(sp => sp.GetRequiredService<CapitalClient>());
 
     // ── Tick provider chain (Playwright + REST fallback) ──────────────
     var usePlaywright = builder.Configuration.GetValue<bool>("HighFreqTicks:Enabled", defaultValue: true);
@@ -248,6 +263,7 @@ try
     builder.Services.AddSingleton<IGeneratedSignalOutcomeRepository>(_ => new GeneratedSignalOutcomeRepository(connString));
     builder.Services.AddSingleton<IParameterRepository>(_ => new ParameterRepository(connString));
     builder.Services.AddSingleton<IPortalOverridesRepository>(_ => new PostgresPortalOverridesRepository(connString));
+    builder.Services.AddSingleton<IExecutedTradeRepository>(_ => new ExecutedTradeRepository(connString));
     builder.Services.AddSingleton<IReplayRepository>(_ => new ReplayRepository(connString));
     builder.Services.AddSingleton<IOptimizerRepository>(_ => new OptimizerRepository(connString));
     builder.Services.AddSingleton<IParameterProvider>(sp =>
@@ -284,9 +300,15 @@ try
         new AdaptiveParameterLogRepository(connString,
             sp.GetRequiredService<ILoggerFactory>().CreateLogger<AdaptiveParameterLogRepository>()));
     builder.Services.AddSingleton<SignalFrequencyManager>();
+    builder.Services.AddSingleton<IExecutionCandidateMapper, ExecutionCandidateMapper>();
+    builder.Services.AddSingleton<TradeExecutionRuntimeState>();
+    builder.Services.AddSingleton<IAccountSnapshotService, AccountSnapshotService>();
+    builder.Services.AddSingleton<ITradeExecutionPolicy, TradeExecutionPolicy>();
+    builder.Services.AddSingleton<ITradeExecutionService, TradeExecutionService>();
     builder.Services.AddSingleton<MlTrainingState>();
     builder.Services.AddSingleton<MlTrainingService>();
     builder.Services.AddHostedService(sp => sp.GetRequiredService<MlTrainingService>());
+    builder.Services.AddHostedService<TradeAutoExecutionService>();
     builder.Services.AddHostedService<DataIngestionService>();
     // B-15: StopHost on unhandled exception so app doesn't run in degraded state
     builder.Services.Configure<HostOptions>(opts =>
@@ -729,6 +751,164 @@ try
             total = result.Total,
             page = result.Page,
             pageSize = result.PageSize
+        });
+    });
+
+    app.MapGet("/api/executed-trades", async (
+        IExecutedTradeRepository repository,
+        DateTimeOffset? from,
+        DateTimeOffset? to,
+        string? instrument,
+        string? direction,
+        string? timeframe,
+        string? sourceType,
+        string? status,
+        int? limit,
+        int? page,
+        CancellationToken ct) =>
+    {
+        var pageSize = Math.Clamp(limit ?? 50, 1, 200);
+        var pageNum = Math.Max(1, page ?? 1);
+        var query = new ExecutedTradeQuery
+        {
+            FromUtc = from,
+            ToUtc = to,
+            Instrument = instrument,
+            Direction = Enum.TryParse<SignalDirection>(direction, true, out var parsedDirection) ? parsedDirection : null,
+            Timeframe = timeframe,
+            SourceType = Enum.TryParse<SignalExecutionSourceType>(sourceType, true, out var parsedSource) ? parsedSource : null,
+            Status = Enum.TryParse<ExecutedTradeStatus>(status, true, out var parsedStatus) ? parsedStatus : null,
+            Limit = pageSize,
+            Offset = (pageNum - 1) * pageSize
+        };
+        var trades = await repository.GetExecutedTradesAsync(query, ct);
+        var total = await repository.GetExecutedTradeCountAsync(query with { Limit = 0, Offset = 0 }, ct);
+        return Results.Ok(new { trades, total, page = pageNum, pageSize });
+    });
+
+    app.MapGet("/api/executed-trades/{id:long}", async (
+        long id,
+        IExecutedTradeRepository repository,
+        CancellationToken ct) =>
+    {
+        var trade = await repository.GetExecutedTradeAsync(id, ct);
+        return trade == null ? Results.NotFound() : Results.Ok(trade);
+    });
+
+    app.MapPost("/api/executed-trades/execute-signal/{signalId:guid}", async (
+        Guid signalId,
+        HttpContext ctx,
+        ISignalRepository signalRepository,
+        IExecutionCandidateMapper mapper,
+        ITradeExecutionService executionService,
+        CancellationToken ct) =>
+    {
+        if (RejectIfNotLoopback(ctx) is { } reject) return reject;
+        var signal = await signalRepository.GetSignalByIdAsync(signalId, ct);
+        if (signal == null) return Results.NotFound(new { error = "Signal not found." });
+        var result = await executionService.ExecuteAsync(new TradeExecutionRequest
+        {
+            Candidate = mapper.FromRecommended(signal),
+            RequestedBy = "dashboard"
+        }, ct);
+        return Results.Ok(result);
+    });
+
+    app.MapPost("/api/executed-trades/execute-generated/{signalId:guid}", async (
+        Guid signalId,
+        HttpContext ctx,
+        IGeneratedSignalHistoryService generatedHistory,
+        IExecutionCandidateMapper mapper,
+        ITradeExecutionService executionService,
+        CancellationToken ct) =>
+    {
+        if (RejectIfNotLoopback(ctx) is { } reject) return reject;
+        var signal = await generatedHistory.GetBySignalIdAsync(symbol, signalId, ct);
+        if (signal == null) return Results.NotFound(new { error = "Generated signal not found." });
+        var result = await executionService.ExecuteAsync(new TradeExecutionRequest
+        {
+            Candidate = mapper.FromGenerated(signal.Signal),
+            RequestedBy = "dashboard"
+        }, ct);
+        return Results.Ok(result);
+    });
+
+    app.MapPost("/api/executed-trades/execute-blocked/{signalId:guid}", async (
+        Guid signalId,
+        HttpContext ctx,
+        IBlockedSignalHistoryService blockedHistory,
+        IExecutionCandidateMapper mapper,
+        ITradeExecutionService executionService,
+        CancellationToken ct) =>
+    {
+        if (RejectIfNotLoopback(ctx) is { } reject) return reject;
+        var signal = await blockedHistory.GetBySignalIdAsync(symbol, signalId, ct);
+        if (signal == null) return Results.NotFound(new { error = "Blocked signal not found." });
+        var result = await executionService.ExecuteAsync(new TradeExecutionRequest
+        {
+            Candidate = mapper.FromBlocked(signal.Signal),
+            RequestedBy = "dashboard"
+        }, ct);
+        return Results.Ok(result);
+    });
+
+    app.MapPost("/api/executed-trades/{id:long}/force-close", async (
+        long id,
+        HttpContext ctx,
+        ForceCloseRequest request,
+        ITradeExecutionService executionService,
+        CancellationToken ct) =>
+    {
+        if (RejectIfNotLoopback(ctx) is { } reject) return reject;
+        var result = await executionService.ForceCloseAsync(id, request, ct);
+        return result.Success ? Results.Ok(result) : Results.BadRequest(result);
+    });
+
+    app.MapGet("/api/trading/account-summary", async (
+        IAccountSnapshotService accountSnapshotService,
+        CancellationToken ct) =>
+    {
+        var snapshot = await accountSnapshotService.GetLatestAsync(ct);
+        return Results.Ok(snapshot);
+    });
+
+    app.MapGet("/api/trading/open-positions", async (
+        ICapitalTradingClient capitalTradingClient,
+        CancellationToken ct) =>
+    {
+        await capitalTradingClient.EnsureDemoReadyAsync(ct);
+        var positions = await capitalTradingClient.GetOpenPositionsAsync(ct);
+        return Results.Ok(new { positions });
+    });
+
+    app.MapGet("/api/trading/execution-stats", async (
+        IExecutedTradeRepository repository,
+        CancellationToken ct) =>
+    {
+        var stats = await repository.GetExecutionStatsAsync(ct);
+        return Results.Ok(stats);
+    });
+
+    app.MapGet("/api/trading/health", async (
+        ITradeExecutionPolicy policy,
+        ICapitalTradingClient capitalTradingClient,
+        IExecutedTradeRepository repository,
+        TradeExecutionRuntimeState runtimeState,
+        CancellationToken ct) =>
+    {
+        var settings = policy.GetSettings();
+        var latestSnapshot = await repository.GetLatestAccountSnapshotAsync(ct);
+        return Results.Ok(new BrokerHealthSnapshot
+        {
+            DemoOnly = settings.DemoOnly && capitalTradingClient.IsDemoEnvironment,
+            SessionReady = runtimeState.SessionReady,
+            ExecutionEnabled = settings.Enabled,
+            AccountName = latestSnapshot?.AccountName,
+            AccountId = latestSnapshot?.AccountId,
+            ActiveAccountIsDemo = latestSnapshot?.IsDemo,
+            LastSyncUtc = runtimeState.LastSyncUtc ?? latestSnapshot?.CapturedAtUtc,
+            LatestBrokerError = runtimeState.LatestBrokerError,
+            LatestOrderNote = runtimeState.LatestOrderNote
         });
     });
 
@@ -1864,7 +2044,8 @@ try
         Log.Information("Database migration completed");
     }
 
-    // U-01 FIX: Seed default ACTIVE parameter set if none exists, then refresh cache
+    // Seed the default active parameter set if none exists, then refresh cache.
+    // StrategyParameters.Default keeps MlMode=SHADOW so first-run behavior remains safe.
     {
         var paramRepo = app.Services.GetRequiredService<IParameterRepository>();
         var pp = app.Services.GetRequiredService<IParameterProvider>();
@@ -1887,7 +2068,7 @@ try
                 Notes = "Auto-seeded default parameter set"
             });
             await paramRepo.ActivateAsync(setId, null, "startup-seed", "initial default seeding");
-            Log.Information("Seeded default ACTIVE parameter set id={Id} hash={Hash}", setId, hashStr);
+            Log.Information("Seeded default parameter set id={Id} hash={Hash} mlMode={MlMode}", setId, hashStr, defaults.MlMode);
         }
         else
         {
@@ -1966,15 +2147,22 @@ try
             Log.Information("ML model loaded: {Version} ({Format})",
                 mlInference.ActiveModelVersion, mlInference.ActiveModelFormat);
 
-            // Auto-switch MlMode to ACTIVE when a healthy, promoted ONNX model
-            // is loaded. Accuracy-first gate: heuristic fallback must NEVER
-            // auto-activate — it is only used in SHADOW/annotation mode.
+            // Optional startup auto-activation: only switch MlMode to ACTIVE when
+            // explicitly enabled in parameters. SHADOW remains the default.
+            // Accuracy-first gate: heuristic fallback must NEVER auto-activate —
+            // it is only used in SHADOW/annotation mode.
             try
             {
                 var autoPp = app.Services.GetRequiredService<IParameterProvider>();
                 var autoParamRepo = app.Services.GetRequiredService<IParameterRepository>();
                 var currentParams = autoPp.GetActive();
-                if (currentParams.MlMode != MlMode.ACTIVE)
+                if (!currentParams.MlAutoActivateOnStartup)
+                {
+                    Log.Information(
+                        "Startup: MlMode remains {Mode} because MlAutoActivateOnStartup is disabled by default",
+                        currentParams.MlMode);
+                }
+                else if (currentParams.MlMode != MlMode.ACTIVE)
                 {
                     var updatedParams = currentParams with { MlMode = MlMode.ACTIVE };
                     var autoHash = System.Security.Cryptography.SHA256.HashData(
@@ -2236,6 +2424,56 @@ try
             current.DailyLossCapPercent,
             current.MaxConsecutiveLossesPerDay,
             current.ScalpMaxConsecutiveLossesPerDay
+        });
+    });
+
+    // ── Global configuration controls (portal_overrides table) ─────────────────
+    // Recommended-signal execution is enforced only in the auto-executor path so
+    // signal generation, dashboards, and manual execution remain unaffected.
+    app.MapGet("/api/admin/global-config", async (HttpContext ctx, IPortalOverridesRepository overridesRepo) =>
+    {
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
+
+        var o = await overridesRepo.GetAsync();
+        var effective = o?.RecommendedSignalExecutionEnabled ?? true;
+        Log.Information("Global config loaded: RecommendedSignalExecutionEnabled={Enabled} overridden={Overridden}",
+            effective, o?.RecommendedSignalExecutionEnabled.HasValue == true);
+        return Results.Ok(new
+        {
+            recommendedSignalExecutionEnabled = effective,
+            overridden = o?.RecommendedSignalExecutionEnabled.HasValue == true,
+            updatedAt = o?.UpdatedAt,
+            updatedBy = o?.UpdatedBy
+        });
+    });
+
+    app.MapPatch("/api/admin/global-config", async (HttpContext ctx, IPortalOverridesRepository overridesRepo) =>
+    {
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
+
+        var body = await ctx.Request.ReadFromJsonAsync<Dictionary<string, JsonElement>>();
+        if (body == null) return Results.BadRequest(new { error = "Missing request body" });
+        if (!body.TryGetValue("recommendedSignalExecutionEnabled", out var toggleElement) ||
+            toggleElement.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+        {
+            return Results.BadRequest(new { error = "Missing 'recommendedSignalExecutionEnabled' bool in body" });
+        }
+
+        var enabled = toggleElement.GetBoolean();
+        await overridesRepo.SaveAsync(new PortalOverrides
+        {
+            RecommendedSignalExecutionEnabled = enabled,
+            UpdatedBy = "portal"
+        });
+
+        Log.Information("Global config changed: RecommendedSignalExecutionEnabled={Enabled}", enabled);
+
+        return Results.Ok(new
+        {
+            recommendedSignalExecutionEnabled = enabled,
+            updatedBy = "portal"
         });
     });
 

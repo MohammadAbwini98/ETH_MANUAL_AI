@@ -185,8 +185,19 @@ async function getEthJson(pathname) {
     return json;
 }
 
-async function persistPortalBlockers(settings) {
+async function loadPortalSettings() {
     if (!pool) throw new Error('DB not configured');
+
+    const r = await pool.query(
+        'SELECT settings FROM "ETH".portal_overrides WHERE id = 1');
+
+    return r.rows[0]?.settings || {};
+}
+
+async function persistPortalSettingsPatch(patch) {
+    if (!pool) throw new Error('DB not configured');
+
+    const settings = { ...(await loadPortalSettings()), ...patch };
 
     await pool.query(`
         INSERT INTO "ETH".portal_overrides (id, settings, updated_at, updated_by)
@@ -196,6 +207,9 @@ async function persistPortalBlockers(settings) {
                 updated_at = EXCLUDED.updated_at,
                 updated_by = EXCLUDED.updated_by
     `, [JSON.stringify(settings)]);
+
+    console.log('[portal] Updated portal settings:', Object.keys(patch).join(', '));
+    return settings;
 }
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
@@ -299,7 +313,7 @@ app.patch('/api/portal/signal-blockers', async (req, res) => {
                 if (body[key] !== null) settings[key] = body[key];
             }
         }
-        await persistPortalBlockers(settings);
+        await persistPortalSettingsPatch(settings);
 
         let appliedLive = false;
         if (isRunning(5234)) {
@@ -312,6 +326,62 @@ app.patch('/api/portal/signal-blockers', async (req, res) => {
         }
 
         res.json({ ok: true, settings, appliedLive });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/portal/global-config', async (_req, res) => {
+    if (!pool) return res.status(503).json({ error: 'DB not configured' });
+    try {
+        const r = await pool.query(
+            'SELECT settings, updated_at, updated_by FROM "ETH".portal_overrides WHERE id = 1');
+        if (r.rows.length === 0) {
+            return res.json({ recommendedSignalExecutionEnabled: true, updatedAt: null, updatedBy: null });
+        }
+
+        const { settings, updated_at, updated_by } = r.rows[0];
+        res.json({
+            recommendedSignalExecutionEnabled:
+                typeof settings?.recommendedSignalExecutionEnabled === 'boolean'
+                    ? settings.recommendedSignalExecutionEnabled
+                    : true,
+            updatedAt: updated_at,
+            updatedBy: updated_by
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.patch('/api/portal/global-config', async (req, res) => {
+    if (!pool) return res.status(503).json({ error: 'DB not configured' });
+    try {
+        if (typeof req.body?.recommendedSignalExecutionEnabled !== 'boolean') {
+            return res.status(400).json({ error: "Missing 'recommendedSignalExecutionEnabled' bool in body" });
+        }
+
+        const settings = await persistPortalSettingsPatch({
+            recommendedSignalExecutionEnabled: req.body.recommendedSignalExecutionEnabled
+        });
+
+        let appliedLive = false;
+        if (isRunning(5234)) {
+            try {
+                await postEthJson('/api/admin/global-config', {
+                    recommendedSignalExecutionEnabled: req.body.recommendedSignalExecutionEnabled
+                });
+                appliedLive = true;
+            } catch (err) {
+                console.error('[portal] Live global-config apply failed:', err.message);
+            }
+        }
+
+        res.json({
+            ok: true,
+            recommendedSignalExecutionEnabled: settings.recommendedSignalExecutionEnabled,
+            appliedLive
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }

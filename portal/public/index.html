@@ -472,13 +472,24 @@
           Update
         </button>
 
-        <div style="display:flex;align-items:center;gap:10px;padding:10px 0 4px;border-top:1px solid var(--border);margin-top:4px">
-          <span style="font-size:.75rem;color:var(--text-dim);min-width:90px">Chrome Mode:</span>
-          <button id="btn-headless-toggle" onclick="toggleHeadless()"
-            style="font-size:.75rem;padding:4px 12px;border-radius:5px;border:1px solid var(--border);background:none;cursor:pointer;color:var(--text);transition:all .15s">
-            Loading…
-          </button>
-          <span id="headless-apply-note" style="font-size:.68rem;color:var(--text-dim);display:none"></span>
+        <div style="padding:10px 0 4px;border-top:1px solid var(--border);margin-top:4px">
+          <div style="font-size:.76rem;color:var(--text);font-weight:600;margin-bottom:8px">Global Configuration</div>
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+            <span style="font-size:.75rem;color:var(--text-dim);min-width:140px">Chrome Mode:</span>
+            <button id="btn-headless-toggle" onclick="toggleHeadless()"
+              style="font-size:.75rem;padding:4px 12px;border-radius:5px;border:1px solid var(--border);background:none;cursor:pointer;color:var(--text);transition:all .15s">
+              Loading…
+            </button>
+            <span id="headless-apply-note" style="font-size:.68rem;color:var(--text-dim);display:none"></span>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:10px">
+            <span style="font-size:.75rem;color:var(--text-dim);min-width:140px">Recommended Signal Executor:</span>
+            <button id="btn-recommended-exec-toggle" onclick="toggleRecommendedExecutor()"
+              style="font-size:.75rem;padding:4px 12px;border-radius:5px;border:1px solid var(--border);background:none;cursor:pointer;color:var(--text);transition:all .15s">
+              Loading…
+            </button>
+            <span id="recommended-exec-note" style="font-size:.68rem;color:var(--text-dim);display:none"></span>
+          </div>
         </div>
 
       </div>
@@ -738,6 +749,7 @@
     // ── Playwright headless toggle ─────────────────────────────────────────────
 
     let _headlessState = null; // true = headless, false = visible
+    let _recommendedExecState = null; // true = auto execution enabled for recommended signals
 
     async function loadHeadlessState() {
       try {
@@ -788,6 +800,60 @@
         }
       } catch (e) {
         alert('Failed to update headless mode: ' + e.message);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function loadGlobalConfig() {
+      try {
+        const r = await fetch('/api/portal/global-config');
+        if (!r.ok) return;
+        const d = await r.json();
+        _recommendedExecState = !!d.recommendedSignalExecutionEnabled;
+        renderRecommendedExecutorBtn();
+        const note = document.getElementById('recommended-exec-note');
+        if (note) note.style.display = 'none';
+      } catch { }
+    }
+
+    function renderRecommendedExecutorBtn() {
+      const btn = document.getElementById('btn-recommended-exec-toggle');
+      if (!btn || _recommendedExecState === null) return;
+      if (_recommendedExecState) {
+        btn.textContent = 'ON (Auto execute enabled)';
+        btn.style.borderColor = 'var(--green)';
+        btn.style.color = 'var(--green)';
+      } else {
+        btn.textContent = 'OFF (Skip recommended auto execution)';
+        btn.style.borderColor = 'var(--red)';
+        btn.style.color = 'var(--red)';
+      }
+    }
+
+    async function toggleRecommendedExecutor() {
+      if (_recommendedExecState === null) return;
+      const newVal = !_recommendedExecState;
+      const btn = document.getElementById('btn-recommended-exec-toggle');
+      btn.disabled = true;
+      try {
+        const r = await fetch('/api/portal/global-config', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ recommendedSignalExecutionEnabled: newVal })
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const d = await r.json();
+        _recommendedExecState = !!d.recommendedSignalExecutionEnabled;
+        renderRecommendedExecutorBtn();
+        const note = document.getElementById('recommended-exec-note');
+        if (note) {
+          note.textContent = d.appliedLive ? 'Applied live' : 'Saved ✓';
+          note.style.color = d.appliedLive ? 'var(--green)' : 'var(--yellow)';
+          note.style.display = 'inline';
+        }
+      } catch (e) {
+        alert('Failed to update recommended signal executor: ' + e.message);
       } finally {
         btn.disabled = false;
       }
@@ -932,6 +998,7 @@
         if (state[inst] === 'running') startLogPolling(inst);
       }
       loadHeadlessState();
+      loadGlobalConfig();
       loadBlockers();
     })();
 

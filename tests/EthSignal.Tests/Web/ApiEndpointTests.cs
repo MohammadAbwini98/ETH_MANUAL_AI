@@ -1,10 +1,12 @@
 using System.Net;
+using System.Net.Http.Json;
 using System.Text.Json;
 using EthSignal.Domain.Models;
 using EthSignal.Infrastructure.Apis;
 using EthSignal.Infrastructure.Db;
 using EthSignal.Infrastructure.Engine;
 using EthSignal.Infrastructure.Engine.ML;
+using EthSignal.Infrastructure.Trading;
 using EthSignal.Web.BackgroundServices;
 using FluentAssertions;
 using Microsoft.AspNetCore.Builder;
@@ -117,6 +119,75 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
         doc.RootElement.TryGetProperty("signals", out _).Should().BeTrue();
         doc.RootElement.TryGetProperty("stats", out _).Should().BeTrue();
         doc.RootElement.TryGetProperty("total", out _).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Executed_Trades_Returns_Array_And_Total()
+    {
+        var response = await _client.GetAsync("/api/executed-trades?limit=5&page=1");
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var json = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        doc.RootElement.TryGetProperty("trades", out var trades).Should().BeTrue();
+        trades.GetArrayLength().Should().Be(1);
+        doc.RootElement.GetProperty("total").GetInt32().Should().Be(1);
+    }
+
+    [Fact]
+    public async Task Trading_Health_Returns_Demo_Status()
+    {
+        var response = await _client.GetAsync("/api/trading/health");
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var json = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        doc.RootElement.GetProperty("demoOnly").GetBoolean().Should().BeTrue();
+        doc.RootElement.GetProperty("sessionReady").GetBoolean().Should().BeTrue();
+        doc.RootElement.GetProperty("accountName").GetString().Should().Be("DEMOAI");
+        doc.RootElement.GetProperty("activeAccountIsDemo").GetBoolean().Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Trading_Execution_Stats_Returns_Expected_Fields()
+    {
+        var response = await _client.GetAsync("/api/trading/execution-stats");
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var json = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        doc.RootElement.GetProperty("totalExecuted").GetInt32().Should().Be(1);
+        doc.RootElement.GetProperty("openTrades").GetInt32().Should().Be(1);
+        doc.RootElement.GetProperty("currency").GetString().Should().Be("USD");
+    }
+
+    [Fact]
+    public async Task Admin_Global_Config_Returns_Recommended_Executor_Flag()
+    {
+        using var client = _factory.WithWebHostBuilder(_ => { }).CreateClient();
+        var response = await client.GetAsync("/api/admin/global-config");
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var json = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        doc.RootElement.GetProperty("recommendedSignalExecutionEnabled").GetBoolean().Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Admin_Global_Config_Patch_Updates_Recommended_Executor_Flag()
+    {
+        using var client = _factory.WithWebHostBuilder(_ => { }).CreateClient();
+        var response = await client.PatchAsJsonAsync("/api/admin/global-config", new
+        {
+            recommendedSignalExecutionEnabled = false
+        });
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var followUp = await client.GetAsync("/api/admin/global-config");
+        followUp.StatusCode.Should().Be(HttpStatusCode.OK);
+        var json = await followUp.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        doc.RootElement.GetProperty("recommendedSignalExecutionEnabled").GetBoolean().Should().BeFalse();
     }
 
     /// <summary>P8-T1: Performance summary contains expected stat fields.</summary>
@@ -322,6 +393,7 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
 
                 // Replace real services with mocks
                 services.RemoveAll<ICapitalClient>();
+                services.RemoveAll<ICapitalTradingClient>();
                 services.RemoveAll<IDbMigrator>();
                 services.RemoveAll<ICandleRepository>();
                 services.RemoveAll<ICandleSyncRepository>();
@@ -333,13 +405,21 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
                 services.RemoveAll<IMlPredictionRepository>();
                 services.RemoveAll<IMlDataDiagnosticsService>();
                 services.RemoveAll<IMlDataDiagnosticsRepository>();
+                services.RemoveAll<IPortalOverridesRepository>();
                 services.RemoveAll<IBlockedSignalHistoryService>();
                 services.RemoveAll<IGeneratedSignalHistoryService>();
+                services.RemoveAll<IExecutedTradeRepository>();
+                services.RemoveAll<ITradeExecutionService>();
+                services.RemoveAll<ITradeExecutionPolicy>();
+                services.RemoveAll<IAccountSnapshotService>();
+                services.RemoveAll<TradeExecutionRuntimeState>();
                 services.RemoveAll<BackfillService>();
                 services.RemoveAll<LiveTickProcessor>();
                 services.RemoveAll<CandleSyncState>();
 
-                services.AddSingleton(CreateMockCapitalClient());
+                var capitalClient = CreateMockCapitalClient();
+                services.AddSingleton(capitalClient);
+                services.AddSingleton<ICapitalTradingClient>(capitalClient);
                 services.AddSingleton(Mock.Of<IDbMigrator>());
                 services.AddSingleton(CreateMockCandleRepo());
                 services.AddSingleton(CreateMockCandleSyncRepo());
@@ -350,8 +430,16 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
                 services.AddSingleton(CreateMockDecisionAuditRepo());
                 services.AddSingleton(CreateMockMlPredictionRepo());
                 services.AddSingleton(CreateMockMlDiagnosticsService());
+                services.AddSingleton(CreateMockPortalOverridesRepository());
                 services.AddSingleton(CreateMockBlockedSignalHistoryService());
                 services.AddSingleton(CreateMockGeneratedSignalHistoryService());
+                services.AddSingleton(CreateMockExecutedTradeRepository());
+                services.AddSingleton(CreateMockTradeExecutionService());
+                services.AddSingleton(CreateMockTradeExecutionPolicy());
+                services.AddSingleton(CreateMockAccountSnapshotService());
+                var runtimeState = new TradeExecutionRuntimeState();
+                runtimeState.RecordSync(true, "Mock note");
+                services.AddSingleton(runtimeState);
                 services.AddSingleton(CreateSeededCandleSyncState());
                 services.AddSingleton<IStartupFilter, TestRemoteIpStartupFilter>();
             });
@@ -442,8 +530,151 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
         private static ICapitalClient CreateMockCapitalClient()
         {
             var mock = new Mock<ICapitalClient>();
+            mock.SetupGet(c => c.IsDemoEnvironment).Returns(true);
+            mock.Setup(c => c.EnsureDemoReadyAsync(It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
             mock.Setup(c => c.GetSpotPriceAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
                 .ReturnsAsync(new SpotPrice(2050m, 2051m, 2050.5m, DateTimeOffset.UtcNow));
+            mock.Setup(c => c.GetOpenPositionsAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(Array.Empty<CapitalPositionSnapshot>());
+            return mock.Object;
+        }
+
+        private static IExecutedTradeRepository CreateMockExecutedTradeRepository()
+        {
+            var snapshot = new AccountSnapshot
+            {
+                SnapshotId = 1,
+                AccountId = "demo-1",
+                AccountName = "DEMOAI",
+                Currency = "USD",
+                Balance = 10000m,
+                Equity = 10010m,
+                Available = 9200m,
+                Margin = 500m,
+                Funds = 10010m,
+                OpenPositions = 1,
+                IsDemo = true,
+                HedgingMode = false,
+                CapturedAtUtc = new DateTimeOffset(2026, 4, 10, 11, 0, 0, TimeSpan.Zero)
+            };
+
+            var trade = new ExecutedTrade
+            {
+                ExecutedTradeId = 7,
+                SignalId = Guid.Parse("11111111-1111-1111-1111-111111111111"),
+                SourceType = SignalExecutionSourceType.Recommended,
+                Symbol = "ETHUSD",
+                Instrument = "ETHUSD",
+                Timeframe = "5m",
+                Direction = SignalDirection.BUY,
+                RecommendedEntryPrice = 2200m,
+                ActualEntryPrice = 2201m,
+                TpPrice = 2208m,
+                SlPrice = 2196m,
+                RequestedSize = 0.1m,
+                ExecutedSize = 0.1m,
+                DealReference = "DEAL-REF-1",
+                DealId = "DEAL-ID-1",
+                Status = ExecutedTradeStatus.Open,
+                AccountCurrency = "USD",
+                Pnl = 1.25m,
+                OpenedAtUtc = new DateTimeOffset(2026, 4, 10, 10, 5, 0, TimeSpan.Zero),
+                ClosedAtUtc = null,
+                CreatedAtUtc = new DateTimeOffset(2026, 4, 10, 10, 5, 0, TimeSpan.Zero),
+                UpdatedAtUtc = new DateTimeOffset(2026, 4, 10, 10, 6, 0, TimeSpan.Zero)
+            };
+
+            var mock = new Mock<IExecutedTradeRepository>();
+            mock.Setup(r => r.GetExecutedTradesAsync(It.IsAny<ExecutedTradeQuery>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync([trade]);
+            mock.Setup(r => r.GetExecutedTradeCountAsync(It.IsAny<ExecutedTradeQuery>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(1);
+            mock.Setup(r => r.GetExecutedTradeAsync(It.IsAny<long>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(trade);
+            mock.Setup(r => r.GetExecutionStatsAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new ExecutedTradeStats
+                {
+                    TotalExecuted = 1,
+                    OpenTrades = 1,
+                    Wins = 1,
+                    Losses = 0,
+                    FailedExecutions = 0,
+                    TotalPnl = 1.25m,
+                    WinRate = 100m,
+                    Currency = "USD"
+                });
+            mock.Setup(r => r.GetLatestAccountSnapshotAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(snapshot);
+            return mock.Object;
+        }
+
+        private static ITradeExecutionService CreateMockTradeExecutionService()
+        {
+            var mock = new Mock<ITradeExecutionService>();
+            mock.Setup(s => s.ForceCloseAsync(It.IsAny<long>(), It.IsAny<ForceCloseRequest>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new ForceCloseResult
+                {
+                    Success = true,
+                    Message = "Closed",
+                    DealReference = "CLOSE-REF-1",
+                    DealId = "DEAL-ID-1",
+                    CloseLevel = 2202m,
+                    Pnl = 1.5m
+                });
+            mock.Setup(s => s.ExecuteAsync(It.IsAny<TradeExecutionRequest>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new TradeExecutionResult
+                {
+                    Success = true,
+                    ExecutedTradeId = 7,
+                    Status = ExecutedTradeStatus.Open,
+                    DealReference = "DEAL-REF-1",
+                    DealId = "DEAL-ID-1",
+                    ActualEntryPrice = 2201m,
+                    ExecutedSize = 0.1m,
+                    Message = "Mock execution succeeded"
+                });
+            return mock.Object;
+        }
+
+        private static ITradeExecutionPolicy CreateMockTradeExecutionPolicy()
+        {
+            var mock = new Mock<ITradeExecutionPolicy>();
+            mock.Setup(p => p.GetSettings()).Returns(new TradeExecutionPolicySettings
+            {
+                Enabled = true,
+                AutoExecuteEnabled = false,
+                DemoOnly = true,
+                AllowedSourceTypes = new HashSet<SignalExecutionSourceType>
+                {
+                    SignalExecutionSourceType.Recommended,
+                    SignalExecutionSourceType.Generated,
+                    SignalExecutionSourceType.Blocked
+                }
+            });
+            return mock.Object;
+        }
+
+        private static IAccountSnapshotService CreateMockAccountSnapshotService()
+        {
+            var mock = new Mock<IAccountSnapshotService>();
+            mock.Setup(s => s.GetLatestAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new AccountSnapshot
+                {
+                    SnapshotId = 1,
+                    AccountId = "demo-1",
+                    AccountName = "DEMOAI",
+                    Currency = "USD",
+                    Balance = 10000m,
+                    Equity = 10010m,
+                    Available = 9200m,
+                    Margin = 500m,
+                    Funds = 10010m,
+                    OpenPositions = 1,
+                    IsDemo = true,
+                    HedgingMode = false,
+                    CapturedAtUtc = new DateTimeOffset(2026, 4, 10, 11, 0, 0, TimeSpan.Zero)
+                });
             return mock.Object;
         }
 
@@ -739,6 +970,40 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
                     Total = 1,
                     Page = 1,
                     PageSize = 5
+                });
+            return mock.Object;
+        }
+
+        private static IPortalOverridesRepository CreateMockPortalOverridesRepository()
+        {
+            PortalOverrides state = new()
+            {
+                RecommendedSignalExecutionEnabled = true,
+                UpdatedAt = new DateTimeOffset(2026, 4, 10, 11, 0, 0, TimeSpan.Zero),
+                UpdatedBy = "test"
+            };
+
+            var mock = new Mock<IPortalOverridesRepository>();
+            mock.Setup(r => r.EnsureTableExistsAsync(It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            mock.Setup(r => r.GetAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(() => state);
+            mock.Setup(r => r.SaveAsync(It.IsAny<PortalOverrides>(), It.IsAny<CancellationToken>()))
+                .Returns<PortalOverrides, CancellationToken>((overrides, _) =>
+                {
+                    state = state with
+                    {
+                        MaxOpenPositions = overrides.MaxOpenPositions ?? state.MaxOpenPositions,
+                        MaxOpenPerTimeframe = overrides.MaxOpenPerTimeframe ?? state.MaxOpenPerTimeframe,
+                        MaxOpenPerDirection = overrides.MaxOpenPerDirection ?? state.MaxOpenPerDirection,
+                        DailyLossCapPercent = overrides.DailyLossCapPercent ?? state.DailyLossCapPercent,
+                        MaxConsecutiveLossesPerDay = overrides.MaxConsecutiveLossesPerDay ?? state.MaxConsecutiveLossesPerDay,
+                        ScalpMaxConsecutiveLossesPerDay = overrides.ScalpMaxConsecutiveLossesPerDay ?? state.ScalpMaxConsecutiveLossesPerDay,
+                        RecommendedSignalExecutionEnabled = overrides.RecommendedSignalExecutionEnabled ?? state.RecommendedSignalExecutionEnabled,
+                        UpdatedBy = overrides.UpdatedBy ?? state.UpdatedBy,
+                        UpdatedAt = DateTimeOffset.UtcNow
+                    };
+                    return Task.CompletedTask;
                 });
             return mock.Object;
         }

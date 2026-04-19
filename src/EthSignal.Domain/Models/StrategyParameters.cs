@@ -151,6 +151,12 @@ public sealed record StrategyParameters
 
     // ─── ML Enhancement ─────────────────────────────────
     public MlMode MlMode { get; init; } = MlMode.SHADOW;
+    /// <summary>
+    /// When true, startup may promote MlMode from SHADOW to ACTIVE automatically
+    /// after a healthy trained model is loaded. Default is false so SHADOW
+    /// remains the safe default unless explicitly opted in.
+    /// </summary>
+    public bool MlAutoActivateOnStartup { get; init; } = false;
     public decimal MlMinWinProbability { get; init; } = 0.55m;
     public decimal MlConfidenceBlendWeight { get; init; } = 0.5m;
     public bool MlDynamicThresholdsEnabled { get; init; } = false;

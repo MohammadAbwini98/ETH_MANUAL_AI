@@ -96,6 +96,25 @@ public sealed class SignalRepository : ISignalRepository
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
+    public async Task<SignalRecommendation?> GetSignalByIdAsync(Guid signalId, CancellationToken ct = default)
+    {
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(ct);
+
+        await using var cmd = new NpgsqlCommand(@"
+            SELECT symbol, signal_id, timeframe, signal_time_utc, direction,
+                   entry_price, tp_price, sl_price, risk_percent, risk_usd,
+                   confidence_score, regime, strategy_version, reasons_json, status
+            FROM ""ETH"".signals
+            WHERE signal_id = @id
+            LIMIT 1;", conn);
+        cmd.Parameters.AddWithValue("id", signalId);
+
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        if (!await r.ReadAsync(ct)) return null;
+        return ReadSignalFromRowWithSymbol(r);
+    }
+
     public async Task<SignalRecommendation?> GetLatestSignalAsync(string symbol, CancellationToken ct = default)
     {
         await using var conn = new NpgsqlConnection(_connectionString);
@@ -437,6 +456,25 @@ public sealed class SignalRepository : ISignalRepository
         StrategyVersion = r.GetString(11),
         Reasons = ParseReasons(r.GetString(12)),
         Status = Enum.Parse<SignalStatus>(r.GetString(13))
+    };
+
+    private static SignalRecommendation ReadSignalFromRowWithSymbol(NpgsqlDataReader r) => new()
+    {
+        SignalId = r.GetGuid(1),
+        Symbol = r.GetString(0),
+        Timeframe = r.GetString(2),
+        SignalTimeUtc = r.GetFieldValue<DateTimeOffset>(3),
+        Direction = Enum.Parse<SignalDirection>(r.GetString(4)),
+        EntryPrice = r.GetDecimal(5),
+        TpPrice = r.GetDecimal(6),
+        SlPrice = r.GetDecimal(7),
+        RiskPercent = r.GetDecimal(8),
+        RiskUsd = r.GetDecimal(9),
+        ConfidenceScore = r.GetInt32(10),
+        Regime = Enum.Parse<Regime>(r.GetString(11)),
+        StrategyVersion = r.GetString(12),
+        Reasons = ParseReasons(r.GetString(13)),
+        Status = Enum.Parse<SignalStatus>(r.GetString(14))
     };
 
     private static SignalRecommendation ReadSignalWithCondition(string symbol, NpgsqlDataReader r) => new()
