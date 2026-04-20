@@ -21,16 +21,16 @@ public sealed class TradeAutoExecutionServiceTests
                 CreateRecommendedSignal()
             ]);
 
-        var executionService = new Mock<ITradeExecutionService>();
+        var queueService = new Mock<ITradeExecutionQueueService>();
         var sut = CreateSut(
             signalRepo: signalRepo,
-            executionService: executionService,
+            queueService: queueService,
             portalOverrides: new PortalOverrides { RecommendedSignalExecutionEnabled = false },
             allowedSourceTypes: [SignalExecutionSourceType.Recommended]);
 
         await sut.RunOnceAsync(CancellationToken.None);
 
-        executionService.Verify(s => s.ExecuteAsync(It.IsAny<TradeExecutionRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+        queueService.Verify(s => s.EnqueueAsync(It.IsAny<TradeExecutionRequest>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
     [Fact]
@@ -42,25 +42,25 @@ public sealed class TradeAutoExecutionServiceTests
                 CreateRecommendedSignal()
             ]);
 
-        var executionService = new Mock<ITradeExecutionService>();
-        executionService.Setup(s => s.ExecuteAsync(It.IsAny<TradeExecutionRequest>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new TradeExecutionResult
+        var queueService = new Mock<ITradeExecutionQueueService>();
+        queueService.Setup(s => s.EnqueueAsync(It.IsAny<TradeExecutionRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new TradeExecutionQueueResult
             {
-                Success = true,
-                ExecutedTradeId = 1,
-                Status = ExecutedTradeStatus.Open,
+                Accepted = true,
+                QueueEntryId = 1,
+                Status = TradeExecutionQueueStatus.Queued.ToString(),
                 Message = "ok"
             });
 
         var sut = CreateSut(
             signalRepo: signalRepo,
-            executionService: executionService,
+            queueService: queueService,
             portalOverrides: new PortalOverrides { RecommendedSignalExecutionEnabled = true },
             allowedSourceTypes: [SignalExecutionSourceType.Recommended]);
 
         await sut.RunOnceAsync(CancellationToken.None);
 
-        executionService.Verify(s => s.ExecuteAsync(
+        queueService.Verify(s => s.EnqueueAsync(
             It.Is<TradeExecutionRequest>(r => r.Candidate.SourceType == SignalExecutionSourceType.Recommended),
             It.IsAny<CancellationToken>()), Times.Once);
     }
@@ -110,13 +110,13 @@ public sealed class TradeAutoExecutionServiceTests
                 PageSize = 100
             });
 
-        var executionService = new Mock<ITradeExecutionService>();
-        executionService.Setup(s => s.ExecuteAsync(It.IsAny<TradeExecutionRequest>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new TradeExecutionResult
+        var queueService = new Mock<ITradeExecutionQueueService>();
+        queueService.Setup(s => s.EnqueueAsync(It.IsAny<TradeExecutionRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new TradeExecutionQueueResult
             {
-                Success = true,
-                ExecutedTradeId = 1,
-                Status = ExecutedTradeStatus.Open,
+                Accepted = true,
+                QueueEntryId = 1,
+                Status = TradeExecutionQueueStatus.Queued.ToString(),
                 Message = "ok"
             });
 
@@ -124,7 +124,7 @@ public sealed class TradeAutoExecutionServiceTests
             signalRepo: signalRepo,
             generatedHistory: generatedHistory,
             blockedHistory: blockedHistory,
-            executionService: executionService,
+            queueService: queueService,
             portalOverrides: new PortalOverrides { RecommendedSignalExecutionEnabled = false },
             allowedSourceTypes:
             [
@@ -135,13 +135,13 @@ public sealed class TradeAutoExecutionServiceTests
 
         await sut.RunOnceAsync(CancellationToken.None);
 
-        executionService.Verify(s => s.ExecuteAsync(
+        queueService.Verify(s => s.EnqueueAsync(
             It.Is<TradeExecutionRequest>(r => r.Candidate.SourceType == SignalExecutionSourceType.Recommended),
             It.IsAny<CancellationToken>()), Times.Never);
-        executionService.Verify(s => s.ExecuteAsync(
+        queueService.Verify(s => s.EnqueueAsync(
             It.Is<TradeExecutionRequest>(r => r.Candidate.SourceType == SignalExecutionSourceType.Generated),
             It.IsAny<CancellationToken>()), Times.Once);
-        executionService.Verify(s => s.ExecuteAsync(
+        queueService.Verify(s => s.EnqueueAsync(
             It.Is<TradeExecutionRequest>(r => r.Candidate.SourceType == SignalExecutionSourceType.Blocked),
             It.IsAny<CancellationToken>()), Times.Once);
     }
@@ -150,7 +150,7 @@ public sealed class TradeAutoExecutionServiceTests
         Mock<ISignalRepository>? signalRepo = null,
         Mock<IGeneratedSignalHistoryService>? generatedHistory = null,
         Mock<IBlockedSignalHistoryService>? blockedHistory = null,
-        Mock<ITradeExecutionService>? executionService = null,
+        Mock<ITradeExecutionQueueService>? queueService = null,
         PortalOverrides? portalOverrides = null,
         IEnumerable<SignalExecutionSourceType>? allowedSourceTypes = null)
     {
@@ -186,7 +186,7 @@ public sealed class TradeAutoExecutionServiceTests
             generatedHistory?.Object ?? Mock.Of<IGeneratedSignalHistoryService>(),
             mapper,
             policy.Object,
-            executionService?.Object ?? Mock.Of<ITradeExecutionService>(),
+            queueService?.Object ?? Mock.Of<ITradeExecutionQueueService>(),
             executedRepo.Object,
             overridesRepo.Object,
             NullLogger<TradeAutoExecutionService>.Instance);

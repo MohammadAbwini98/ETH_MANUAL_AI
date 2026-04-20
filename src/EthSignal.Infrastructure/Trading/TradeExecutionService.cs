@@ -1,3 +1,4 @@
+using System.Text.Json;
 using EthSignal.Domain.Models;
 using EthSignal.Infrastructure.Db;
 using Microsoft.Extensions.Logging;
@@ -186,6 +187,19 @@ public sealed class TradeExecutionService : ITradeExecutionService
 
         try
         {
+            _logger.LogInformation(
+                "[TradeExecution] Placing {SourceType} signal {SignalId} on {Epic} | Direction={Direction} Size={Size} RequestedEntry={RequestedEntry} MarketEntry={MarketEntry} Stop={Stop} Profit={Profit} Note={ValidationNote}",
+                candidate.SourceType,
+                candidate.SignalId,
+                plan.Epic,
+                candidate.Direction,
+                plan.FinalSize,
+                plan.RequestedEntryPrice,
+                plan.MarketEntryPrice,
+                plan.StopLevel,
+                plan.ProfitLevel,
+                plan.ValidationNote);
+
             var openResult = await _capitalClient.PlacePositionAsync(new CapitalPlacePositionRequest
             {
                 Epic = plan.Epic,
@@ -227,73 +241,128 @@ public sealed class TradeExecutionService : ITradeExecutionService
                 brokerPayload: confirmation.DealId,
                 ct);
 
-            if (!confirmation.Accepted || string.IsNullOrWhiteSpace(confirmation.DealId))
+            if (confirmation.Accepted && !string.IsNullOrWhiteSpace(confirmation.DealId))
             {
-                var failedTrade = submittedTrade with
+                var actualEntry = confirmation.Level ?? plan.MarketEntryPrice;
+                var openTrade = submittedTrade with
                 {
-                    Status = ExecutedTradeStatus.Rejected,
-                    FailureReason = confirmation.RejectionReason ?? "Deal confirmation rejected.",
-                    ErrorDetails = confirmation.Note,
+                    DealId = confirmation.DealId,
+                    ActualEntryPrice = actualEntry,
+                    ExecutedSize = confirmation.Size ?? plan.FinalSize,
+                    Status = ExecutedTradeStatus.Open,
+                    OpenedAtUtc = DateTimeOffset.UtcNow,
                     UpdatedAtUtc = DateTimeOffset.UtcNow
                 };
-                await _repository.UpdateExecutedTradeAsync(failedTrade, ct);
+                await _repository.UpdateExecutedTradeAsync(openTrade, ct);
                 await _repository.InsertExecutionEventAsync(
                     executedTradeId,
                     candidate.SignalId,
                     candidate.SourceType,
-                    "execution_rejected",
-                    failedTrade.FailureReason ?? "Deal rejected.",
+                    "execution_opened",
+                    $"Deal {confirmation.DealId} confirmed open.",
                     null,
                     ct);
-                _runtimeState.RecordBrokerError(failedTrade.FailureReason ?? "Deal confirmation rejected.");
+                _logger.LogInformation(
+                    "[TradeExecution] {SourceType} signal {SignalId} opened immediately on broker deal {DealId}",
+                    candidate.SourceType,
+                    candidate.SignalId,
+                    confirmation.DealId);
 
                 return new TradeExecutionResult
                 {
-                    Success = false,
+                    Success = true,
                     ExecutedTradeId = executedTradeId,
-                    Status = ExecutedTradeStatus.Rejected,
+                    Status = ExecutedTradeStatus.Open,
                     DealReference = openResult.DealReference,
-                    FailureReason = failedTrade.FailureReason,
-                    ErrorDetails = failedTrade.ErrorDetails,
-                    Message = failedTrade.FailureReason ?? "Deal confirmation rejected."
+                    DealId = confirmation.DealId,
+                    ActualEntryPrice = actualEntry,
+                    ExecutedSize = confirmation.Size ?? plan.FinalSize,
+                    Message = $"Trade opened on Capital.com demo account '{executionAccount.AccountName}'."
                 };
             }
 
-            var actualEntry = confirmation.Level ?? plan.MarketEntryPrice;
-            var openTrade = submittedTrade with
+            if (ConfirmationStillPending(confirmation))
             {
-                DealId = confirmation.DealId,
-                ActualEntryPrice = actualEntry,
-                ExecutedSize = confirmation.Size ?? plan.FinalSize,
-                Status = ExecutedTradeStatus.Open,
-                OpenedAtUtc = DateTimeOffset.UtcNow,
+                var pendingConfirmationTrade = submittedTrade with
+                {
+                    DealId = confirmation.DealId ?? submittedTrade.DealId,
+                    UpdatedAtUtc = DateTimeOffset.UtcNow
+                };
+                await _repository.UpdateExecutedTradeAsync(pendingConfirmationTrade, ct);
+                await _repository.InsertExecutionEventAsync(
+                    executedTradeId,
+                    candidate.SignalId,
+                    candidate.SourceType,
+                    "execution_pending_confirmation",
+                    "Broker accepted the request but the position has not become open yet.",
+                    JsonSerializer.Serialize(new
+                    {
+                        confirmation.Status,
+                        confirmation.DealStatus,
+                        confirmation.DealId,
+                        confirmation.Note
+                    }),
+                    ct);
+                _logger.LogInformation(
+                    "[TradeExecution] {SourceType} signal {SignalId} stored as {Status}; awaiting broker open confirmation (DealReference={DealReference}, DealStatus={DealStatus}, Status={BrokerStatus})",
+                    candidate.SourceType,
+                    candidate.SignalId,
+                    pendingConfirmationTrade.Status,
+                    openResult.DealReference,
+                    confirmation.DealStatus,
+                    confirmation.Status);
+
+                return new TradeExecutionResult
+                {
+                    Success = true,
+                    ExecutedTradeId = executedTradeId,
+                    Status = pendingConfirmationTrade.Status,
+                    DealReference = openResult.DealReference,
+                    DealId = pendingConfirmationTrade.DealId,
+                    Message = $"Trade submitted to Capital.com demo account '{executionAccount.AccountName}' and is awaiting broker confirmation."
+                };
+            }
+
+            var failedTrade = submittedTrade with
+            {
+                Status = ExecutedTradeStatus.Rejected,
+                FailureReason = confirmation.RejectionReason ?? "Deal confirmation rejected.",
+                ErrorDetails = confirmation.Note,
                 UpdatedAtUtc = DateTimeOffset.UtcNow
             };
-            await _repository.UpdateExecutedTradeAsync(openTrade, ct);
+            await _repository.UpdateExecutedTradeAsync(failedTrade, ct);
             await _repository.InsertExecutionEventAsync(
                 executedTradeId,
                 candidate.SignalId,
                 candidate.SourceType,
-                "execution_opened",
-                $"Deal {confirmation.DealId} confirmed open.",
+                "execution_rejected",
+                failedTrade.FailureReason ?? "Deal rejected.",
                 null,
                 ct);
+            _runtimeState.RecordBrokerError(failedTrade.FailureReason ?? "Deal confirmation rejected.");
 
             return new TradeExecutionResult
             {
-                Success = true,
+                Success = false,
                 ExecutedTradeId = executedTradeId,
-                Status = ExecutedTradeStatus.Open,
+                Status = ExecutedTradeStatus.Rejected,
                 DealReference = openResult.DealReference,
-                DealId = confirmation.DealId,
-                ActualEntryPrice = actualEntry,
-                ExecutedSize = confirmation.Size ?? plan.FinalSize,
-                Message = $"Trade opened on Capital.com demo account '{executionAccount.AccountName}'."
+                FailureReason = failedTrade.FailureReason,
+                ErrorDetails = failedTrade.ErrorDetails,
+                Message = failedTrade.FailureReason ?? "Deal confirmation rejected."
             };
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "[TradeExecution] Failed to execute signal {SignalId} ({SourceType})", candidate.SignalId, candidate.SourceType);
+            _logger.LogError(
+                ex,
+                "[TradeExecution] Failed to execute signal {SignalId} ({SourceType}) | Direction={Direction} RequestedEntry={RequestedEntry} SignalStop={SignalStop} SignalProfit={SignalProfit}",
+                candidate.SignalId,
+                candidate.SourceType,
+                candidate.Direction,
+                candidate.RecommendedEntryPrice,
+                candidate.SlPrice,
+                candidate.TpPrice);
             _runtimeState.RecordBrokerError(ex.Message);
 
             var failedTrade = pendingTrade with
@@ -407,10 +476,16 @@ public sealed class TradeExecutionService : ITradeExecutionService
             var pnl = closeLevel.HasValue
                 ? ComputePnl(trade.Direction, trade.ActualEntryPrice, closeLevel.Value, trade.ExecutedSize)
                 : trade.Pnl;
+            var terminalStatus = pnl switch
+            {
+                > 0m => ExecutedTradeStatus.Win,
+                < 0m => ExecutedTradeStatus.Loss,
+                _ => ExecutedTradeStatus.Closed
+            };
 
             var closedTrade = pendingClose with
             {
-                Status = ExecutedTradeStatus.Closed,
+                Status = terminalStatus,
                 ForceClosed = true,
                 CloseSource = TradeCloseSource.User,
                 ClosedAtUtc = DateTimeOffset.UtcNow,
@@ -460,4 +535,19 @@ public sealed class TradeExecutionService : ITradeExecutionService
         => direction == SignalDirection.BUY
             ? (exit - entry) * size
             : (entry - exit) * size;
+
+    private static bool ConfirmationStillPending(CapitalDealConfirmation confirmation)
+    {
+        if (confirmation.Accepted && string.IsNullOrWhiteSpace(confirmation.DealId))
+            return true;
+
+        var dealStatus = Normalize(confirmation.DealStatus);
+        var status = Normalize(confirmation.Status);
+        return string.IsNullOrWhiteSpace(confirmation.DealId)
+            && (dealStatus is "PENDING" or "CREATED" or "UNKNOWN"
+                || status is "PENDING" or "CREATED" or "QUEUED");
+    }
+
+    private static string Normalize(string? value)
+        => value?.Trim().Replace("-", "_", StringComparison.Ordinal).ToUpperInvariant() ?? "";
 }

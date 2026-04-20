@@ -545,6 +545,12 @@ internal sealed class StubCapitalClient : ICapitalClient
     public Task<IReadOnlyList<CapitalPositionSnapshot>> GetOpenPositionsAsync(CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<CapitalPositionSnapshot>>(Array.Empty<CapitalPositionSnapshot>());
 
+    public Task<CapitalPositionSnapshot?> GetPositionAsync(string dealId, CancellationToken ct = default) =>
+        Task.FromResult((CapitalPositionSnapshot?)null);
+
+    public Task<IReadOnlyList<CapitalActivityRecord>> GetActivityHistoryAsync(CapitalActivityQuery query, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<CapitalActivityRecord>>(Array.Empty<CapitalActivityRecord>());
+
     public Task<CapitalClosePositionResult> ClosePositionAsync(CapitalClosePositionRequest request, CancellationToken ct = default) =>
         Task.FromResult(new CapitalClosePositionResult
         {

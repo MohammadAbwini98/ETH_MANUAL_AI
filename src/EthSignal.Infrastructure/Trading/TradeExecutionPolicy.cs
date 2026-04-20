@@ -27,7 +27,7 @@ public sealed class TradeExecutionPolicy : ITradeExecutionPolicy
 
     public TradeExecutionPolicySettings GetSettings()
     {
-        var allowed = (_config["CapitalTrading:AllowedSourceTypes"] ?? "Recommended")
+        var allowed = (_config["CapitalTrading:AllowedSourceTypes"] ?? "Recommended,Generated,Blocked")
             .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Select(v => Enum.TryParse<SignalExecutionSourceType>(v, true, out var parsed) ? parsed : (SignalExecutionSourceType?)null)
             .Where(v => v.HasValue)
@@ -35,7 +35,11 @@ public sealed class TradeExecutionPolicy : ITradeExecutionPolicy
             .ToHashSet();
 
         if (allowed.Count == 0)
+        {
             allowed.Add(SignalExecutionSourceType.Recommended);
+            allowed.Add(SignalExecutionSourceType.Generated);
+            allowed.Add(SignalExecutionSourceType.Blocked);
+        }
 
         return new TradeExecutionPolicySettings
         {
@@ -44,6 +48,9 @@ public sealed class TradeExecutionPolicy : ITradeExecutionPolicy
             DemoOnly = GetBool("CapitalTrading:DemoOnly", true),
             StaleWindowMinutes = GetInt("CapitalTrading:StaleWindowMinutes", 30),
             EntryDriftTolerancePct = GetDecimal("CapitalTrading:EntryDriftTolerancePct", 0.005m),
+            EntryPriceMarginUsd = GetDecimal("CapitalTrading:EntryPriceMarginUsd", 1m),
+            QueueConcurrentRequestLimit = GetInt("CapitalTrading:QueueConcurrentRequestLimit", 3),
+            QueueCooldownMilliseconds = GetInt("CapitalTrading:QueueCooldownMilliseconds", 500),
             MaxConcurrentOpenTrades = GetInt("CapitalTrading:MaxConcurrentOpenTrades", 3),
             EntryMode = Enum.TryParse<TradeEntryMode>(_config["CapitalTrading:EntryMode"], true, out var mode)
                 ? mode
@@ -65,6 +72,9 @@ public sealed class TradeExecutionPolicy : ITradeExecutionPolicy
 
         if (!settings.AllowedSourceTypes.Contains(candidate.SourceType))
             return Reject($"Source type {candidate.SourceType} is not allowed by execution policy.", "SourceTypeNotAllowed");
+
+        if (IsExcludedExecutionTimeframe(candidate.Timeframe))
+            return Reject($"Timeframe {candidate.Timeframe} is excluded from broker execution.", "TimeframeNotAllowed");
 
         if (candidate.Direction is not (SignalDirection.BUY or SignalDirection.SELL))
             return Reject("Only BUY and SELL signals are executable.", "InvalidDirection");
@@ -96,18 +106,19 @@ public sealed class TradeExecutionPolicy : ITradeExecutionPolicy
                 "UnexpectedDemoAccount");
         }
 
-        var openTrades = await _tradeRepo.GetOpenExecutedTradeCountAsync(new ExecutedTradeQuery
+        var activeTrades = await _tradeRepo.GetActiveExecutedTradeCountAsync(new ExecutedTradeQuery
         {
             AccountId = account.AccountId,
             AccountName = account.AccountName,
             IsDemo = settings.DemoOnly ? true : null
         }, ct);
-        if (openTrades >= settings.MaxConcurrentOpenTrades)
-            return Reject($"Max concurrent open trades reached ({openTrades}/{settings.MaxConcurrentOpenTrades}).", "MaxConcurrentOpenTrades");
+        if (activeTrades >= settings.MaxConcurrentOpenTrades)
+            return Reject($"Max concurrent open trades reached ({activeTrades}/{settings.MaxConcurrentOpenTrades}).", "MaxConcurrentOpenTrades");
 
-        var requestedSize = request.RequestedSize.GetValueOrDefault(market.MinDealSize);
+        var configuredDefaultSize = GetDecimal("CapitalTrading:DefaultTradeSize", 0.05m);
+        var requestedSize = request.RequestedSize.GetValueOrDefault(configuredDefaultSize);
         if (requestedSize <= 0)
-            requestedSize = market.MinDealSize;
+            requestedSize = configuredDefaultSize > 0 ? configuredDefaultSize : market.MinDealSize;
         var finalSize = RoundSize(requestedSize, market.MinDealSize, market.MinSizeIncrement);
         if (finalSize < market.MinDealSize)
             finalSize = market.MinDealSize;
@@ -119,16 +130,18 @@ public sealed class TradeExecutionPolicy : ITradeExecutionPolicy
         var driftPct = candidate.RecommendedEntryPrice > 0
             ? Math.Abs(marketEntry - candidate.RecommendedEntryPrice) / candidate.RecommendedEntryPrice
             : decimal.MaxValue;
+        var driftUsd = Math.Abs(marketEntry - candidate.RecommendedEntryPrice);
 
         var entryMode = request.ForceMarketExecution ? TradeEntryMode.MarketNow : settings.EntryMode;
-        if (entryMode != TradeEntryMode.MarketNow && driftPct > settings.EntryDriftTolerancePct)
+        if (entryMode != TradeEntryMode.MarketNow
+            && (driftPct > settings.EntryDriftTolerancePct || driftUsd > settings.EntryPriceMarginUsd))
             return Reject(
-                $"Price drift {driftPct:P2} exceeds tolerance {settings.EntryDriftTolerancePct:P2}.",
+                $"Price drift {driftPct:P2} / {driftUsd:F2} USD exceeds tolerance {settings.EntryDriftTolerancePct:P2} and +/-{settings.EntryPriceMarginUsd:F2} USD.",
                 "EntryDriftExceeded");
 
         var stopLevel = candidate.SlPrice;
         var profitLevel = candidate.TpPrice;
-        var note = "Using persisted signal TP/SL as source of truth.";
+        var note = $"Using persisted signal TP/SL as source of truth. Entry execution band is +/-{settings.EntryPriceMarginUsd:F2} USD around the signal entry.";
 
         if (!LevelsAreDirectional(candidate.Direction, marketEntry, profitLevel, stopLevel))
         {
@@ -144,6 +157,26 @@ public sealed class TradeExecutionPolicy : ITradeExecutionPolicy
         var minDistance = ResolveDistance(marketEntry, market.MinStopOrProfitDistance, market.MinStopOrProfitDistanceUnit);
         if (Math.Abs(profitLevel - marketEntry) < minDistance || Math.Abs(stopLevel - marketEntry) < minDistance)
             return Reject($"TP/SL are too close to market price; minimum distance is {minDistance:F4}.", "TpSlTooClose");
+
+        var brokerAdjusted = EnforceBrokerSideBounds(
+            candidate.Direction,
+            profitLevel,
+            stopLevel,
+            market.Bid,
+            market.Offer,
+            minDistance,
+            market.DecimalPlaces);
+        profitLevel = brokerAdjusted.ProfitLevel;
+        stopLevel = brokerAdjusted.StopLevel;
+        if (!string.IsNullOrWhiteSpace(brokerAdjusted.Note))
+            note = $"{note} {brokerAdjusted.Note}".Trim();
+
+        if (!LevelsAreDirectional(candidate.Direction, marketEntry, profitLevel, stopLevel))
+        {
+            return Reject(
+                "TP/SL could not be normalized into Capital.com's current bid/offer bounds without breaking trade directionality.",
+                "BrokerBoundsInvalid");
+        }
 
         var estimatedMargin = market.MarginFactor > 0
             ? marketEntry * finalSize * (market.MarginFactorUnit.Equals("PERCENTAGE", StringComparison.OrdinalIgnoreCase)
@@ -189,6 +222,9 @@ public sealed class TradeExecutionPolicy : ITradeExecutionPolicy
     private decimal GetDecimal(string key, decimal fallback)
         => decimal.TryParse(_config[key], out var value) ? value : fallback;
 
+    private static bool IsExcludedExecutionTimeframe(string? timeframe)
+        => string.Equals(timeframe?.Trim(), "1m", StringComparison.OrdinalIgnoreCase);
+
     private static TradeExecutionPolicyDecision Reject(string message, string failureReason) => new()
     {
         Allowed = false,
@@ -227,4 +263,61 @@ public sealed class TradeExecutionPolicy : ITradeExecutionPolicy
             return price;
         return Math.Round(price, decimals, MidpointRounding.AwayFromZero);
     }
+
+    private static BrokerLevelAdjustment EnforceBrokerSideBounds(
+        SignalDirection direction,
+        decimal profitLevel,
+        decimal stopLevel,
+        decimal bid,
+        decimal offer,
+        decimal minDistance,
+        int decimalPlaces)
+    {
+        if (minDistance <= 0 || bid <= 0 || offer <= 0)
+            return new BrokerLevelAdjustment(profitLevel, stopLevel, null);
+
+        var tick = decimalPlaces > 0
+            ? 1m / (decimal)Math.Pow(10, decimalPlaces)
+            : 1m;
+        var noteParts = new List<string>(2);
+
+        if (direction == SignalDirection.BUY)
+        {
+            var maxStop = RoundPrice(bid - minDistance - tick, decimalPlaces);
+            var minProfit = RoundPrice(offer + minDistance + tick, decimalPlaces);
+
+            if (stopLevel >= maxStop)
+            {
+                stopLevel = maxStop;
+                noteParts.Add($"Stop normalized to broker max BUY stop {maxStop.ToString($"F{Math.Max(0, decimalPlaces)}")}.");
+            }
+
+            if (profitLevel <= minProfit)
+            {
+                profitLevel = minProfit;
+                noteParts.Add($"Profit normalized to broker min BUY limit {minProfit.ToString($"F{Math.Max(0, decimalPlaces)}")}.");
+            }
+        }
+        else if (direction == SignalDirection.SELL)
+        {
+            var minStop = RoundPrice(offer + minDistance + tick, decimalPlaces);
+            var maxProfit = RoundPrice(bid - minDistance - tick, decimalPlaces);
+
+            if (stopLevel <= minStop)
+            {
+                stopLevel = minStop;
+                noteParts.Add($"Stop normalized to broker min SELL stop {minStop.ToString($"F{Math.Max(0, decimalPlaces)}")}.");
+            }
+
+            if (profitLevel >= maxProfit)
+            {
+                profitLevel = maxProfit;
+                noteParts.Add($"Profit normalized to broker max SELL limit {maxProfit.ToString($"F{Math.Max(0, decimalPlaces)}")}.");
+            }
+        }
+
+        return new BrokerLevelAdjustment(profitLevel, stopLevel, noteParts.Count == 0 ? null : string.Join(" ", noteParts));
+    }
+
+    private sealed record BrokerLevelAdjustment(decimal ProfitLevel, decimal StopLevel, string? Note);
 }

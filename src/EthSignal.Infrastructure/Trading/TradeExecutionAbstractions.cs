@@ -10,6 +10,9 @@ public sealed record TradeExecutionPolicySettings
     public bool DemoOnly { get; init; } = true;
     public int StaleWindowMinutes { get; init; } = 30;
     public decimal EntryDriftTolerancePct { get; init; } = 0.005m;
+    public decimal EntryPriceMarginUsd { get; init; } = 1m;
+    public int QueueConcurrentRequestLimit { get; init; } = 3;
+    public int QueueCooldownMilliseconds { get; init; } = 500;
     public int MaxConcurrentOpenTrades { get; init; } = 3;
     public TradeEntryMode EntryMode { get; init; } = TradeEntryMode.NearRecommendedEntry;
     public ISet<SignalExecutionSourceType> AllowedSourceTypes { get; init; } =
@@ -66,6 +69,57 @@ public interface ITradeExecutionService
     Task<ForceCloseResult> ForceCloseAsync(long executedTradeId, ForceCloseRequest request, CancellationToken ct = default);
 }
 
+public sealed record TradeExecutionQueueResult
+{
+    public bool Accepted { get; init; }
+    public long? QueueEntryId { get; init; }
+    public long? ExecutedTradeId { get; init; }
+    public required string Status { get; init; }
+    public string? FailureReason { get; init; }
+    public required string Message { get; init; }
+}
+
+public sealed record TradeExecutionQueueEntrySnapshot
+{
+    public long QueueEntryId { get; init; }
+    public required Guid SignalId { get; init; }
+    public Guid? EvaluationId { get; init; }
+    public required SignalExecutionSourceType SourceType { get; init; }
+    public required string RequestedBy { get; init; }
+    public decimal? RequestedSize { get; init; }
+    public bool ForceMarketExecution { get; init; }
+    public required TradeExecutionQueueStatus Status { get; init; }
+    public long? ExecutedTradeId { get; init; }
+    public string? FailureReason { get; init; }
+    public string? ErrorDetails { get; init; }
+    public DateTimeOffset CreatedAtUtc { get; init; }
+    public DateTimeOffset UpdatedAtUtc { get; init; }
+    public DateTimeOffset? ProcessedAtUtc { get; init; }
+    public double AgeSeconds { get; init; }
+    public double WaitSeconds { get; init; }
+}
+
+public sealed record TradeExecutionQueueSnapshot
+{
+    public required DateTimeOffset ServerTimeUtc { get; init; }
+    public int ActiveTradeCount { get; init; }
+    public int MaxConcurrentOpenTrades { get; init; }
+    public int QueueConcurrentRequestLimit { get; init; }
+    public int QueueCooldownMilliseconds { get; init; }
+    public int QueuedCount { get; init; }
+    public int ProcessingCount { get; init; }
+    public int CompletedCount { get; init; }
+    public int FailedCount { get; init; }
+    public required IReadOnlyList<TradeExecutionQueueEntrySnapshot> Entries { get; init; }
+}
+
+public interface ITradeExecutionQueueService
+{
+    Task<TradeExecutionQueueResult> EnqueueAsync(TradeExecutionRequest request, CancellationToken ct = default);
+    Task<int> DrainAsync(CancellationToken ct = default);
+    Task<TradeExecutionQueueSnapshot> GetSnapshotAsync(int limit = 50, CancellationToken ct = default);
+}
+
 public interface ITradeExecutionPolicy
 {
     Task<TradeExecutionPolicyDecision> EvaluateAsync(TradeExecutionRequest request, CancellationToken ct = default);
@@ -93,6 +147,8 @@ public interface ICapitalTradingClient
     Task<CapitalOpenPositionResult> PlacePositionAsync(CapitalPlacePositionRequest request, CancellationToken ct = default);
     Task<CapitalDealConfirmation> ConfirmDealAsync(string dealReference, CancellationToken ct = default);
     Task<IReadOnlyList<CapitalPositionSnapshot>> GetOpenPositionsAsync(CancellationToken ct = default);
+    Task<CapitalPositionSnapshot?> GetPositionAsync(string dealId, CancellationToken ct = default);
+    Task<IReadOnlyList<CapitalActivityRecord>> GetActivityHistoryAsync(CapitalActivityQuery query, CancellationToken ct = default);
     Task<CapitalClosePositionResult> ClosePositionAsync(CapitalClosePositionRequest request, CancellationToken ct = default);
 }
 
@@ -173,6 +229,7 @@ public sealed record CapitalAccountInfo
 public sealed record CapitalPositionSnapshot
 {
     public required string DealId { get; init; }
+    public string? DealReference { get; init; }
     public required string Epic { get; init; }
     public required SignalDirection Direction { get; init; }
     public decimal Size { get; init; }
@@ -180,4 +237,27 @@ public sealed record CapitalPositionSnapshot
     public decimal? StopLevel { get; init; }
     public decimal? ProfitLevel { get; init; }
     public string Currency { get; init; } = "";
+}
+
+public sealed record CapitalActivityQuery
+{
+    public DateTimeOffset? FromUtc { get; init; }
+    public DateTimeOffset? ToUtc { get; init; }
+    public int? LastPeriodSeconds { get; init; }
+    public string? DealId { get; init; }
+    public bool Detailed { get; init; } = true;
+}
+
+public sealed record CapitalActivityRecord
+{
+    public required DateTimeOffset DateUtc { get; init; }
+    public string? Epic { get; init; }
+    public string? DealId { get; init; }
+    public string? Source { get; init; }
+    public string? Type { get; init; }
+    public string? Status { get; init; }
+    public decimal? Level { get; init; }
+    public decimal? Size { get; init; }
+    public string? Currency { get; init; }
+    public string? DetailsJson { get; init; }
 }

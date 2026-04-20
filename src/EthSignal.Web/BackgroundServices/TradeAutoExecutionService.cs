@@ -13,7 +13,7 @@ public sealed class TradeAutoExecutionService : BackgroundService
     private readonly IGeneratedSignalHistoryService _generatedHistory;
     private readonly IExecutionCandidateMapper _mapper;
     private readonly ITradeExecutionPolicy _policy;
-    private readonly ITradeExecutionService _executionService;
+    private readonly ITradeExecutionQueueService _queueService;
     private readonly IExecutedTradeRepository _executedTradeRepository;
     private readonly IPortalOverridesRepository _portalOverridesRepository;
     private readonly ILogger<TradeAutoExecutionService> _logger;
@@ -27,7 +27,7 @@ public sealed class TradeAutoExecutionService : BackgroundService
         IGeneratedSignalHistoryService generatedHistory,
         IExecutionCandidateMapper mapper,
         ITradeExecutionPolicy policy,
-        ITradeExecutionService executionService,
+        ITradeExecutionQueueService queueService,
         IExecutedTradeRepository executedTradeRepository,
         IPortalOverridesRepository portalOverridesRepository,
         ILogger<TradeAutoExecutionService> logger)
@@ -38,7 +38,7 @@ public sealed class TradeAutoExecutionService : BackgroundService
         _generatedHistory = generatedHistory;
         _mapper = mapper;
         _policy = policy;
-        _executionService = executionService;
+        _queueService = queueService;
         _executedTradeRepository = executedTradeRepository;
         _portalOverridesRepository = portalOverridesRepository;
         _logger = logger;
@@ -129,16 +129,37 @@ public sealed class TradeAutoExecutionService : BackgroundService
         }
 
         foreach (var candidate in candidates
-                     .OrderByDescending(c => c.SignalTimeUtc))
+                     .OrderBy(c => c.SignalTimeUtc))
         {
             if (DateTimeOffset.UtcNow - candidate.SignalTimeUtc > TimeSpan.FromMinutes(settings.StaleWindowMinutes))
+            {
+                _logger.LogInformation(
+                    "[TradeAutoExecution] Skipping {SourceType} signal {SignalId} because it is stale ({AgeMinutes:F1}m > {StaleWindowMinutes}m)",
+                    candidate.SourceType,
+                    candidate.SignalId,
+                    (DateTimeOffset.UtcNow - candidate.SignalTimeUtc).TotalMinutes,
+                    settings.StaleWindowMinutes);
                 continue;
+            }
 
             var existing = await _executedTradeRepository.GetBySourceSignalAsync(candidate.SignalId, candidate.SourceType, ct);
             if (existing != null)
+            {
+                _logger.LogInformation(
+                    "[TradeAutoExecution] Skipping {SourceType} signal {SignalId} because execution record {TradeId} already exists with status {Status}",
+                    candidate.SourceType,
+                    candidate.SignalId,
+                    existing.ExecutedTradeId,
+                    existing.Status);
                 continue;
+            }
 
-            var result = await _executionService.ExecuteAsync(new TradeExecutionRequest
+            _logger.LogInformation(
+                "[TradeAutoExecution] {SourceType} signal {SignalId} entered execution queue",
+                candidate.SourceType,
+                candidate.SignalId);
+
+            var result = await _queueService.EnqueueAsync(new TradeExecutionRequest
             {
                 Candidate = candidate,
                 RequestedBy = "auto-executor"
@@ -146,7 +167,7 @@ public sealed class TradeAutoExecutionService : BackgroundService
 
             _logger.LogInformation(
                 "[TradeAutoExecution] Source={Source} SignalId={SignalId} Status={Status} Success={Success}",
-                candidate.SourceType, candidate.SignalId, result.Status, result.Success);
+                candidate.SourceType, candidate.SignalId, result.Status, result.Accepted);
         }
     }
 }

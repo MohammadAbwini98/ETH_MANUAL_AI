@@ -311,20 +311,73 @@ public sealed class CapitalClient : ICapitalClient
         var payload = await SendAuthorizedGetAsync("positions", ct);
         var data = JsonSerializer.Deserialize<OpenPositionsResponse>(payload, JsonOpts) ?? new OpenPositionsResponse();
         return data.Positions
-            .Select(p => new CapitalPositionSnapshot
-            {
-                DealId = p.Position?.DealId ?? "",
-                Epic = p.Market?.Epic ?? p.Position?.Epic ?? "",
-                Direction = Enum.TryParse<SignalDirection>(p.Position?.Direction ?? "", true, out var dir)
-                    ? dir
-                    : SignalDirection.NO_TRADE,
-                Size = p.Position?.Size ?? 0m,
-                Level = p.Position?.Level ?? 0m,
-                StopLevel = p.Position?.StopLevel,
-                ProfitLevel = p.Position?.ProfitLevel,
-                Currency = p.Market?.Currency ?? "USD"
-            })
+            .Select(MapPosition)
             .Where(p => !string.IsNullOrWhiteSpace(p.DealId))
+            .ToList();
+    }
+
+    public async Task<CapitalPositionSnapshot?> GetPositionAsync(string dealId, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(dealId))
+            return null;
+
+        await EnsureDemoReadyAsync(ct);
+        try
+        {
+            var payload = await SendAuthorizedGetAsync($"positions/{Uri.EscapeDataString(dealId)}", ct);
+            var data = JsonSerializer.Deserialize<SinglePositionResponse>(payload, JsonOpts);
+            if (data?.Position == null)
+                return null;
+
+            return MapPosition(new OpenPositionRow
+            {
+                Position = data.Position,
+                Market = data.Market
+            });
+        }
+        catch (InvalidOperationException ex) when (ex.Message.Contains("(404)", StringComparison.Ordinal))
+        {
+            return null;
+        }
+    }
+
+    public async Task<IReadOnlyList<CapitalActivityRecord>> GetActivityHistoryAsync(CapitalActivityQuery query, CancellationToken ct = default)
+    {
+        await EnsureDemoReadyAsync(ct);
+
+        var parts = new List<string>();
+        if (query.FromUtc.HasValue)
+            parts.Add($"from={Uri.EscapeDataString(query.FromUtc.Value.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture))}");
+        if (query.ToUtc.HasValue)
+            parts.Add($"to={Uri.EscapeDataString(query.ToUtc.Value.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture))}");
+        if (query.LastPeriodSeconds.HasValue)
+            parts.Add($"lastPeriod={Math.Max(1, query.LastPeriodSeconds.Value)}");
+        if (query.Detailed)
+            parts.Add("detailed=true");
+        if (!string.IsNullOrWhiteSpace(query.DealId))
+            parts.Add($"dealId={Uri.EscapeDataString(query.DealId)}");
+
+        var path = parts.Count > 0
+            ? $"history/activity?{string.Join("&", parts)}"
+            : "history/activity";
+        var payload = await SendAuthorizedGetAsync(path, ct);
+        var data = JsonSerializer.Deserialize<ActivityHistoryResponse>(payload, JsonOpts) ?? new ActivityHistoryResponse();
+
+        return data.Activities
+            .Select(activity => new CapitalActivityRecord
+            {
+                DateUtc = ParseActivityDateUtc(activity.DateUtc, activity.Date),
+                Epic = activity.Epic,
+                DealId = activity.DealId,
+                Source = activity.Source,
+                Type = activity.Type,
+                Status = activity.Status,
+                Level = activity.Level ?? activity.Details?.Level,
+                Size = activity.Size ?? activity.Details?.Size,
+                Currency = activity.Currency ?? activity.Details?.Currency,
+                DetailsJson = JsonSerializer.Serialize(activity, JsonOpts)
+            })
+            .OrderByDescending(activity => activity.DateUtc)
             .ToList();
     }
 
@@ -341,6 +394,40 @@ public sealed class CapitalClient : ICapitalClient
             DealReference = result.DealReference,
             Note = payload
         };
+    }
+
+    private static CapitalPositionSnapshot MapPosition(OpenPositionRow p) => new()
+    {
+        DealId = p.Position?.DealId ?? "",
+        DealReference = p.Position?.DealReference,
+        Epic = p.Market?.Epic ?? p.Position?.Epic ?? "",
+        Direction = Enum.TryParse<SignalDirection>(p.Position?.Direction ?? "", true, out var dir)
+            ? dir
+            : SignalDirection.NO_TRADE,
+        Size = p.Position?.Size ?? 0m,
+        Level = p.Position?.Level ?? 0m,
+        StopLevel = p.Position?.StopLevel,
+        ProfitLevel = p.Position?.ProfitLevel,
+        Currency = p.Market?.Currency ?? p.Position?.Currency ?? "USD"
+    };
+
+    private static DateTimeOffset ParseActivityDateUtc(string? dateUtc, string? date)
+    {
+        if (!string.IsNullOrWhiteSpace(dateUtc)
+            && DateTimeOffset.TryParse(dateUtc, CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var parsedUtc))
+        {
+            return parsedUtc;
+        }
+
+        if (!string.IsNullOrWhiteSpace(date)
+            && DateTimeOffset.TryParse(date, CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var parsed))
+        {
+            return parsed;
+        }
+
+        return DateTimeOffset.UtcNow;
     }
 
     private Sentiment _lastValidSentiment = new(0m, 0m);
@@ -726,6 +813,12 @@ public sealed class CapitalClient : ICapitalClient
         [JsonPropertyName("positions")] public List<OpenPositionRow> Positions { get; init; } = [];
     }
 
+    private class SinglePositionResponse
+    {
+        [JsonPropertyName("position")] public PositionRow? Position { get; init; }
+        [JsonPropertyName("market")] public PositionMarketRow? Market { get; init; }
+    }
+
     private class OpenPositionRow
     {
         [JsonPropertyName("position")] public PositionRow? Position { get; init; }
@@ -735,17 +828,46 @@ public sealed class CapitalClient : ICapitalClient
     private class PositionRow
     {
         [JsonPropertyName("dealId")] public string? DealId { get; init; }
+        [JsonPropertyName("dealReference")] public string? DealReference { get; init; }
         [JsonPropertyName("epic")] public string? Epic { get; init; }
         [JsonPropertyName("direction")] public string? Direction { get; init; }
         [JsonPropertyName("size")] public decimal? Size { get; init; }
         [JsonPropertyName("level")] public decimal? Level { get; init; }
         [JsonPropertyName("stopLevel")] public decimal? StopLevel { get; init; }
         [JsonPropertyName("profitLevel")] public decimal? ProfitLevel { get; init; }
+        [JsonPropertyName("currency")] public string? Currency { get; init; }
     }
 
     private class PositionMarketRow
     {
         [JsonPropertyName("epic")] public string? Epic { get; init; }
+        [JsonPropertyName("currency")] public string? Currency { get; init; }
+    }
+
+    private class ActivityHistoryResponse
+    {
+        [JsonPropertyName("activities")] public List<ActivityRow> Activities { get; init; } = [];
+    }
+
+    private class ActivityRow
+    {
+        [JsonPropertyName("date")] public string? Date { get; init; }
+        [JsonPropertyName("dateUTC")] public string? DateUtc { get; init; }
+        [JsonPropertyName("epic")] public string? Epic { get; init; }
+        [JsonPropertyName("dealId")] public string? DealId { get; init; }
+        [JsonPropertyName("source")] public string? Source { get; init; }
+        [JsonPropertyName("type")] public string? Type { get; init; }
+        [JsonPropertyName("status")] public string? Status { get; init; }
+        [JsonPropertyName("level")] public decimal? Level { get; init; }
+        [JsonPropertyName("size")] public decimal? Size { get; init; }
+        [JsonPropertyName("currency")] public string? Currency { get; init; }
+        [JsonPropertyName("details")] public ActivityDetailsRow? Details { get; init; }
+    }
+
+    private class ActivityDetailsRow
+    {
+        [JsonPropertyName("level")] public decimal? Level { get; init; }
+        [JsonPropertyName("size")] public decimal? Size { get; init; }
         [JsonPropertyName("currency")] public string? Currency { get; init; }
     }
 }

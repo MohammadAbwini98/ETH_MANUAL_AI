@@ -347,6 +347,33 @@ public sealed class DbMigrator : IDbMigrator
             ON ""ETH"".executed_trades (status, created_at_utc DESC);", ct);
 
         await Exec(conn, @"
+            CREATE TABLE IF NOT EXISTS ""ETH"".trade_execution_queue (
+                queue_entry_id            BIGSERIAL   PRIMARY KEY,
+                signal_id                 UUID        NOT NULL,
+                evaluation_id             UUID,
+                source_type               TEXT        NOT NULL,
+                requested_by              TEXT        NOT NULL DEFAULT 'system',
+                requested_size            NUMERIC,
+                force_market_execution    BOOLEAN     NOT NULL DEFAULT FALSE,
+                candidate_json            JSONB       NOT NULL DEFAULT '{}'::jsonb,
+                status                    TEXT        NOT NULL DEFAULT 'Queued',
+                executed_trade_id         BIGINT      REFERENCES ""ETH"".executed_trades(executed_trade_id) ON DELETE SET NULL,
+                failure_reason            TEXT,
+                error_details             TEXT,
+                created_at_utc            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at_utc            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                processed_at_utc          TIMESTAMPTZ
+            );", ct);
+
+        await Exec(conn, @"
+            CREATE INDEX IF NOT EXISTS idx_trade_execution_queue_status
+            ON ""ETH"".trade_execution_queue (status, created_at_utc ASC);", ct);
+
+        await Exec(conn, @"
+            CREATE INDEX IF NOT EXISTS idx_trade_execution_queue_signal
+            ON ""ETH"".trade_execution_queue (signal_id, source_type, created_at_utc DESC);", ct);
+
+        await Exec(conn, @"
             CREATE TABLE IF NOT EXISTS ""ETH"".execution_attempts (
                 attempt_id                BIGSERIAL   PRIMARY KEY,
                 executed_trade_id         BIGINT      REFERENCES ""ETH"".executed_trades(executed_trade_id) ON DELETE SET NULL,

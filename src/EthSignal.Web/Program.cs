@@ -264,6 +264,7 @@ try
     builder.Services.AddSingleton<IParameterRepository>(_ => new ParameterRepository(connString));
     builder.Services.AddSingleton<IPortalOverridesRepository>(_ => new PostgresPortalOverridesRepository(connString));
     builder.Services.AddSingleton<IExecutedTradeRepository>(_ => new ExecutedTradeRepository(connString));
+    builder.Services.AddSingleton<ITradeExecutionQueueRepository>(_ => new TradeExecutionQueueRepository(connString));
     builder.Services.AddSingleton<IReplayRepository>(_ => new ReplayRepository(connString));
     builder.Services.AddSingleton<IOptimizerRepository>(_ => new OptimizerRepository(connString));
     builder.Services.AddSingleton<IParameterProvider>(sp =>
@@ -305,10 +306,14 @@ try
     builder.Services.AddSingleton<IAccountSnapshotService, AccountSnapshotService>();
     builder.Services.AddSingleton<ITradeExecutionPolicy, TradeExecutionPolicy>();
     builder.Services.AddSingleton<ITradeExecutionService, TradeExecutionService>();
+    builder.Services.AddSingleton<ITradeExecutionQueueService, TradeExecutionQueueService>();
+    builder.Services.AddSingleton<TradeLifecycleReconciliationService>();
     builder.Services.AddSingleton<MlTrainingState>();
     builder.Services.AddSingleton<MlTrainingService>();
     builder.Services.AddHostedService(sp => sp.GetRequiredService<MlTrainingService>());
     builder.Services.AddHostedService<TradeAutoExecutionService>();
+    builder.Services.AddHostedService<TradeExecutionQueueWorkerService>();
+    builder.Services.AddHostedService<ExecutedTradeMonitorService>();
     builder.Services.AddHostedService<DataIngestionService>();
     // B-15: StopHost on unhandled exception so app doesn't run in degraded state
     builder.Services.Configure<HostOptions>(opts =>
@@ -706,17 +711,33 @@ try
         });
     });
 
-    app.MapGet("/api/signals/history", async (ISignalRepository repo, int? limit, int? page) =>
+    app.MapGet("/api/signals/history", async (ISignalRepository repo, IExecutedTradeRepository executedTradeRepository, int? limit, int? page, CancellationToken ct) =>
     {
         var pageNum = Math.Max(1, page ?? 1);
         var pageSize = Math.Clamp(limit ?? 50, 1, 500);
-        var signals = await repo.GetSignalHistoryWithOutcomesAsync(symbol, pageSize, (pageNum - 1) * pageSize);
+        var signals = await repo.GetSignalHistoryWithOutcomesAsync(symbol, pageSize, (pageNum - 1) * pageSize, ct);
+        var executionBySignal = await executedTradeRepository.GetLatestBySourceSignalsAsync(
+            signals.Select(s => s.Signal.SignalId).ToArray(),
+            SignalExecutionSourceType.Recommended,
+            ct);
         var total = await repo.GetSignalCountAsync(symbol);
-        return Results.Ok(new { signals, total, page = pageNum, pageSize });
+        return Results.Ok(new
+        {
+            signals = signals.Select(item => new
+            {
+                signal = item.Signal,
+                outcome = item.Outcome,
+                execution = executionBySignal.TryGetValue(item.Signal.SignalId, out var execution) ? execution : null
+            }),
+            total,
+            page = pageNum,
+            pageSize
+        });
     });
 
     app.MapGet("/api/blocked-signals/history", async (
         IBlockedSignalHistoryService blockedSignalHistory,
+        IExecutedTradeRepository executedTradeRepository,
         int? limit,
         int? page,
         CancellationToken ct) =>
@@ -724,9 +745,18 @@ try
         var pageNum = Math.Max(1, page ?? 1);
         var pageSize = Math.Clamp(limit ?? 50, 1, 2000);
         var result = await blockedSignalHistory.GetHistoryAsync(symbol, pageSize, (pageNum - 1) * pageSize, ct);
+        var executionBySignal = await executedTradeRepository.GetLatestBySourceSignalsAsync(
+            result.Signals.Select(s => s.Signal.SignalId).ToArray(),
+            SignalExecutionSourceType.Blocked,
+            ct);
         return Results.Ok(new
         {
-            signals = result.Signals,
+            signals = result.Signals.Select(item => new
+            {
+                signal = item.Signal,
+                outcome = item.Outcome,
+                execution = executionBySignal.TryGetValue(item.Signal.SignalId, out var execution) ? execution : null
+            }),
             stats = result.Stats,
             total = result.Total,
             page = result.Page,
@@ -736,6 +766,7 @@ try
 
     app.MapGet("/api/generated-signals/history", async (
         IGeneratedSignalHistoryService generatedSignalHistory,
+        IExecutedTradeRepository executedTradeRepository,
         int? limit,
         int? page,
         int? hours,
@@ -744,9 +775,18 @@ try
         var pageNum = Math.Max(1, page ?? 1);
         var pageSize = Math.Clamp(limit ?? 50, 1, 2000);
         var result = await generatedSignalHistory.GetHistoryAsync(symbol, pageSize, (pageNum - 1) * pageSize, hours, ct);
+        var executionBySignal = await executedTradeRepository.GetLatestBySourceSignalsAsync(
+            result.Signals.Select(s => s.Signal.SignalId).ToArray(),
+            SignalExecutionSourceType.Generated,
+            ct);
         return Results.Ok(new
         {
-            signals = result.Signals,
+            signals = result.Signals.Select(item => new
+            {
+                signal = item.Signal,
+                outcome = item.Outcome,
+                execution = executionBySignal.TryGetValue(item.Signal.SignalId, out var execution) ? execution : null
+            }),
             stats = result.Stats,
             total = result.Total,
             page = result.Page,
@@ -809,18 +849,18 @@ try
         HttpContext ctx,
         ISignalRepository signalRepository,
         IExecutionCandidateMapper mapper,
-        ITradeExecutionService executionService,
+        ITradeExecutionQueueService queueService,
         CancellationToken ct) =>
     {
         if (RejectIfNotLoopback(ctx) is { } reject) return reject;
         var signal = await signalRepository.GetSignalByIdAsync(signalId, ct);
         if (signal == null) return Results.NotFound(new { error = "Signal not found." });
-        var result = await executionService.ExecuteAsync(new TradeExecutionRequest
+        var result = await queueService.EnqueueAsync(new TradeExecutionRequest
         {
             Candidate = mapper.FromRecommended(signal),
             RequestedBy = "dashboard"
         }, ct);
-        return result.Success ? Results.Ok(result) : Results.BadRequest(result);
+        return result.Accepted ? Results.Ok(result) : Results.BadRequest(result);
     });
 
     app.MapPost("/api/executed-trades/execute-generated/{signalId:guid}", async (
@@ -828,18 +868,18 @@ try
         HttpContext ctx,
         IGeneratedSignalHistoryService generatedHistory,
         IExecutionCandidateMapper mapper,
-        ITradeExecutionService executionService,
+        ITradeExecutionQueueService queueService,
         CancellationToken ct) =>
     {
         if (RejectIfNotLoopback(ctx) is { } reject) return reject;
         var signal = await generatedHistory.GetBySignalIdAsync(symbol, signalId, ct);
         if (signal == null) return Results.NotFound(new { error = "Generated signal not found." });
-        var result = await executionService.ExecuteAsync(new TradeExecutionRequest
+        var result = await queueService.EnqueueAsync(new TradeExecutionRequest
         {
             Candidate = mapper.FromGenerated(signal.Signal),
             RequestedBy = "dashboard"
         }, ct);
-        return result.Success ? Results.Ok(result) : Results.BadRequest(result);
+        return result.Accepted ? Results.Ok(result) : Results.BadRequest(result);
     });
 
     app.MapPost("/api/executed-trades/execute-blocked/{signalId:guid}", async (
@@ -847,18 +887,18 @@ try
         HttpContext ctx,
         IBlockedSignalHistoryService blockedHistory,
         IExecutionCandidateMapper mapper,
-        ITradeExecutionService executionService,
+        ITradeExecutionQueueService queueService,
         CancellationToken ct) =>
     {
         if (RejectIfNotLoopback(ctx) is { } reject) return reject;
         var signal = await blockedHistory.GetBySignalIdAsync(symbol, signalId, ct);
         if (signal == null) return Results.NotFound(new { error = "Blocked signal not found." });
-        var result = await executionService.ExecuteAsync(new TradeExecutionRequest
+        var result = await queueService.EnqueueAsync(new TradeExecutionRequest
         {
             Candidate = mapper.FromBlocked(signal.Signal),
             RequestedBy = "dashboard"
         }, ct);
-        return result.Success ? Results.Ok(result) : Results.BadRequest(result);
+        return result.Accepted ? Results.Ok(result) : Results.BadRequest(result);
     });
 
     app.MapPost("/api/executed-trades/{id:long}/force-close", async (
@@ -952,6 +992,15 @@ try
             LatestBrokerError = runtimeState.LatestBrokerError,
             LatestOrderNote = runtimeState.LatestOrderNote
         });
+    });
+
+    app.MapGet("/api/trading/queue", async (
+        ITradeExecutionQueueService queueService,
+        int? limit,
+        CancellationToken ct) =>
+    {
+        var snapshot = await queueService.GetSnapshotAsync(Math.Clamp(limit ?? 50, 1, 200), ct);
+        return Results.Ok(snapshot);
     });
 
     // W-02 / W-03: Expose dashboard-relevant thresholds from server parameters

@@ -121,6 +121,39 @@ public sealed class ExecutedTradeRepository : IExecutedTradeRepository
         return ReadTrade(reader);
     }
 
+    public async Task<IReadOnlyDictionary<Guid, ExecutedTrade>> GetLatestBySourceSignalsAsync(IReadOnlyCollection<Guid> signalIds, SignalExecutionSourceType sourceType, CancellationToken ct = default)
+    {
+        if (signalIds.Count == 0)
+            return new Dictionary<Guid, ExecutedTrade>();
+
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(ct);
+        await using var cmd = new NpgsqlCommand(@"
+            SELECT DISTINCT ON (signal_id)
+                executed_trade_id, signal_id, evaluation_id, source_type, symbol, instrument, timeframe, direction,
+                recommended_entry_price, actual_entry_price, tp_price, sl_price,
+                requested_size, executed_size, deal_reference, deal_id, status,
+                account_id, account_name, is_demo, account_currency, opened_at_utc, closed_at_utc, pnl,
+                failure_reason, error_details, force_closed, close_source,
+                created_at_utc, updated_at_utc
+            FROM ""ETH"".executed_trades
+            WHERE source_type = @source_type
+              AND signal_id = ANY(@signal_ids)
+            ORDER BY signal_id, created_at_utc DESC, executed_trade_id DESC;", conn);
+        cmd.Parameters.AddWithValue("source_type", sourceType.ToString());
+        cmd.Parameters.AddWithValue("signal_ids", signalIds.ToArray());
+
+        var results = new Dictionary<Guid, ExecutedTrade>();
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            var trade = ReadTrade(reader);
+            results[trade.SignalId] = trade;
+        }
+
+        return results;
+    }
+
     public async Task<IReadOnlyList<ExecutedTrade>> GetExecutedTradesAsync(ExecutedTradeQuery query, CancellationToken ct = default)
     {
         await using var conn = new NpgsqlConnection(_connectionString);
@@ -138,10 +171,34 @@ public sealed class ExecutedTradeRepository : IExecutedTradeRepository
         await using var cmd = new NpgsqlCommand();
         cmd.Connection = conn;
         AppendFilters(sql, cmd, query);
-        sql.Append(" ORDER BY created_at_utc DESC LIMIT @limit OFFSET @offset;");
+        sql.Append(" ORDER BY COALESCE(opened_at_utc, created_at_utc) DESC, created_at_utc DESC LIMIT @limit OFFSET @offset;");
         cmd.CommandText = sql.ToString();
         cmd.Parameters.AddWithValue("limit", Math.Clamp(query.Limit, 1, 500));
         cmd.Parameters.AddWithValue("offset", Math.Max(0, query.Offset));
+
+        var results = new List<ExecutedTrade>();
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+            results.Add(ReadTrade(reader));
+        return results;
+    }
+
+    public async Task<IReadOnlyList<ExecutedTrade>> GetTradesForLifecycleReconciliationAsync(int limit = 200, CancellationToken ct = default)
+    {
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(ct);
+        await using var cmd = new NpgsqlCommand(@"
+            SELECT executed_trade_id, signal_id, evaluation_id, source_type, symbol, instrument, timeframe, direction,
+                recommended_entry_price, actual_entry_price, tp_price, sl_price,
+                requested_size, executed_size, deal_reference, deal_id, status,
+                account_id, account_name, is_demo, account_currency, opened_at_utc, closed_at_utc, pnl,
+                failure_reason, error_details, force_closed, close_source,
+                created_at_utc, updated_at_utc
+            FROM ""ETH"".executed_trades
+            WHERE status IN ('Pending', 'Submitted', 'Open', 'CloseRequested')
+            ORDER BY updated_at_utc ASC, created_at_utc ASC
+            LIMIT @limit;", conn);
+        cmd.Parameters.AddWithValue("limit", Math.Clamp(limit, 1, 2000));
 
         var results = new List<ExecutedTrade>();
         await using var reader = await cmd.ExecuteReaderAsync(ct);
@@ -173,8 +230,8 @@ public sealed class ExecutedTradeRepository : IExecutedTradeRepository
             SELECT
                 COUNT(*)::INT AS total_executed,
                 COUNT(*) FILTER (WHERE status = 'Open')::INT AS open_trades,
-                COUNT(*) FILTER (WHERE status = 'Closed' AND pnl > 0)::INT AS wins,
-                COUNT(*) FILTER (WHERE status = 'Closed' AND pnl <= 0)::INT AS losses,
+                COUNT(*) FILTER (WHERE status = 'Win' OR (status = 'Closed' AND pnl > 0))::INT AS wins,
+                COUNT(*) FILTER (WHERE status = 'Loss' OR (status = 'Closed' AND pnl <= 0))::INT AS losses,
                 COUNT(*) FILTER (WHERE status IN ('Failed', 'Rejected', 'ValidationFailed', 'CloseFailed'))::INT AS failed_executions,
                 COALESCE(SUM(pnl), 0)::NUMERIC AS total_pnl,
                 COALESCE(MAX(account_currency) FILTER (WHERE account_currency <> ''), 'USD') AS currency
@@ -210,6 +267,18 @@ public sealed class ExecutedTradeRepository : IExecutedTradeRepository
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
         var sql = new StringBuilder(@"SELECT COUNT(*)::INT FROM ""ETH"".executed_trades WHERE status = 'Open'");
+        await using var cmd = new NpgsqlCommand();
+        cmd.Connection = conn;
+        AppendFilters(sql, cmd, query);
+        cmd.CommandText = sql.ToString();
+        return (int)(await cmd.ExecuteScalarAsync(ct))!;
+    }
+
+    public async Task<int> GetActiveExecutedTradeCountAsync(ExecutedTradeQuery query, CancellationToken ct = default)
+    {
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(ct);
+        var sql = new StringBuilder(@"SELECT COUNT(*)::INT FROM ""ETH"".executed_trades WHERE status IN ('Queued', 'Pending', 'Submitted', 'Open', 'CloseRequested')");
         await using var cmd = new NpgsqlCommand();
         cmd.Connection = conn;
         AppendFilters(sql, cmd, query);
@@ -351,18 +420,18 @@ public sealed class ExecutedTradeRepository : IExecutedTradeRepository
     {
         if (query.FromUtc.HasValue)
         {
-            sql.Append(" AND created_at_utc >= @from_utc");
+            sql.Append(" AND COALESCE(opened_at_utc, created_at_utc) >= @from_utc");
             cmd.Parameters.AddWithValue("from_utc", query.FromUtc.Value);
         }
         if (query.ToUtc.HasValue)
         {
-            sql.Append(" AND created_at_utc <= @to_utc");
+            sql.Append(" AND COALESCE(opened_at_utc, created_at_utc) <= @to_utc");
             cmd.Parameters.AddWithValue("to_utc", query.ToUtc.Value);
         }
         if (!string.IsNullOrWhiteSpace(query.Instrument))
         {
-            sql.Append(" AND instrument = @instrument");
-            cmd.Parameters.AddWithValue("instrument", query.Instrument);
+            sql.Append(" AND (instrument ILIKE @instrument OR symbol ILIKE @instrument)");
+            cmd.Parameters.AddWithValue("instrument", $"%{query.Instrument.Trim()}%");
         }
         if (!string.IsNullOrWhiteSpace(query.AccountId))
         {
@@ -386,17 +455,17 @@ public sealed class ExecutedTradeRepository : IExecutedTradeRepository
         }
         if (!string.IsNullOrWhiteSpace(query.Timeframe))
         {
-            sql.Append(" AND timeframe = @timeframe");
-            cmd.Parameters.AddWithValue("timeframe", query.Timeframe);
+            sql.Append(" AND LOWER(BTRIM(timeframe)) = LOWER(BTRIM(@timeframe))");
+            cmd.Parameters.AddWithValue("timeframe", query.Timeframe.Trim());
         }
         if (query.SourceType.HasValue)
         {
-            sql.Append(" AND source_type = @source_type");
+            sql.Append(" AND LOWER(BTRIM(source_type)) = LOWER(BTRIM(@source_type))");
             cmd.Parameters.AddWithValue("source_type", query.SourceType.Value.ToString());
         }
         if (query.Status.HasValue)
         {
-            sql.Append(" AND status = @status");
+            sql.Append(" AND LOWER(BTRIM(status)) = LOWER(BTRIM(@status))");
             cmd.Parameters.AddWithValue("status", query.Status.Value.ToString());
         }
     }

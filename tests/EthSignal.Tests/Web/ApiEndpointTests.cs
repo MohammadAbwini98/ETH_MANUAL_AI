@@ -42,6 +42,7 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
     [InlineData("/api/signals/history?limit=10")]
     [InlineData("/api/blocked-signals/history?limit=10")]
     [InlineData("/api/generated-signals/history?limit=10")]
+    [InlineData("/api/trading/queue?limit=10")]
     [InlineData("/api/performance/summary")]
     [InlineData("/api/performance/daily")]
     [InlineData("/api/admin/candle-sync/status")]
@@ -96,6 +97,19 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
     }
 
     [Fact]
+    public async Task Signal_History_Includes_Execution_State_When_Trade_Exists()
+    {
+        var response = await _client.GetAsync("/api/signals/history?limit=5");
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        var signals = doc.RootElement.GetProperty("signals");
+        signals.GetArrayLength().Should().BeGreaterThan(0);
+        signals[0].TryGetProperty("execution", out var execution).Should().BeTrue();
+        execution.GetProperty("status").GetString().Should().Be("Open");
+    }
+
+    [Fact]
     public async Task Blocked_Signal_History_Returns_Stats_And_Array()
     {
         var response = await _client.GetAsync("/api/blocked-signals/history?limit=5");
@@ -122,6 +136,17 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
     }
 
     [Fact]
+    public async Task Generated_Signal_History_Includes_Execution_State_When_Trade_Exists()
+    {
+        var response = await _client.GetAsync("/api/generated-signals/history?limit=5");
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        var signal = doc.RootElement.GetProperty("signals")[0];
+        signal.GetProperty("execution").GetProperty("status").GetString().Should().Be("Loss");
+    }
+
+    [Fact]
     public async Task Executed_Trades_Returns_Array_And_Total()
     {
         var response = await _client.GetAsync("/api/executed-trades?limit=5&page=1");
@@ -134,6 +159,19 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
         trades[0].GetProperty("accountName").GetString().Should().Be("DEMOAI");
         trades[0].GetProperty("isDemo").GetBoolean().Should().BeTrue();
         doc.RootElement.GetProperty("total").GetInt32().Should().Be(1);
+    }
+
+    [Fact]
+    public async Task Executed_Trades_Returns_Lifecycle_Status_Field()
+    {
+        var response = await _client.GetAsync("/api/executed-trades?limit=5&page=1");
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var json = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        var trade = doc.RootElement.GetProperty("trades")[0];
+        trade.GetProperty("status").GetString().Should().NotBeNullOrWhiteSpace();
+        trade.TryGetProperty("closeSource", out _).Should().BeTrue();
     }
 
     [Fact]
@@ -173,6 +211,26 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
         doc.RootElement.GetProperty("totalExecuted").GetInt32().Should().Be(1);
         doc.RootElement.GetProperty("openTrades").GetInt32().Should().Be(1);
         doc.RootElement.GetProperty("currency").GetString().Should().Be("USD");
+    }
+
+    [Fact]
+    public async Task Trading_Queue_Returns_Status_Ids_And_Times()
+    {
+        var response = await _client.GetAsync("/api/trading/queue?limit=10");
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var json = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        doc.RootElement.GetProperty("activeTradeCount").GetInt32().Should().Be(1);
+        doc.RootElement.GetProperty("queueConcurrentRequestLimit").GetInt32().Should().Be(3);
+        doc.RootElement.GetProperty("queueCooldownMilliseconds").GetInt32().Should().Be(500);
+        doc.RootElement.TryGetProperty("serverTimeUtc", out _).Should().BeTrue();
+        var entries = doc.RootElement.GetProperty("entries");
+        entries.GetArrayLength().Should().Be(1);
+        entries[0].GetProperty("queueEntryId").GetInt64().Should().Be(71);
+        entries[0].GetProperty("signalId").GetString().Should().Be("55555555-5555-5555-5555-555555555555");
+        entries[0].TryGetProperty("createdAtUtc", out _).Should().BeTrue();
+        entries[0].TryGetProperty("updatedAtUtc", out _).Should().BeTrue();
     }
 
     [Fact]
@@ -424,6 +482,7 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
                 services.RemoveAll<IGeneratedSignalHistoryService>();
                 services.RemoveAll<IExecutedTradeRepository>();
                 services.RemoveAll<ITradeExecutionService>();
+                services.RemoveAll<ITradeExecutionQueueService>();
                 services.RemoveAll<ITradeExecutionPolicy>();
                 services.RemoveAll<IAccountSnapshotService>();
                 services.RemoveAll<TradeExecutionRuntimeState>();
@@ -449,6 +508,7 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
                 services.AddSingleton(CreateMockGeneratedSignalHistoryService());
                 services.AddSingleton(CreateMockExecutedTradeRepository());
                 services.AddSingleton(CreateMockTradeExecutionService());
+                services.AddSingleton(CreateMockTradeExecutionQueueService());
                 services.AddSingleton(CreateMockTradeExecutionPolicy());
                 services.AddSingleton(CreateMockAccountSnapshotService());
                 var runtimeState = new TradeExecutionRuntimeState();
@@ -551,6 +611,10 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
                 .ReturnsAsync(new SpotPrice(2050m, 2051m, 2050.5m, DateTimeOffset.UtcNow));
             mock.Setup(c => c.GetOpenPositionsAsync(It.IsAny<CancellationToken>()))
                 .ReturnsAsync(Array.Empty<CapitalPositionSnapshot>());
+            mock.Setup(c => c.GetPositionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync((CapitalPositionSnapshot?)null);
+            mock.Setup(c => c.GetActivityHistoryAsync(It.IsAny<CapitalActivityQuery>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(Array.Empty<CapitalActivityRecord>());
             return mock.Object;
         }
 
@@ -601,14 +665,42 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
                 CreatedAtUtc = new DateTimeOffset(2026, 4, 10, 10, 5, 0, TimeSpan.Zero),
                 UpdatedAtUtc = new DateTimeOffset(2026, 4, 10, 10, 6, 0, TimeSpan.Zero)
             };
+            var generatedTrade = trade with
+            {
+                ExecutedTradeId = 8,
+                SignalId = Guid.Parse("33333333-3333-3333-3333-333333333333"),
+                SourceType = SignalExecutionSourceType.Generated,
+                Status = ExecutedTradeStatus.Loss,
+                Pnl = -1.0m,
+                ClosedAtUtc = new DateTimeOffset(2026, 4, 10, 13, 30, 0, TimeSpan.Zero)
+            };
 
             var mock = new Mock<IExecutedTradeRepository>();
             mock.Setup(r => r.GetExecutedTradesAsync(It.IsAny<ExecutedTradeQuery>(), It.IsAny<CancellationToken>()))
                 .ReturnsAsync([trade]);
+            mock.Setup(r => r.GetTradesForLifecycleReconciliationAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(Array.Empty<ExecutedTrade>());
             mock.Setup(r => r.GetExecutedTradeCountAsync(It.IsAny<ExecutedTradeQuery>(), It.IsAny<CancellationToken>()))
                 .ReturnsAsync(1);
             mock.Setup(r => r.GetExecutedTradeAsync(It.IsAny<long>(), It.IsAny<CancellationToken>()))
                 .ReturnsAsync(trade);
+            mock.Setup(r => r.GetBySourceSignalAsync(It.IsAny<Guid>(), It.IsAny<SignalExecutionSourceType>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync((Guid signalId, SignalExecutionSourceType sourceType, CancellationToken _) =>
+                {
+                    if (signalId == trade.SignalId && sourceType == trade.SourceType) return trade;
+                    if (signalId == generatedTrade.SignalId && sourceType == generatedTrade.SourceType) return generatedTrade;
+                    return null;
+                });
+            mock.Setup(r => r.GetLatestBySourceSignalsAsync(It.IsAny<IReadOnlyCollection<Guid>>(), It.IsAny<SignalExecutionSourceType>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync((IReadOnlyCollection<Guid> signalIds, SignalExecutionSourceType sourceType, CancellationToken _) =>
+                {
+                    var result = new Dictionary<Guid, ExecutedTrade>();
+                    if (sourceType == trade.SourceType && signalIds.Contains(trade.SignalId))
+                        result[trade.SignalId] = trade;
+                    if (sourceType == generatedTrade.SourceType && signalIds.Contains(generatedTrade.SignalId))
+                        result[generatedTrade.SignalId] = generatedTrade;
+                    return (IReadOnlyDictionary<Guid, ExecutedTrade>)result;
+                });
             mock.Setup(r => r.GetExecutionStatsAsync(It.IsAny<CancellationToken>()))
                 .ReturnsAsync(new ExecutedTradeStats
                 {
@@ -637,6 +729,8 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
                 .ReturnsAsync(snapshot);
             mock.Setup(r => r.GetLatestAccountSnapshotAsync(It.IsAny<string?>(), It.IsAny<bool?>(), It.IsAny<CancellationToken>()))
                 .ReturnsAsync(snapshot);
+            mock.Setup(r => r.GetActiveExecutedTradeCountAsync(It.IsAny<ExecutedTradeQuery>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(1);
             return mock.Object;
         }
 
@@ -664,6 +758,53 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
                     ActualEntryPrice = 2201m,
                     ExecutedSize = 0.1m,
                     Message = "Mock execution succeeded"
+                });
+            return mock.Object;
+        }
+
+        private static ITradeExecutionQueueService CreateMockTradeExecutionQueueService()
+        {
+            var mock = new Mock<ITradeExecutionQueueService>();
+            mock.Setup(s => s.EnqueueAsync(It.IsAny<TradeExecutionRequest>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new TradeExecutionQueueResult
+                {
+                    Accepted = true,
+                    QueueEntryId = 7,
+                    Status = TradeExecutionQueueStatus.Queued.ToString(),
+                    Message = "Mock queue accepted"
+                });
+            mock.Setup(s => s.DrainAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(0);
+            mock.Setup(s => s.GetSnapshotAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new TradeExecutionQueueSnapshot
+                {
+                    ServerTimeUtc = new DateTimeOffset(2026, 4, 10, 11, 15, 0, TimeSpan.Zero),
+                    ActiveTradeCount = 1,
+                    MaxConcurrentOpenTrades = 3,
+                    QueueConcurrentRequestLimit = 3,
+                    QueueCooldownMilliseconds = 500,
+                    QueuedCount = 1,
+                    ProcessingCount = 0,
+                    CompletedCount = 9,
+                    FailedCount = 0,
+                    Entries =
+                    [
+                        new TradeExecutionQueueEntrySnapshot
+                        {
+                            QueueEntryId = 71,
+                            SignalId = Guid.Parse("55555555-5555-5555-5555-555555555555"),
+                            EvaluationId = Guid.Parse("66666666-6666-6666-6666-666666666666"),
+                            SourceType = SignalExecutionSourceType.Recommended,
+                            RequestedBy = "auto-executor",
+                            RequestedSize = 0.05m,
+                            ForceMarketExecution = false,
+                            Status = TradeExecutionQueueStatus.Queued,
+                            CreatedAtUtc = new DateTimeOffset(2026, 4, 10, 11, 10, 0, TimeSpan.Zero),
+                            UpdatedAtUtc = new DateTimeOffset(2026, 4, 10, 11, 10, 0, TimeSpan.Zero),
+                            AgeSeconds = 300,
+                            WaitSeconds = 300
+                        }
+                    ]
                 });
             return mock.Object;
         }
@@ -787,9 +928,40 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
             mock.Setup(r => r.GetSignalHistoryAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
                 .ReturnsAsync(new List<SignalRecommendation>());
             mock.Setup(r => r.GetSignalHistoryWithOutcomesAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
-                .ReturnsAsync(new List<SignalWithOutcome>());
+                .ReturnsAsync([
+                    new SignalWithOutcome
+                    {
+                        Signal = new SignalRecommendation
+                        {
+                            SignalId = Guid.Parse("11111111-1111-1111-1111-111111111111"),
+                            Symbol = "ETHUSD",
+                            Timeframe = "5m",
+                            SignalTimeUtc = new DateTimeOffset(2026, 4, 10, 10, 0, 0, TimeSpan.Zero),
+                            Direction = SignalDirection.BUY,
+                            EntryPrice = 2205m,
+                            TpPrice = 2212m,
+                            SlPrice = 2201m,
+                            RiskPercent = 0.5m,
+                            RiskUsd = 10m,
+                            ConfidenceScore = 74,
+                            Regime = Regime.BULLISH,
+                            StrategyVersion = "v3.0",
+                            Reasons = ["Primary timeframe signal"],
+                            Status = SignalStatus.OPEN
+                        },
+                        Outcome = new SignalOutcome
+                        {
+                            SignalId = Guid.Parse("11111111-1111-1111-1111-111111111111"),
+                            OutcomeLabel = OutcomeLabel.PENDING,
+                            PnlR = 0m,
+                            BarsObserved = 0,
+                            TpHit = false,
+                            SlHit = false
+                        }
+                    }
+                ]);
             mock.Setup(r => r.GetSignalCountAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
-                .ReturnsAsync(0);
+                .ReturnsAsync(1);
             mock.Setup(r => r.GetOutcomesAsync(It.IsAny<string>(), It.IsAny<DateTimeOffset>(), It.IsAny<DateTimeOffset>(), It.IsAny<CancellationToken>()))
                 .ReturnsAsync(new List<SignalOutcome>());
             return mock.Object;
@@ -1051,7 +1223,7 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
                         {
                             Signal = new GeneratedSignalRecommendation
                             {
-                                SignalId = Guid.NewGuid(),
+                                SignalId = Guid.Parse("33333333-3333-3333-3333-333333333333"),
                                 EvaluationId = Guid.NewGuid(),
                                 Symbol = "ETHUSD",
                                 Timeframe = "15m",
@@ -1079,17 +1251,16 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
                             },
                             Outcome = new SignalOutcome
                             {
-                                SignalId = Guid.NewGuid(),
-                                BarsObserved = 6,
+                                SignalId = Guid.Parse("33333333-3333-3333-3333-333333333333"),
+                                BarsObserved = 0,
                                 TpHit = false,
-                                SlHit = true,
-                                OutcomeLabel = OutcomeLabel.LOSS,
-                                PnlR = -1.0m,
-                                MfePrice = 2208m,
-                                MaePrice = 2215m,
-                                MfeR = 0.4m,
-                                MaeR = -1.2m,
-                                ClosedAtUtc = new DateTimeOffset(2026, 4, 10, 13, 30, 0, TimeSpan.Zero)
+                                SlHit = false,
+                                OutcomeLabel = OutcomeLabel.PENDING,
+                                PnlR = 0m,
+                                MfePrice = 0m,
+                                MaePrice = 0m,
+                                MfeR = 0m,
+                                MaeR = 0m
                             }
                         }
                     ],

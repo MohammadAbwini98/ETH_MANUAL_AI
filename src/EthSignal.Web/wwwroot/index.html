@@ -1585,7 +1585,13 @@
                             </select>
                             <select class="filter-input" id="exec-filter-status" style="width:120px" onchange="onExecutedTradeFilterChange()">
                                 <option value="">All Status</option>
+                                <option value="Queued">Queued</option>
+                                <option value="Pending">Pending</option>
+                                <option value="Submitted">Submitted</option>
                                 <option value="Open">Open</option>
+                                <option value="CloseRequested">CloseRequested</option>
+                                <option value="Win">Win</option>
+                                <option value="Loss">Loss</option>
                                 <option value="Closed">Closed</option>
                                 <option value="Failed">Failed</option>
                                 <option value="Rejected">Rejected</option>
@@ -1629,13 +1635,43 @@
                             <span id="exec-page-info">Page 1</span>
                             <button id="exec-next-page" onclick="changeExecutedTradePage(1)">Next &raquo;</button>
                         </div>
+                        <div class="card-header d-flex justify-content-between align-items-center" style="border-top:1px solid var(--border)">
+                            <span style="font-size:.78rem;color:var(--text-sub)">Execution Queue</span>
+                            <div class="d-flex gap-2 align-items-center flex-wrap" style="font-size:.74rem;color:var(--text-sub)">
+                                <span>Server: <span id="trade-queue-server-time">--</span></span>
+                                <span>Active Trades: <span id="trade-queue-active">--</span></span>
+                                <span>Burst: <span id="trade-queue-burst">--</span></span>
+                                <span>Cooldown: <span id="trade-queue-cooldown">--</span></span>
+                                <span>Queued: <span id="trade-queue-queued">--</span></span>
+                                <span>Processing: <span id="trade-queue-processing">--</span></span>
+                            </div>
+                        </div>
+                        <div class="signal-tbl-wrap">
+                            <table class="table table-sm table-dark table-hover mb-0" id="trade-queue-table">
+                                <thead>
+                                    <tr>
+                                        <th>Queue Id</th>
+                                        <th>Signal Id</th>
+                                        <th>Source</th>
+                                        <th>Status</th>
+                                        <th>Requested By</th>
+                                        <th>Created</th>
+                                        <th>Updated</th>
+                                        <th>Processed</th>
+                                        <th>Age</th>
+                                        <th>Wait</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="trade-queue-body"></tbody>
+                            </table>
+                        </div>
                     </div>
                 </div>
             </div>
         </div>
     </div>
 
-    <script src="js/dashboard.js?v=18"></script>
+    <script src="js/dashboard.js?v=19"></script>
 </body>
 
 </html>

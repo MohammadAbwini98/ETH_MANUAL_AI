@@ -9,6 +9,7 @@ public enum SignalExecutionSourceType
 
 public enum ExecutedTradeStatus
 {
+    Queued,
     Pending,
     ValidationFailed,
     Submitted,
@@ -16,7 +17,17 @@ public enum ExecutedTradeStatus
     Open,
     CloseRequested,
     Closed,
+    Win,
+    Loss,
     CloseFailed,
+    Failed
+}
+
+public enum TradeExecutionQueueStatus
+{
+    Queued,
+    Processing,
+    Completed,
     Failed
 }
 
@@ -26,7 +37,8 @@ public enum TradeCloseSource
     System,
     TakeProfit,
     StopLoss,
-    Platform
+    Platform,
+    Unknown
 }
 
 public enum TradeEntryMode
@@ -173,4 +185,23 @@ public sealed record ExecutedTradeStats
     public decimal TotalPnl { get; init; }
     public decimal WinRate { get; init; }
     public required string Currency { get; init; }
+}
+
+public sealed record QueuedTradeExecution
+{
+    public long QueueEntryId { get; init; }
+    public required Guid SignalId { get; init; }
+    public Guid? EvaluationId { get; init; }
+    public required SignalExecutionSourceType SourceType { get; init; }
+    public string RequestedBy { get; init; } = "system";
+    public decimal? RequestedSize { get; init; }
+    public bool ForceMarketExecution { get; init; }
+    public required string CandidateJson { get; init; }
+    public required TradeExecutionQueueStatus Status { get; init; }
+    public long? ExecutedTradeId { get; init; }
+    public string? FailureReason { get; init; }
+    public string? ErrorDetails { get; init; }
+    public DateTimeOffset CreatedAtUtc { get; init; }
+    public DateTimeOffset UpdatedAtUtc { get; init; }
+    public DateTimeOffset? ProcessedAtUtc { get; init; }
 }

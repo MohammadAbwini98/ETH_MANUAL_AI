@@ -700,6 +700,7 @@ let executedTradesData = [];
 let executedTradesCurrentPage = 1;
 const EXECUTED_TRADES_PAGE_SIZE = 25;
 let executedTradesTotal = 0;
+let tradeQueueData = null;
 
 async function loadHistory() {
     const data = await fetchJson(`/api/signals/history?limit=500&page=1`);
@@ -762,13 +763,35 @@ function outcomeClass(label) {
     switch (label.toUpperCase()) {
         case 'WIN': return 'badge-win';
         case 'LOSS': return 'badge-loss';
+        case 'FAILED': return 'badge-loss';
+        case 'CLOSED': return 'badge-neutral';
         case 'EXPIRED': return 'badge-expired';
         case 'AMBIGUOUS': return 'badge-ambiguous';
         default: return 'badge-pending';
     }
 }
 
+function historyExecutionLabel(status, pendingLabel) {
+    switch ((status || '').toUpperCase()) {
+        case 'WIN': return 'WIN';
+        case 'LOSS': return 'LOSS';
+        case 'CLOSED': return 'CLOSED';
+        case 'FAILED':
+        case 'REJECTED':
+        case 'VALIDATIONFAILED':
+        case 'CLOSEFAILED': return 'FAILED';
+        case 'QUEUED':
+        case 'PENDING':
+        case 'SUBMITTED':
+        case 'OPEN':
+        case 'CLOSEREQUESTED': return pendingLabel;
+        default: return null;
+    }
+}
+
 function getOutcomeLabel(item) {
+    const executionLabel = historyExecutionLabel(item.execution?.status, 'OPEN');
+    if (executionLabel) return executionLabel;
     if (item.outcome?.outcomeLabel) return item.outcome.outcomeLabel;
     if (item.signal?.status === 'OPEN') return 'OPEN';
     return item.signal?.status || 'OPEN';
@@ -783,7 +806,7 @@ async function executeCandidate(path, label) {
             alert(payload?.message || payload?.failureReason || payload?.error || `Execution failed (${response.status})`);
             return;
         }
-        await Promise.all([loadExecutedTrades(), refreshTradingSummary()]);
+        await Promise.all([loadExecutedTrades(), refreshTradingSummary(), loadTradeQueue()]);
         alert(payload?.message || 'Execution request submitted.');
     } catch (e) {
         alert(`Execution failed: ${e.message}`);
@@ -906,6 +929,8 @@ function changePage(delta) {
 }
 
 function getBlockedOutcomeLabel(item) {
+    const executionLabel = historyExecutionLabel(item.execution?.status, 'PENDING');
+    if (executionLabel) return executionLabel;
     return item.outcome?.outcomeLabel || 'PENDING';
 }
 
@@ -1027,6 +1052,8 @@ function changeBlockedPage(delta) {
 }
 
 function getGeneratedOutcomeLabel(item) {
+    const executionLabel = historyExecutionLabel(item.execution?.status, 'PENDING');
+    if (executionLabel) return executionLabel;
     return item.outcome?.outcomeLabel || 'PENDING';
 }
 
@@ -1151,7 +1178,12 @@ function changeGeneratedPage(delta) {
 function executionStatusBadgeClass(status) {
     switch ((status || '').toUpperCase()) {
         case 'OPEN': return 'badge-win';
+        case 'WIN': return 'badge-win';
+        case 'LOSS': return 'badge-loss';
         case 'CLOSED': return 'badge-neutral';
+        case 'PROCESSING': return 'badge-pending';
+        case 'COMPLETED': return 'badge-neutral';
+        case 'QUEUED':
         case 'SUBMITTED':
         case 'PENDING':
         case 'CLOSEREQUESTED': return 'badge-pending';
@@ -1250,6 +1282,60 @@ async function refreshTradingSummary() {
     }
 }
 
+function formatElapsedSeconds(seconds) {
+    const totalSeconds = Math.max(0, Math.round(Number(seconds || 0)));
+    if (totalSeconds < 60) return `${totalSeconds}s`;
+    const totalMinutes = Math.floor(totalSeconds / 60);
+    const remainingSeconds = totalSeconds % 60;
+    if (totalMinutes < 60) return `${totalMinutes}m ${remainingSeconds}s`;
+    const hours = Math.floor(totalMinutes / 60);
+    const remainingMinutes = totalMinutes % 60;
+    return `${hours}h ${remainingMinutes}m`;
+}
+
+function renderTradeQueue() {
+    const snapshot = tradeQueueData || {};
+    tradingSummaryText('trade-queue-server-time', snapshot.serverTimeUtc ? toAmmanShort(snapshot.serverTimeUtc) : '--');
+    tradingSummaryText('trade-queue-active', snapshot.activeTradeCount != null && snapshot.maxConcurrentOpenTrades != null
+        ? `${snapshot.activeTradeCount}/${snapshot.maxConcurrentOpenTrades}`
+        : '--');
+    tradingSummaryText('trade-queue-burst', snapshot.queueConcurrentRequestLimit ?? '--');
+    tradingSummaryText('trade-queue-cooldown', snapshot.queueCooldownMilliseconds != null ? `${snapshot.queueCooldownMilliseconds}ms` : '--');
+    tradingSummaryText('trade-queue-queued', snapshot.queuedCount ?? '--');
+    tradingSummaryText('trade-queue-processing', snapshot.processingCount ?? '--');
+
+    const tbody = $('trade-queue-body');
+    if (!tbody) return;
+
+    const entries = snapshot.entries || [];
+    if (entries.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="10" class="text-center" style="color:var(--text)">No active queue entries</td></tr>';
+        return;
+    }
+
+    tbody.innerHTML = entries.map(entry => `
+        <tr>
+            <td style="font-family:monospace;font-size:.72rem">#${entry.queueEntryId}</td>
+            <td style="font-family:monospace;font-size:.7rem;color:var(--text)">${escapeHtml(entry.signalId || '--')}</td>
+            <td><span class="badge badge-neutral" style="font-size:.68rem">${escapeHtml(entry.sourceType || '--')}</span></td>
+            <td><span class="badge ${executionStatusBadgeClass(entry.status)}" style="font-size:.68rem">${escapeHtml(entry.status || '--')}</span></td>
+            <td>${escapeHtml(entry.requestedBy || '--')}</td>
+            <td>${entry.createdAtUtc ? toAmmanShort(entry.createdAtUtc) : '--'}</td>
+            <td>${entry.updatedAtUtc ? toAmmanShort(entry.updatedAtUtc) : '--'}</td>
+            <td>${entry.processedAtUtc ? toAmmanShort(entry.processedAtUtc) : '--'}</td>
+            <td>${formatElapsedSeconds(entry.ageSeconds)}</td>
+            <td>${formatElapsedSeconds(entry.waitSeconds)}</td>
+        </tr>
+    `).join('');
+}
+
+async function loadTradeQueue() {
+    const data = await fetchJson('/api/trading/queue?limit=50');
+    if (!data) return;
+    tradeQueueData = data;
+    renderTradeQueue();
+}
+
 function renderExecutedTrades() {
     const tbody = $('executed-trades-body');
     if (!tbody) return;
@@ -1330,7 +1416,7 @@ async function forceCloseExecutedTrade(id) {
             alert(payload?.message || payload?.error || `Force close failed (${response.status})`);
             return;
         }
-        await Promise.all([loadExecutedTrades(), refreshTradingSummary()]);
+        await Promise.all([loadExecutedTrades(), refreshTradingSummary(), loadTradeQueue()]);
     } catch (e) {
         alert(`Force close failed: ${e.message}`);
     }
@@ -1571,7 +1657,7 @@ async function refreshAll() {
         await Promise.all([
             refreshQuote(), refreshIndicators(), refreshRegime(),
             refreshSignal(), refreshPerformance(), loadHistory(), loadBlockedHistory(), loadGeneratedHistory(),
-            loadExecutedTrades(), refreshTradingSummary(),
+            loadExecutedTrades(), refreshTradingSummary(), loadTradeQueue(),
             refreshMlHealth(), refreshMlPerformance(), refreshMlPredictions(),
             refreshMlDiagnostics(), refreshMlFeatureSnapshot(), refreshDecisionSummary(), refreshTrainerStatus(), refreshHistorySync(),
             refreshAdaptiveStatus(), refreshActiveParameterSet(),
@@ -1588,7 +1674,7 @@ setInterval(refreshQuote, 200);
 setInterval(() => { refreshIndicators(); refreshRegime(); refreshSignal(); }, 1000);
 setInterval(() => { refreshCharts().catch(() => { }); }, 2000);
 setInterval(() => { refreshHistorySync().catch(() => { }); }, 5000);
-setInterval(() => { refreshPerformance(); loadHistory(); loadBlockedHistory(); loadGeneratedHistory(); loadExecutedTrades(); refreshTradingSummary(); refreshDecisionSummary(); }, 15000);
+setInterval(() => { refreshPerformance(); loadHistory(); loadBlockedHistory(); loadGeneratedHistory(); loadExecutedTrades(); refreshTradingSummary(); loadTradeQueue(); refreshDecisionSummary(); }, 15000);
 setInterval(() => { refreshMlHealth(); refreshMlPerformance(); refreshMlPredictions(); refreshMlDiagnostics(); refreshMlFeatureSnapshot(); refreshTrainerStatus(); }, 30000);
 setInterval(() => { refreshAdaptiveStatus(); refreshActiveParameterSet(); }, 15000);
 setInterval(() => { loadMlModelRegistry().catch(() => {}); updateRegimeSpecialistStatus().catch(() => {}); }, 60000);
