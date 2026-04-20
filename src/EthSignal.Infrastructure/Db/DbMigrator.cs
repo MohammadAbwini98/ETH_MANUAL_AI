@@ -319,6 +319,9 @@ public sealed class DbMigrator : IDbMigrator
                 deal_reference            TEXT,
                 deal_id                   TEXT,
                 status                    TEXT        NOT NULL DEFAULT 'Pending',
+                account_id                TEXT        NOT NULL DEFAULT '',
+                account_name              TEXT        NOT NULL DEFAULT '',
+                is_demo                   BOOLEAN     NOT NULL DEFAULT FALSE,
                 account_currency          TEXT        NOT NULL DEFAULT '',
                 opened_at_utc             TIMESTAMPTZ,
                 closed_at_utc             TIMESTAMPTZ,
@@ -330,6 +333,10 @@ public sealed class DbMigrator : IDbMigrator
                 created_at_utc            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at_utc            TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );", ct);
+
+        await Exec(conn, @"ALTER TABLE ""ETH"".executed_trades ADD COLUMN IF NOT EXISTS account_id TEXT NOT NULL DEFAULT '';", ct);
+        await Exec(conn, @"ALTER TABLE ""ETH"".executed_trades ADD COLUMN IF NOT EXISTS account_name TEXT NOT NULL DEFAULT '';", ct);
+        await Exec(conn, @"ALTER TABLE ""ETH"".executed_trades ADD COLUMN IF NOT EXISTS is_demo BOOLEAN NOT NULL DEFAULT FALSE;", ct);
 
         await Exec(conn, @"
             CREATE INDEX IF NOT EXISTS idx_executed_trades_source_signal

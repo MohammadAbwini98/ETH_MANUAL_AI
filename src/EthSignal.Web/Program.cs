@@ -756,6 +756,7 @@ try
 
     app.MapGet("/api/executed-trades", async (
         IExecutedTradeRepository repository,
+        ICapitalTradingClient capitalTradingClient,
         DateTimeOffset? from,
         DateTimeOffset? to,
         string? instrument,
@@ -781,6 +782,14 @@ try
             Limit = pageSize,
             Offset = (pageNum - 1) * pageSize
         };
+        if (capitalTradingClient.IsDemoEnvironment)
+        {
+            query = query with
+            {
+                AccountName = preferredDemoAccountName,
+                IsDemo = true
+            };
+        }
         var trades = await repository.GetExecutedTradesAsync(query, ct);
         var total = await repository.GetExecutedTradeCountAsync(query with { Limit = 0, Offset = 0 }, ct);
         return Results.Ok(new { trades, total, page = pageNum, pageSize });
@@ -811,7 +820,7 @@ try
             Candidate = mapper.FromRecommended(signal),
             RequestedBy = "dashboard"
         }, ct);
-        return Results.Ok(result);
+        return result.Success ? Results.Ok(result) : Results.BadRequest(result);
     });
 
     app.MapPost("/api/executed-trades/execute-generated/{signalId:guid}", async (
@@ -830,7 +839,7 @@ try
             Candidate = mapper.FromGenerated(signal.Signal),
             RequestedBy = "dashboard"
         }, ct);
-        return Results.Ok(result);
+        return result.Success ? Results.Ok(result) : Results.BadRequest(result);
     });
 
     app.MapPost("/api/executed-trades/execute-blocked/{signalId:guid}", async (
@@ -849,7 +858,7 @@ try
             Candidate = mapper.FromBlocked(signal.Signal),
             RequestedBy = "dashboard"
         }, ct);
-        return Results.Ok(result);
+        return result.Success ? Results.Ok(result) : Results.BadRequest(result);
     });
 
     app.MapPost("/api/executed-trades/{id:long}/force-close", async (
@@ -866,10 +875,29 @@ try
 
     app.MapGet("/api/trading/account-summary", async (
         IAccountSnapshotService accountSnapshotService,
+        IExecutedTradeRepository repository,
+        ICapitalTradingClient capitalTradingClient,
         CancellationToken ct) =>
     {
-        var snapshot = await accountSnapshotService.GetLatestAsync(ct);
-        return Results.Ok(snapshot);
+        try
+        {
+            var snapshot = await accountSnapshotService.GetLatestAsync(ct);
+            return Results.Ok(snapshot);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Trading account summary refresh failed; falling back to latest persisted snapshot");
+            var fallback = capitalTradingClient.IsDemoEnvironment
+                ? await repository.GetLatestAccountSnapshotAsync(preferredDemoAccountName, isDemo: true, ct)
+                : await repository.GetLatestAccountSnapshotAsync(ct);
+            if (fallback != null)
+                return Results.Ok(fallback);
+
+            return Results.Problem(
+                title: "Trading account summary unavailable",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
     });
 
     app.MapGet("/api/trading/open-positions", async (
@@ -883,9 +911,17 @@ try
 
     app.MapGet("/api/trading/execution-stats", async (
         IExecutedTradeRepository repository,
+        ICapitalTradingClient capitalTradingClient,
         CancellationToken ct) =>
     {
-        var stats = await repository.GetExecutionStatsAsync(ct);
+        var statsQuery = capitalTradingClient.IsDemoEnvironment
+            ? new ExecutedTradeQuery
+            {
+                AccountName = preferredDemoAccountName,
+                IsDemo = true
+            }
+            : new ExecutedTradeQuery();
+        var stats = await repository.GetExecutionStatsAsync(statsQuery, ct);
         return Results.Ok(stats);
     });
 
@@ -897,16 +933,22 @@ try
         CancellationToken ct) =>
     {
         var settings = policy.GetSettings();
-        var latestSnapshot = await repository.GetLatestAccountSnapshotAsync(ct);
+        var latestSnapshot = capitalTradingClient.IsDemoEnvironment
+            ? await repository.GetLatestAccountSnapshotAsync(preferredDemoAccountName, isDemo: true, ct)
+            : await repository.GetLatestAccountSnapshotAsync(ct);
         return Results.Ok(new BrokerHealthSnapshot
         {
             DemoOnly = settings.DemoOnly && capitalTradingClient.IsDemoEnvironment,
             SessionReady = runtimeState.SessionReady,
             ExecutionEnabled = settings.Enabled,
-            AccountName = latestSnapshot?.AccountName,
-            AccountId = latestSnapshot?.AccountId,
-            ActiveAccountIsDemo = latestSnapshot?.IsDemo,
+            AccountName = runtimeState.ActiveAccountName ?? latestSnapshot?.AccountName,
+            AccountId = runtimeState.ActiveAccountId ?? latestSnapshot?.AccountId,
+            ActiveAccountIsDemo = runtimeState.ActiveAccountIsDemo ?? latestSnapshot?.IsDemo,
             LastSyncUtc = runtimeState.LastSyncUtc ?? latestSnapshot?.CapturedAtUtc,
+            LatestAccountResolutionUtc = runtimeState.LastAccountResolutionUtc,
+            AccountSelectionSource = runtimeState.AccountSelectionSource,
+            LatestExecutionAccountId = runtimeState.LatestExecutionAccountId,
+            LatestExecutionAccountName = runtimeState.LatestExecutionAccountName,
             LatestBrokerError = runtimeState.LatestBrokerError,
             LatestOrderNote = runtimeState.LatestOrderNote
         });

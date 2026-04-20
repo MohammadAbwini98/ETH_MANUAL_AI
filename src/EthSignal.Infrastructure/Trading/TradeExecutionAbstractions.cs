@@ -52,6 +52,10 @@ public sealed record BrokerHealthSnapshot
     public string? AccountId { get; init; }
     public bool? ActiveAccountIsDemo { get; init; }
     public DateTimeOffset? LastSyncUtc { get; init; }
+    public DateTimeOffset? LatestAccountResolutionUtc { get; init; }
+    public string? AccountSelectionSource { get; init; }
+    public string? LatestExecutionAccountId { get; init; }
+    public string? LatestExecutionAccountName { get; init; }
     public string? LatestBrokerError { get; init; }
     public string? LatestOrderNote { get; init; }
 }
@@ -162,6 +166,8 @@ public sealed record CapitalAccountInfo
     public decimal Equity { get; init; }
     public bool HedgingMode { get; init; }
     public bool IsDemo { get; init; }
+    public string ResolutionSource { get; init; } = "";
+    public DateTimeOffset? ResolvedAtUtc { get; init; }
 }
 
 public sealed record CapitalPositionSnapshot

@@ -131,7 +131,21 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
         using var doc = JsonDocument.Parse(json);
         doc.RootElement.TryGetProperty("trades", out var trades).Should().BeTrue();
         trades.GetArrayLength().Should().Be(1);
+        trades[0].GetProperty("accountName").GetString().Should().Be("DEMOAI");
+        trades[0].GetProperty("isDemo").GetBoolean().Should().BeTrue();
         doc.RootElement.GetProperty("total").GetInt32().Should().Be(1);
+    }
+
+    [Fact]
+    public async Task Trading_Account_Summary_Returns_DemoAiDetails()
+    {
+        var response = await _client.GetAsync("/api/trading/account-summary");
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var json = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(json);
+        doc.RootElement.GetProperty("accountName").GetString().Should().Be("DEMOAI");
+        doc.RootElement.GetProperty("isDemo").GetBoolean().Should().BeTrue();
     }
 
     [Fact]
@@ -577,6 +591,9 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
                 DealReference = "DEAL-REF-1",
                 DealId = "DEAL-ID-1",
                 Status = ExecutedTradeStatus.Open,
+                AccountId = "demo-1",
+                AccountName = "DEMOAI",
+                IsDemo = true,
                 AccountCurrency = "USD",
                 Pnl = 1.25m,
                 OpenedAtUtc = new DateTimeOffset(2026, 4, 10, 10, 5, 0, TimeSpan.Zero),
@@ -604,7 +621,21 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
                     WinRate = 100m,
                     Currency = "USD"
                 });
+            mock.Setup(r => r.GetExecutionStatsAsync(It.IsAny<ExecutedTradeQuery>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new ExecutedTradeStats
+                {
+                    TotalExecuted = 1,
+                    OpenTrades = 1,
+                    Wins = 1,
+                    Losses = 0,
+                    FailedExecutions = 0,
+                    TotalPnl = 1.25m,
+                    WinRate = 100m,
+                    Currency = "USD"
+                });
             mock.Setup(r => r.GetLatestAccountSnapshotAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(snapshot);
+            mock.Setup(r => r.GetLatestAccountSnapshotAsync(It.IsAny<string?>(), It.IsAny<bool?>(), It.IsAny<CancellationToken>()))
                 .ReturnsAsync(snapshot);
             return mock.Object;
         }

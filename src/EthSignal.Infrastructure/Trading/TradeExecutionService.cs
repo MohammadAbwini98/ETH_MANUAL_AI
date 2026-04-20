@@ -29,7 +29,69 @@ public sealed class TradeExecutionService : ITradeExecutionService
     public async Task<TradeExecutionResult> ExecuteAsync(TradeExecutionRequest request, CancellationToken ct = default)
     {
         var candidate = request.Candidate;
-        var policyDecision = await _policy.EvaluateAsync(request, ct);
+        TradeExecutionPolicyDecision policyDecision;
+        try
+        {
+            policyDecision = await _policy.EvaluateAsync(request, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "[TradeExecution] Policy evaluation failed for signal {SignalId} ({SourceType})", candidate.SignalId, candidate.SourceType);
+            _runtimeState.RecordBrokerError(ex.Message);
+
+            var failedTrade = new ExecutedTrade
+            {
+                SignalId = candidate.SignalId,
+                EvaluationId = candidate.EvaluationId,
+                SourceType = candidate.SourceType,
+                Symbol = candidate.Symbol,
+                Instrument = candidate.Symbol,
+                Timeframe = candidate.Timeframe,
+                Direction = candidate.Direction,
+                RecommendedEntryPrice = candidate.RecommendedEntryPrice,
+                ActualEntryPrice = 0m,
+                TpPrice = candidate.TpPrice,
+                SlPrice = candidate.SlPrice,
+                RequestedSize = request.RequestedSize ?? 0m,
+                ExecutedSize = 0m,
+                Status = ExecutedTradeStatus.Failed,
+                AccountCurrency = "",
+                FailureReason = "PolicyEvaluationFailed",
+                ErrorDetails = ex.Message,
+                CreatedAtUtc = DateTimeOffset.UtcNow,
+                UpdatedAtUtc = DateTimeOffset.UtcNow
+            };
+            var tradeId = await _repository.InsertExecutedTradeAsync(failedTrade, ct);
+            await _repository.InsertExecutionAttemptAsync(
+                tradeId,
+                candidate.SignalId,
+                candidate.SourceType,
+                "policy_evaluation",
+                success: false,
+                summary: "Execution policy evaluation failed.",
+                errorDetails: ex.Message,
+                brokerPayload: null,
+                ct);
+            await _repository.InsertExecutionEventAsync(
+                tradeId,
+                candidate.SignalId,
+                candidate.SourceType,
+                "execution_failed",
+                ex.Message,
+                null,
+                ct);
+
+            return new TradeExecutionResult
+            {
+                Success = false,
+                ExecutedTradeId = tradeId,
+                Status = ExecutedTradeStatus.Failed,
+                FailureReason = "PolicyEvaluationFailed",
+                ErrorDetails = ex.Message,
+                Message = ex.Message
+            };
+        }
+
         if (!policyDecision.Allowed || policyDecision.Plan == null)
         {
             var failedTrade = new ExecutedTrade
@@ -86,6 +148,9 @@ public sealed class TradeExecutionService : ITradeExecutionService
         }
 
         var plan = policyDecision.Plan;
+        var executionAccount = plan.AccountSnapshot;
+        _runtimeState.RecordExecutionAccount(executionAccount);
+
         var pendingTrade = new ExecutedTrade
         {
             SignalId = candidate.SignalId,
@@ -102,6 +167,9 @@ public sealed class TradeExecutionService : ITradeExecutionService
             RequestedSize = plan.RequestedSize,
             ExecutedSize = 0m,
             Status = ExecutedTradeStatus.Pending,
+            AccountId = executionAccount.AccountId,
+            AccountName = executionAccount.AccountName,
+            IsDemo = executionAccount.IsDemo,
             AccountCurrency = plan.Currency,
             CreatedAtUtc = DateTimeOffset.UtcNow,
             UpdatedAtUtc = DateTimeOffset.UtcNow
@@ -220,7 +288,7 @@ public sealed class TradeExecutionService : ITradeExecutionService
                 DealId = confirmation.DealId,
                 ActualEntryPrice = actualEntry,
                 ExecutedSize = confirmation.Size ?? plan.FinalSize,
-                Message = "Trade opened on Capital.com demo account."
+                Message = $"Trade opened on Capital.com demo account '{executionAccount.AccountName}'."
             };
         }
         catch (Exception ex)

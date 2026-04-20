@@ -11,10 +11,13 @@ public interface IExecutedTradeRepository
     Task<IReadOnlyList<ExecutedTrade>> GetExecutedTradesAsync(ExecutedTradeQuery query, CancellationToken ct = default);
     Task<int> GetExecutedTradeCountAsync(ExecutedTradeQuery query, CancellationToken ct = default);
     Task<ExecutedTradeStats> GetExecutionStatsAsync(CancellationToken ct = default);
+    Task<ExecutedTradeStats> GetExecutionStatsAsync(ExecutedTradeQuery query, CancellationToken ct = default);
     Task<int> GetOpenExecutedTradeCountAsync(CancellationToken ct = default);
+    Task<int> GetOpenExecutedTradeCountAsync(ExecutedTradeQuery query, CancellationToken ct = default);
     Task InsertExecutionAttemptAsync(long? executedTradeId, Guid signalId, SignalExecutionSourceType sourceType, string attemptType, bool success, string? summary, string? errorDetails, string? brokerPayload, CancellationToken ct = default);
     Task InsertExecutionEventAsync(long? executedTradeId, Guid signalId, SignalExecutionSourceType sourceType, string eventType, string message, string? detailsJson, CancellationToken ct = default);
     Task<long> InsertAccountSnapshotAsync(AccountSnapshot snapshot, CancellationToken ct = default);
     Task<AccountSnapshot?> GetLatestAccountSnapshotAsync(CancellationToken ct = default);
+    Task<AccountSnapshot?> GetLatestAccountSnapshotAsync(string? accountName, bool? isDemo, CancellationToken ct = default);
     Task InsertCloseTradeActionAsync(long executedTradeId, ForceCloseRequest request, ForceCloseResult result, CancellationToken ct = default);
 }

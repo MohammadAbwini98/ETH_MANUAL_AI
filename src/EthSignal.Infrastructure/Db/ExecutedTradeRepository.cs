@@ -23,14 +23,14 @@ public sealed class ExecutedTradeRepository : IExecutedTradeRepository
                 (signal_id, evaluation_id, source_type, symbol, instrument, timeframe, direction,
                  recommended_entry_price, actual_entry_price, tp_price, sl_price,
                  requested_size, executed_size, deal_reference, deal_id, status,
-                 account_currency, opened_at_utc, closed_at_utc, pnl,
+                 account_id, account_name, is_demo, account_currency, opened_at_utc, closed_at_utc, pnl,
                  failure_reason, error_details, force_closed, close_source,
                  created_at_utc, updated_at_utc)
             VALUES
                 (@signal_id, @evaluation_id, @source_type, @symbol, @instrument, @timeframe, @direction,
                  @recommended_entry_price, @actual_entry_price, @tp_price, @sl_price,
                  @requested_size, @executed_size, @deal_reference, @deal_id, @status,
-                 @account_currency, @opened_at_utc, @closed_at_utc, @pnl,
+                 @account_id, @account_name, @is_demo, @account_currency, @opened_at_utc, @closed_at_utc, @pnl,
                  @failure_reason, @error_details, @force_closed, @close_source,
                  @created_at_utc, @updated_at_utc)
             RETURNING executed_trade_id;", conn);
@@ -59,6 +59,9 @@ public sealed class ExecutedTradeRepository : IExecutedTradeRepository
                 deal_reference = @deal_reference,
                 deal_id = @deal_id,
                 status = @status,
+                account_id = @account_id,
+                account_name = @account_name,
+                is_demo = @is_demo,
                 account_currency = @account_currency,
                 opened_at_utc = @opened_at_utc,
                 closed_at_utc = @closed_at_utc,
@@ -79,10 +82,10 @@ public sealed class ExecutedTradeRepository : IExecutedTradeRepository
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
         await using var cmd = new NpgsqlCommand(@"
-            SELECT executed_trade_id, signal_id, evaluation_id, source_type, symbol, instrument, timeframe, direction,
-                   recommended_entry_price, actual_entry_price, tp_price, sl_price,
-                   requested_size, executed_size, deal_reference, deal_id, status,
-                   account_currency, opened_at_utc, closed_at_utc, pnl,
+             SELECT executed_trade_id, signal_id, evaluation_id, source_type, symbol, instrument, timeframe, direction,
+                 recommended_entry_price, actual_entry_price, tp_price, sl_price,
+                 requested_size, executed_size, deal_reference, deal_id, status,
+                 account_id, account_name, is_demo, account_currency, opened_at_utc, closed_at_utc, pnl,
                    failure_reason, error_details, force_closed, close_source,
                    created_at_utc, updated_at_utc
             FROM ""ETH"".executed_trades
@@ -99,10 +102,10 @@ public sealed class ExecutedTradeRepository : IExecutedTradeRepository
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
         await using var cmd = new NpgsqlCommand(@"
-            SELECT executed_trade_id, signal_id, evaluation_id, source_type, symbol, instrument, timeframe, direction,
-                   recommended_entry_price, actual_entry_price, tp_price, sl_price,
-                   requested_size, executed_size, deal_reference, deal_id, status,
-                   account_currency, opened_at_utc, closed_at_utc, pnl,
+             SELECT executed_trade_id, signal_id, evaluation_id, source_type, symbol, instrument, timeframe, direction,
+                 recommended_entry_price, actual_entry_price, tp_price, sl_price,
+                 requested_size, executed_size, deal_reference, deal_id, status,
+                 account_id, account_name, is_demo, account_currency, opened_at_utc, closed_at_utc, pnl,
                    failure_reason, error_details, force_closed, close_source,
                    created_at_utc, updated_at_utc
             FROM ""ETH"".executed_trades
@@ -123,10 +126,10 @@ public sealed class ExecutedTradeRepository : IExecutedTradeRepository
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
         var sql = new StringBuilder(@"
-            SELECT executed_trade_id, signal_id, evaluation_id, source_type, symbol, instrument, timeframe, direction,
-                   recommended_entry_price, actual_entry_price, tp_price, sl_price,
-                   requested_size, executed_size, deal_reference, deal_id, status,
-                   account_currency, opened_at_utc, closed_at_utc, pnl,
+             SELECT executed_trade_id, signal_id, evaluation_id, source_type, symbol, instrument, timeframe, direction,
+                 recommended_entry_price, actual_entry_price, tp_price, sl_price,
+                 requested_size, executed_size, deal_reference, deal_id, status,
+                 account_id, account_name, is_demo, account_currency, opened_at_utc, closed_at_utc, pnl,
                    failure_reason, error_details, force_closed, close_source,
                    created_at_utc, updated_at_utc
             FROM ""ETH"".executed_trades
@@ -159,11 +162,14 @@ public sealed class ExecutedTradeRepository : IExecutedTradeRepository
         return (int)(await cmd.ExecuteScalarAsync(ct))!;
     }
 
-    public async Task<ExecutedTradeStats> GetExecutionStatsAsync(CancellationToken ct = default)
+    public Task<ExecutedTradeStats> GetExecutionStatsAsync(CancellationToken ct = default)
+        => GetExecutionStatsAsync(new ExecutedTradeQuery(), ct);
+
+    public async Task<ExecutedTradeStats> GetExecutionStatsAsync(ExecutedTradeQuery query, CancellationToken ct = default)
     {
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
-        await using var cmd = new NpgsqlCommand(@"
+        var sql = new StringBuilder(@"
             SELECT
                 COUNT(*)::INT AS total_executed,
                 COUNT(*) FILTER (WHERE status = 'Open')::INT AS open_trades,
@@ -172,7 +178,12 @@ public sealed class ExecutedTradeRepository : IExecutedTradeRepository
                 COUNT(*) FILTER (WHERE status IN ('Failed', 'Rejected', 'ValidationFailed', 'CloseFailed'))::INT AS failed_executions,
                 COALESCE(SUM(pnl), 0)::NUMERIC AS total_pnl,
                 COALESCE(MAX(account_currency) FILTER (WHERE account_currency <> ''), 'USD') AS currency
-            FROM ""ETH"".executed_trades;", conn);
+            FROM ""ETH"".executed_trades
+            WHERE 1 = 1");
+        await using var cmd = new NpgsqlCommand();
+        cmd.Connection = conn;
+        AppendFilters(sql, cmd, query);
+        cmd.CommandText = sql.ToString();
         await using var reader = await cmd.ExecuteReaderAsync(ct);
         await reader.ReadAsync(ct);
         var wins = reader.GetInt32(2);
@@ -191,11 +202,18 @@ public sealed class ExecutedTradeRepository : IExecutedTradeRepository
         };
     }
 
-    public async Task<int> GetOpenExecutedTradeCountAsync(CancellationToken ct = default)
+    public Task<int> GetOpenExecutedTradeCountAsync(CancellationToken ct = default)
+        => GetOpenExecutedTradeCountAsync(new ExecutedTradeQuery(), ct);
+
+    public async Task<int> GetOpenExecutedTradeCountAsync(ExecutedTradeQuery query, CancellationToken ct = default)
     {
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
-        await using var cmd = new NpgsqlCommand(@"SELECT COUNT(*)::INT FROM ""ETH"".executed_trades WHERE status = 'Open';", conn);
+        var sql = new StringBuilder(@"SELECT COUNT(*)::INT FROM ""ETH"".executed_trades WHERE status = 'Open'");
+        await using var cmd = new NpgsqlCommand();
+        cmd.Connection = conn;
+        AppendFilters(sql, cmd, query);
+        cmd.CommandText = sql.ToString();
         return (int)(await cmd.ExecuteScalarAsync(ct))!;
     }
 
@@ -262,15 +280,31 @@ public sealed class ExecutedTradeRepository : IExecutedTradeRepository
         return (long)(await cmd.ExecuteScalarAsync(ct))!;
     }
 
-    public async Task<AccountSnapshot?> GetLatestAccountSnapshotAsync(CancellationToken ct = default)
+    public Task<AccountSnapshot?> GetLatestAccountSnapshotAsync(CancellationToken ct = default)
+        => GetLatestAccountSnapshotAsync(accountName: null, isDemo: null, ct);
+
+    public async Task<AccountSnapshot?> GetLatestAccountSnapshotAsync(string? accountName, bool? isDemo, CancellationToken ct = default)
     {
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
-        await using var cmd = new NpgsqlCommand(@"
+        var sql = new StringBuilder(@"
             SELECT snapshot_id, account_id, account_name, currency, balance, equity, available, margin, funds, open_positions, is_demo, hedging_mode, captured_at_utc
             FROM ""ETH"".account_snapshots
-            ORDER BY captured_at_utc DESC
-            LIMIT 1;", conn);
+            WHERE 1 = 1");
+        await using var cmd = new NpgsqlCommand();
+        cmd.Connection = conn;
+        if (!string.IsNullOrWhiteSpace(accountName))
+        {
+            sql.Append(" AND account_name = @snapshot_account_name");
+            cmd.Parameters.AddWithValue("snapshot_account_name", accountName);
+        }
+        if (isDemo.HasValue)
+        {
+            sql.Append(" AND is_demo = @snapshot_is_demo");
+            cmd.Parameters.AddWithValue("snapshot_is_demo", isDemo.Value);
+        }
+        sql.Append(" ORDER BY captured_at_utc DESC LIMIT 1;");
+        cmd.CommandText = sql.ToString();
         await using var reader = await cmd.ExecuteReaderAsync(ct);
         if (!await reader.ReadAsync(ct))
             return null;
@@ -330,6 +364,21 @@ public sealed class ExecutedTradeRepository : IExecutedTradeRepository
             sql.Append(" AND instrument = @instrument");
             cmd.Parameters.AddWithValue("instrument", query.Instrument);
         }
+        if (!string.IsNullOrWhiteSpace(query.AccountId))
+        {
+            sql.Append(" AND account_id = @account_id");
+            cmd.Parameters.AddWithValue("account_id", query.AccountId);
+        }
+        if (!string.IsNullOrWhiteSpace(query.AccountName))
+        {
+            sql.Append(" AND account_name = @account_name");
+            cmd.Parameters.AddWithValue("account_name", query.AccountName);
+        }
+        if (query.IsDemo.HasValue)
+        {
+            sql.Append(" AND is_demo = @is_demo");
+            cmd.Parameters.AddWithValue("is_demo", query.IsDemo.Value);
+        }
         if (query.Direction.HasValue)
         {
             sql.Append(" AND direction = @direction");
@@ -371,6 +420,9 @@ public sealed class ExecutedTradeRepository : IExecutedTradeRepository
         cmd.Parameters.AddWithValue("deal_reference", (object?)trade.DealReference ?? DBNull.Value);
         cmd.Parameters.AddWithValue("deal_id", (object?)trade.DealId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("status", trade.Status.ToString());
+        cmd.Parameters.AddWithValue("account_id", trade.AccountId);
+        cmd.Parameters.AddWithValue("account_name", trade.AccountName);
+        cmd.Parameters.AddWithValue("is_demo", trade.IsDemo);
         cmd.Parameters.AddWithValue("account_currency", trade.AccountCurrency);
         cmd.Parameters.AddWithValue("opened_at_utc", (object?)trade.OpenedAtUtc ?? DBNull.Value);
         cmd.Parameters.AddWithValue("closed_at_utc", (object?)trade.ClosedAtUtc ?? DBNull.Value);
@@ -402,15 +454,18 @@ public sealed class ExecutedTradeRepository : IExecutedTradeRepository
         DealReference = reader.IsDBNull(14) ? null : reader.GetString(14),
         DealId = reader.IsDBNull(15) ? null : reader.GetString(15),
         Status = Enum.Parse<ExecutedTradeStatus>(reader.GetString(16), true),
-        AccountCurrency = reader.GetString(17),
-        OpenedAtUtc = reader.IsDBNull(18) ? null : reader.GetFieldValue<DateTimeOffset>(18),
-        ClosedAtUtc = reader.IsDBNull(19) ? null : reader.GetFieldValue<DateTimeOffset>(19),
-        Pnl = reader.IsDBNull(20) ? null : reader.GetDecimal(20),
-        FailureReason = reader.IsDBNull(21) ? null : reader.GetString(21),
-        ErrorDetails = reader.IsDBNull(22) ? null : reader.GetString(22),
-        ForceClosed = reader.GetBoolean(23),
-        CloseSource = reader.IsDBNull(24) ? null : Enum.Parse<TradeCloseSource>(reader.GetString(24), true),
-        CreatedAtUtc = reader.GetFieldValue<DateTimeOffset>(25),
-        UpdatedAtUtc = reader.GetFieldValue<DateTimeOffset>(26)
+        AccountId = reader.GetString(17),
+        AccountName = reader.GetString(18),
+        IsDemo = reader.GetBoolean(19),
+        AccountCurrency = reader.GetString(20),
+        OpenedAtUtc = reader.IsDBNull(21) ? null : reader.GetFieldValue<DateTimeOffset>(21),
+        ClosedAtUtc = reader.IsDBNull(22) ? null : reader.GetFieldValue<DateTimeOffset>(22),
+        Pnl = reader.IsDBNull(23) ? null : reader.GetDecimal(23),
+        FailureReason = reader.IsDBNull(24) ? null : reader.GetString(24),
+        ErrorDetails = reader.IsDBNull(25) ? null : reader.GetString(25),
+        ForceClosed = reader.GetBoolean(26),
+        CloseSource = reader.IsDBNull(27) ? null : Enum.Parse<TradeCloseSource>(reader.GetString(27), true),
+        CreatedAtUtc = reader.GetFieldValue<DateTimeOffset>(28),
+        UpdatedAtUtc = reader.GetFieldValue<DateTimeOffset>(29)
     };
 }

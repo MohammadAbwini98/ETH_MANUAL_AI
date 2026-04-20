@@ -1219,11 +1219,19 @@ async function refreshTradingSummary() {
     const demoEl = $('trade-demo-indicator');
     if (demoEl) {
         const accountName = account?.accountName || health?.accountName || '--';
-        const isDemo = account?.isDemo === true && health?.demoOnly === true;
-        demoEl.textContent = isDemo ? `${accountName} · DEMO` : `${accountName} · NOT DEMO`;
+        const accountId = account?.accountId || health?.accountId || '--';
+        const isDemo = account?.isDemo === true
+            && accountName === 'DEMOAI'
+            && health?.demoOnly === true
+            && health?.activeAccountIsDemo !== false;
+        demoEl.textContent = isDemo ? `${accountName} (${accountId}) · DEMO` : `${accountName} (${accountId}) · BLOCKED`;
         demoEl.style.color = isDemo ? 'var(--green)' : 'var(--red)';
         demoEl.style.fontWeight = '700';
     }
+
+    tradingSummaryText('trade-account-id', account?.accountId || health?.accountId || '--');
+    tradingSummaryText('trade-selection-source', health?.accountSelectionSource || '--');
+    tradingSummaryText('trade-last-exec-account', health?.latestExecutionAccountName || '--');
 
     const sessionEl = $('trade-session-status');
     if (sessionEl) {
@@ -1270,6 +1278,8 @@ function renderExecutedTrades() {
             <td>${trade.openedAtUtc ? toAmmanShort(trade.openedAtUtc) : '--'}</td>
             <td>${trade.closedAtUtc ? toAmmanShort(trade.closedAtUtc) : '--'}</td>
             <td class="${pnlCls}">${pnl}</td>
+            <td title="${escapeHtml(trade.accountId || '--')}">${escapeHtml(trade.accountName || '--')}</td>
+            <td><span class="badge ${trade.isDemo ? 'badge-win' : 'badge-loss'}" style="font-size:.68rem">${trade.isDemo ? 'DEMO' : 'LIVE'}</span></td>
             <td>${escapeHtml(trade.accountCurrency || '--')}</td>
             <td style="font-size:.7rem;font-family:monospace;color:var(--text)">${escapeHtml(trade.dealReference || '--')}</td>
             <td title="${escapeHtml(trade.errorDetails || trade.failureReason || '--')}" style="max-width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(trade.failureReason || '--')}</td>
@@ -1280,7 +1290,7 @@ function renderExecutedTrades() {
     }
 
     if (executedTradesData.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="18" class="text-center" style="color:var(--text)">No executed trades found</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="20" class="text-center" style="color:var(--text)">No executed trades found</td></tr>';
     }
 
     const totalPages = Math.max(1, Math.ceil(executedTradesTotal / EXECUTED_TRADES_PAGE_SIZE));

@@ -10,6 +10,7 @@ public sealed class TradeExecutionPolicy : ITradeExecutionPolicy
     private readonly ICapitalTradingClient _capitalClient;
     private readonly IExecutedTradeRepository _tradeRepo;
     private readonly IAccountSnapshotService _accountSnapshotService;
+    private readonly string _preferredDemoAccountName;
 
     public TradeExecutionPolicy(
         IConfiguration config,
@@ -21,6 +22,7 @@ public sealed class TradeExecutionPolicy : ITradeExecutionPolicy
         _capitalClient = capitalClient;
         _tradeRepo = tradeRepo;
         _accountSnapshotService = accountSnapshotService;
+        _preferredDemoAccountName = _config["CapitalTrading:PreferredDemoAccountName"] ?? "DEMOAI";
     }
 
     public TradeExecutionPolicySettings GetSettings()
@@ -78,10 +80,6 @@ public sealed class TradeExecutionPolicy : ITradeExecutionPolicy
         if (existing != null && existing.Status is not (ExecutedTradeStatus.Failed or ExecutedTradeStatus.Rejected or ExecutedTradeStatus.ValidationFailed))
             return Reject($"Signal {candidate.SignalId} already has an execution record with status {existing.Status}.", "DuplicateExecution");
 
-        var openTrades = await _tradeRepo.GetOpenExecutedTradeCountAsync(ct);
-        if (openTrades >= settings.MaxConcurrentOpenTrades)
-            return Reject($"Max concurrent open trades reached ({openTrades}/{settings.MaxConcurrentOpenTrades}).", "MaxConcurrentOpenTrades");
-
         await _capitalClient.EnsureDemoReadyAsync(ct);
         var epic = ResolveEpic(candidate.Symbol);
         var market = await _capitalClient.GetMarketInfoAsync(epic, ct);
@@ -91,6 +89,21 @@ public sealed class TradeExecutionPolicy : ITradeExecutionPolicy
         var account = await _accountSnapshotService.GetLatestAsync(ct);
         if (!account.IsDemo && settings.DemoOnly)
             return Reject("Active Capital account is not a demo account.", "AccountNotDemo");
+        if (settings.DemoOnly && !string.Equals(account.AccountName, _preferredDemoAccountName, StringComparison.Ordinal))
+        {
+            return Reject(
+                $"Active Capital account '{account.AccountName}' does not match the required demo account '{_preferredDemoAccountName}'.",
+                "UnexpectedDemoAccount");
+        }
+
+        var openTrades = await _tradeRepo.GetOpenExecutedTradeCountAsync(new ExecutedTradeQuery
+        {
+            AccountId = account.AccountId,
+            AccountName = account.AccountName,
+            IsDemo = settings.DemoOnly ? true : null
+        }, ct);
+        if (openTrades >= settings.MaxConcurrentOpenTrades)
+            return Reject($"Max concurrent open trades reached ({openTrades}/{settings.MaxConcurrentOpenTrades}).", "MaxConcurrentOpenTrades");
 
         var requestedSize = request.RequestedSize.GetValueOrDefault(market.MinDealSize);
         if (requestedSize <= 0)

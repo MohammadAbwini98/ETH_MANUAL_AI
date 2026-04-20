@@ -132,6 +132,9 @@ public sealed record ExecutedTrade
     public string? DealReference { get; init; }
     public string? DealId { get; init; }
     public required ExecutedTradeStatus Status { get; init; }
+    public string AccountId { get; init; } = "";
+    public string AccountName { get; init; } = "";
+    public bool IsDemo { get; init; }
     public required string AccountCurrency { get; init; }
     public decimal? Pnl { get; init; }
     public string? FailureReason { get; init; }
@@ -149,6 +152,9 @@ public sealed record ExecutedTradeQuery
     public DateTimeOffset? FromUtc { get; init; }
     public DateTimeOffset? ToUtc { get; init; }
     public string? Instrument { get; init; }
+    public string? AccountId { get; init; }
+    public string? AccountName { get; init; }
+    public bool? IsDemo { get; init; }
     public SignalDirection? Direction { get; init; }
     public string? Timeframe { get; init; }
     public SignalExecutionSourceType? SourceType { get; init; }

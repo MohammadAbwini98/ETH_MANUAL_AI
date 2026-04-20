@@ -25,6 +25,8 @@ public sealed class CapitalClient : ICapitalClient
     private string? _securityToken;
     private string? _activeAccountId;
     private string? _activeAccountName;
+    private string? _lastAccountSelectionSource;
+    private DateTimeOffset? _lastAccountResolutionUtc;
     private DateTimeOffset _lastAuthUtc;
     private static readonly TimeSpan TokenRefreshInterval = TimeSpan.FromHours(4);
     private readonly SemaphoreSlim _authLock = new(1, 1); // P8-03: protect concurrent auth
@@ -53,6 +55,12 @@ public sealed class CapitalClient : ICapitalClient
         await _authLock.WaitAsync(ct);
         try
         {
+            if (!string.IsNullOrWhiteSpace(_cst)
+                && !string.IsNullOrWhiteSpace(_securityToken)
+                && (DateTimeOffset.UtcNow - _lastAuthUtc) <= TokenRefreshInterval)
+            {
+                return;
+            }
 
             _logger.LogDebug("Sending auth request to {BaseUrl}", _http.BaseAddress);
             using var req = new HttpRequestMessage(HttpMethod.Post, "session");
@@ -156,14 +164,21 @@ public sealed class CapitalClient : ICapitalClient
         if (!IsDemoEnvironment)
             throw new InvalidOperationException("Capital trading is allowed only against the demo API base URL.");
 
-        await EnsurePreferredDemoAccountSelectedAsync(ct);
-        var account = await GetAccountInfoAsync(ct);
-        if (!account.IsDemo)
+        var context = await ResolveAccountContextAsync(requireConfiguredDemoAccount: true, ct);
+        if (context.Account.IsDemo == false)
             throw new InvalidOperationException("Capital trading guard rejected the active account because it is not demo.");
-        if (!string.Equals(account.AccountName, _preferredDemoAccountName, StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(context.Account.AccountName, _preferredDemoAccountName, StringComparison.Ordinal))
         {
             throw new InvalidOperationException(
-                $"Capital trading guard rejected the active demo account because '{account.AccountName}' is active instead of the required '{_preferredDemoAccountName}'.");
+                $"Capital trading guard rejected the active demo account because '{context.Account.AccountName}' is active instead of the required '{_preferredDemoAccountName}'.");
+        }
+
+        if (context.Account.IsDemo != true)
+        {
+            _logger.LogWarning(
+                "Capital.com did not return an explicit demo flag for account {AccountName} ({AccountId}); continuing because the demo API environment and exact-name selection policy are both satisfied.",
+                context.Account.AccountName,
+                context.Account.AccountId);
         }
     }
 
@@ -194,7 +209,7 @@ public sealed class CapitalClient : ICapitalClient
 
     public async Task<CapitalAccountInfo> GetAccountInfoAsync(CancellationToken ct = default)
     {
-        await EnsurePreferredDemoAccountSelectedAsync(ct);
+        var context = await ResolveAccountContextAsync(requireConfiguredDemoAccount: IsDemoEnvironment, ct);
         var accountsPayload = await SendAuthorizedGetAsync("accounts", ct);
         var prefsPayload = await SendAuthorizedGetAsync("accounts/preferences", ct);
         var accounts = JsonSerializer.Deserialize<AccountsResponse>(accountsPayload, JsonOpts)
@@ -202,9 +217,9 @@ public sealed class CapitalClient : ICapitalClient
         var prefs = JsonSerializer.Deserialize<AccountPreferencesResponse>(prefsPayload, JsonOpts);
 
         var account = accounts.Accounts?
-            .OrderByDescending(a => a.Preferred)
-            .FirstOrDefault(a => string.Equals(a.Status, "ENABLED", StringComparison.OrdinalIgnoreCase))
-            ?? throw new InvalidOperationException("No enabled Capital account is available for execution.");
+            .FirstOrDefault(a => string.Equals(a.AccountId, context.Account.AccountId, StringComparison.Ordinal))
+            ?? throw new InvalidOperationException(
+                $"Capital account '{context.Account.AccountId}' was resolved for trading but could not be found in the latest accounts payload.");
 
         _activeAccountId = account.AccountId;
         _activeAccountName = account.AccountName;
@@ -220,13 +235,15 @@ public sealed class CapitalClient : ICapitalClient
             ProfitLoss = profitLoss,
             Equity = balance + profitLoss,
             HedgingMode = prefs?.HedgingMode ?? false,
-            IsDemo = IsDemoEnvironment
+            IsDemo = context.Account.IsDemo ?? IsDemoEnvironment,
+            ResolutionSource = _lastAccountSelectionSource ?? context.SelectionSource,
+            ResolvedAtUtc = _lastAccountResolutionUtc ?? context.ResolvedAtUtc
         };
     }
 
     public async Task<CapitalOpenPositionResult> PlacePositionAsync(CapitalPlacePositionRequest request, CancellationToken ct = default)
     {
-        await EnsurePreferredDemoAccountSelectedAsync(ct);
+        await EnsureDemoReadyAsync(ct);
         var body = new
         {
             epic = request.Epic,
@@ -290,7 +307,7 @@ public sealed class CapitalClient : ICapitalClient
 
     public async Task<IReadOnlyList<CapitalPositionSnapshot>> GetOpenPositionsAsync(CancellationToken ct = default)
     {
-        await EnsurePreferredDemoAccountSelectedAsync(ct);
+        await EnsureDemoReadyAsync(ct);
         var payload = await SendAuthorizedGetAsync("positions", ct);
         var data = JsonSerializer.Deserialize<OpenPositionsResponse>(payload, JsonOpts) ?? new OpenPositionsResponse();
         return data.Positions
@@ -313,7 +330,7 @@ public sealed class CapitalClient : ICapitalClient
 
     public async Task<CapitalClosePositionResult> ClosePositionAsync(CapitalClosePositionRequest request, CancellationToken ct = default)
     {
-        await EnsurePreferredDemoAccountSelectedAsync(ct);
+        await EnsureDemoReadyAsync(ct);
         var payload = await SendAuthorizedAsync(HttpMethod.Delete, $"positions/{Uri.EscapeDataString(request.DealId)}", null, ct);
         var result = JsonSerializer.Deserialize<DealReferenceResponse>(payload, JsonOpts)
             ?? throw new InvalidOperationException("Capital close position response was empty.");
@@ -371,62 +388,96 @@ public sealed class CapitalClient : ICapitalClient
         _http.Dispose();
     }
 
-    private async Task EnsurePreferredDemoAccountSelectedAsync(CancellationToken ct)
+    private async Task<CapitalResolvedAccountContext> ResolveAccountContextAsync(bool requireConfiguredDemoAccount, CancellationToken ct)
     {
-        if (!IsDemoEnvironment)
-            return;
-
         await _accountSelectionLock.WaitAsync(ct);
         try
         {
             await AuthenticateAsync(ct);
             var accounts = await GetAccountsAsync(ct);
-            var target = accounts
-                .Where(a => string.Equals(a.Status, "ENABLED", StringComparison.OrdinalIgnoreCase))
-                .FirstOrDefault(a => string.Equals(a.AccountName, _preferredDemoAccountName, StringComparison.OrdinalIgnoreCase));
+            CapitalResolvedAccountContext resolved;
 
-            if (target is null || string.IsNullOrWhiteSpace(target.AccountId))
+            if (requireConfiguredDemoAccount || IsDemoEnvironment)
             {
-                throw new InvalidOperationException(
-                    $"Preferred Capital demo account '{_preferredDemoAccountName}' was not found among enabled accounts.");
+                resolved = ResolveConfiguredDemoAccount(accounts, DateTimeOffset.UtcNow);
+
+                if (!resolved.Account.Preferred)
+                {
+                    _logger.LogInformation(
+                        "Switching Capital active account to required demo account {AccountName} ({AccountId})",
+                        resolved.Account.AccountName,
+                        resolved.Account.AccountId);
+
+                    await SendAuthorizedJsonAsync(HttpMethod.Put, "session", new { accountId = resolved.Account.AccountId }, ct);
+
+                    var refreshedAccounts = await GetAccountsAsync(ct);
+                    var refreshed = ResolveConfiguredDemoAccount(refreshedAccounts, DateTimeOffset.UtcNow);
+                    if (!refreshed.Account.Preferred
+                        || !string.Equals(refreshed.Account.AccountId, resolved.Account.AccountId, StringComparison.Ordinal))
+                    {
+                        throw new InvalidOperationException(
+                            $"Capital account switch did not activate the required demo account '{_preferredDemoAccountName}'.");
+                    }
+
+                    resolved = refreshed with
+                    {
+                        SelectionSource = $"{refreshed.SelectionSource}+session-switch"
+                    };
+                }
+            }
+            else
+            {
+                var active = accounts
+                    .Where(a => string.Equals(a.Status, "ENABLED", StringComparison.OrdinalIgnoreCase))
+                    .OrderByDescending(a => a.Preferred)
+                    .FirstOrDefault()
+                    ?? throw new InvalidOperationException("No enabled Capital account is available.");
+
+                resolved = new CapitalResolvedAccountContext
+                {
+                    Account = ToBrokerAccount(active),
+                    SelectionSource = "accounts.preferred-enabled",
+                    ResolvedAtUtc = DateTimeOffset.UtcNow
+                };
             }
 
-            if (target.Preferred)
-            {
-                _activeAccountId = target.AccountId;
-                _activeAccountName = target.AccountName;
-                return;
-            }
+            _activeAccountId = resolved.Account.AccountId;
+            _activeAccountName = resolved.Account.AccountName;
+            _lastAccountSelectionSource = resolved.SelectionSource;
+            _lastAccountResolutionUtc = resolved.ResolvedAtUtc;
 
             _logger.LogInformation(
-                "Switching Capital active account to preferred demo account {AccountName} ({AccountId})",
-                target.AccountName, target.AccountId);
+                "Capital active account resolved as {AccountName} ({AccountId}) | Demo={IsDemo} | Source={Source}",
+                resolved.Account.AccountName,
+                resolved.Account.AccountId,
+                resolved.Account.IsDemo,
+                resolved.SelectionSource);
 
-            await SendAuthorizedJsonAsync(HttpMethod.Put, "session", new { accountId = target.AccountId }, ct);
-
-            var refreshedAccounts = await GetAccountsAsync(ct);
-            var active = refreshedAccounts
-                .Where(a => string.Equals(a.Status, "ENABLED", StringComparison.OrdinalIgnoreCase))
-                .OrderByDescending(a => a.Preferred)
-                .FirstOrDefault();
-
-            if (active is null
-                || !active.Preferred
-                || !string.Equals(active.AccountId, target.AccountId, StringComparison.Ordinal))
-            {
-                throw new InvalidOperationException(
-                    $"Capital account switch did not activate the required demo account '{_preferredDemoAccountName}'.");
-            }
-
-            _activeAccountId = active.AccountId;
-            _activeAccountName = active.AccountName;
-            _logger.LogInformation(
-                "Capital active account confirmed as demo account {AccountName} ({AccountId})",
-                active.AccountName, active.AccountId);
+            return resolved;
         }
         finally
         {
             _accountSelectionLock.Release();
+        }
+    }
+
+    private CapitalResolvedAccountContext ResolveConfiguredDemoAccount(IReadOnlyList<AccountRow> accounts, DateTimeOffset resolvedAtUtc)
+    {
+        try
+        {
+            return CapitalAccountSelectionPolicy.ResolveRequiredDemoAccount(
+                accounts.Select(ToBrokerAccount).ToList(),
+                _preferredDemoAccountName,
+                IsDemoEnvironment,
+                resolvedAtUtc);
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogError(ex,
+                "Capital demo account resolution failed for required account {AccountName} on base URL {BaseUrl}",
+                _preferredDemoAccountName,
+                _http.BaseAddress);
+            throw;
         }
     }
 
@@ -437,6 +488,18 @@ public sealed class CapitalClient : ICapitalClient
             ?? throw new InvalidOperationException("Capital accounts endpoint returned an empty payload.");
         return accounts.Accounts ?? [];
     }
+
+    private static CapitalBrokerAccount ToBrokerAccount(AccountRow row) => new()
+    {
+        AccountId = row.AccountId?.Trim() ?? "",
+        AccountName = row.AccountName?.Trim() ?? "",
+        Status = row.Status?.Trim() ?? "",
+        Currency = row.Currency?.Trim() ?? "USD",
+        Preferred = row.Preferred,
+        IsDemo = row.ResolveIsDemo(),
+        AccountType = row.AccountType ?? row.AccountCategory ?? row.Type,
+        EnvironmentName = row.EnvironmentName
+    };
 
     private async Task<string> SendAuthorizedGetAsync(string path, CancellationToken ct)
         => await SendAuthorizedAsync(HttpMethod.Get, path, null, ct);
@@ -584,7 +647,41 @@ public sealed class CapitalClient : ICapitalClient
         [JsonPropertyName("status")] public string? Status { get; init; }
         [JsonPropertyName("preferred")] public bool Preferred { get; init; }
         [JsonPropertyName("currency")] public string? Currency { get; init; }
+        [JsonPropertyName("isDemo")] public bool? IsDemo { get; init; }
+        [JsonPropertyName("demo")] public bool? Demo { get; init; }
+        [JsonPropertyName("accountType")] public string? AccountType { get; init; }
+        [JsonPropertyName("accountCategory")] public string? AccountCategory { get; init; }
+        [JsonPropertyName("type")] public string? Type { get; init; }
+        [JsonPropertyName("environment")] public string? EnvironmentName { get; init; }
         [JsonPropertyName("balance")] public AccountBalanceRow? Balance { get; init; }
+
+        public bool? ResolveIsDemo()
+        {
+            if (IsDemo.HasValue)
+                return IsDemo.Value;
+            if (Demo.HasValue)
+                return Demo.Value;
+
+            return InferDemoFlag(AccountType)
+                ?? InferDemoFlag(AccountCategory)
+                ?? InferDemoFlag(Type)
+                ?? InferDemoFlag(EnvironmentName);
+        }
+
+        private static bool? InferDemoFlag(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return null;
+
+            var normalized = value.Trim();
+            if (normalized.Contains("demo", StringComparison.OrdinalIgnoreCase)
+                || normalized.Contains("practice", StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (normalized.Contains("live", StringComparison.OrdinalIgnoreCase)
+                || normalized.Contains("real", StringComparison.OrdinalIgnoreCase))
+                return false;
+            return null;
+        }
     }
 
     private class AccountBalanceRow

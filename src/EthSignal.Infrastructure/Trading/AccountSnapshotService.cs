@@ -23,6 +23,8 @@ public sealed class AccountSnapshotService : IAccountSnapshotService
     {
         var info = await _capitalClient.GetAccountInfoAsync(ct);
         var openPositions = await _capitalClient.GetOpenPositionsAsync(ct);
+        _runtimeState.RecordAccountContext(info);
+
         var snapshot = new AccountSnapshot
         {
             AccountId = info.AccountId,

@@ -28,7 +28,7 @@ for var in CAPITAL_API_KEY CAPITAL_IDENTIFIER CAPITAL_PASSWORD; do
     fi
 done
 
-export CAPITAL_BASE_URL="${CAPITAL_BASE_URL:-https://api-capital.backend-capital.com}"
+export CAPITAL_BASE_URL="${CAPITAL_BASE_URL:-https://demo-api-capital.backend-capital.com}"
 export PG_CONNECTION="${PG_CONNECTION:-Host=localhost;Port=5432;Database=ETH_BASE;Username=mohammadabwini}"
 export ASPNETCORE_ENVIRONMENT="${ASPNETCORE_ENVIRONMENT:-Development}"
 

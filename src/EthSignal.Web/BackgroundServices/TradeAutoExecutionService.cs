@@ -7,8 +7,6 @@ namespace EthSignal.Web.BackgroundServices;
 
 public sealed class TradeAutoExecutionService : BackgroundService
 {
-    private static readonly TimeSpan PollInterval = TimeSpan.FromMinutes(1);
-
     private readonly IConfiguration _config;
     private readonly ISignalRepository _signalRepository;
     private readonly IBlockedSignalHistoryService _blockedHistory;
@@ -19,6 +17,7 @@ public sealed class TradeAutoExecutionService : BackgroundService
     private readonly IExecutedTradeRepository _executedTradeRepository;
     private readonly IPortalOverridesRepository _portalOverridesRepository;
     private readonly ILogger<TradeAutoExecutionService> _logger;
+    private readonly TimeSpan _pollInterval;
     private bool? _lastRecommendedExecutionEnabled;
 
     public TradeAutoExecutionService(
@@ -43,6 +42,8 @@ public sealed class TradeAutoExecutionService : BackgroundService
         _executedTradeRepository = executedTradeRepository;
         _portalOverridesRepository = portalOverridesRepository;
         _logger = logger;
+        var pollSeconds = Math.Clamp(_config.GetValue("CapitalTrading:AutoExecutePollIntervalSeconds", 1), 1, 60);
+        _pollInterval = TimeSpan.FromSeconds(pollSeconds);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -62,7 +63,7 @@ public sealed class TradeAutoExecutionService : BackgroundService
                 _logger.LogError(ex, "[TradeAutoExecution] Poll cycle failed");
             }
 
-            await Task.Delay(PollInterval, stoppingToken);
+            await Task.Delay(_pollInterval, stoppingToken);
         }
     }
 
