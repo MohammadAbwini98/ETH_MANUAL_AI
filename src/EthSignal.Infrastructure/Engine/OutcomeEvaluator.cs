@@ -460,6 +460,7 @@ public static class OutcomeEvaluator
     /// </summary>
     public static int GetTimeoutBars(StrategyParameters p, Timeframe tf)
     {
+        p = p.ResolveForTimeframe(tf.Name);
         int specificTimeout = tf.Minutes switch
         {
             1 => p.ScalpTimeoutBars,

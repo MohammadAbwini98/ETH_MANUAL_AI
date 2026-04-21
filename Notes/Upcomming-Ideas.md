@@ -23,6 +23,9 @@ MaxConsecutiveLossesPerDay.
 ScalpMaxConsecutiveLossesPerDay.
 
 
+-System should be able to recommend signals with multiple take profit levels [TP1, TP2, TP3], any type or any timeframe signal should have those 3 levels of take profit
+
+
 
 
 -------------------

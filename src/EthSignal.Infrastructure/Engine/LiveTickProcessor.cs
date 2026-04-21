@@ -225,7 +225,7 @@ public sealed class LiveTickProcessor
 
         // TF-5: Optional warm-start evaluation of the latest fully closed 5m bar
         {
-            var p = _paramProvider.GetActive();
+            var p = _paramProvider.GetActive().ResolveForTimeframe(Timeframe.M5.Name);
             if (p.WarmStartEvaluateLatestClosed5m && _currentRegimeResult != null)
             {
                 try
@@ -709,12 +709,14 @@ public sealed class LiveTickProcessor
             int expired = 0;
             foreach (var s in open)
             {
-                bool wrongVersion = !string.Equals(s.StrategyVersion, p.StrategyVersion, StringComparison.Ordinal);
+                var signalParams = p.ResolveForTimeframe(s.Timeframe);
+                bool wrongVersion = !string.Equals(s.StrategyVersion, signalParams.StrategyVersion, StringComparison.Ordinal);
 
                 // Expire if past the outcome timeout window for that TF
-                var tfMinutes = Math.Max(1, Timeframe.ByName(s.Timeframe).Minutes);
+                var tf = Timeframe.ByName(s.Timeframe);
+                var tfMinutes = Math.Max(1, tf.Minutes);
                 var ageMinutes = (DateTimeOffset.UtcNow - s.SignalTimeUtc).TotalMinutes;
-                var timeoutMinutes = tfMinutes * p.OutcomeTimeoutBars;
+                var timeoutMinutes = tfMinutes * OutcomeEvaluator.GetTimeoutBars(signalParams, tf);
                 bool tooOld = ageMinutes > timeoutMinutes;
 
                 if (wrongVersion || tooOld)
@@ -741,9 +743,9 @@ public sealed class LiveTickProcessor
     {
         try
         {
-            var p = GetRuntimeParameters();
             foreach (var tf in new[] { Timeframe.M1, Timeframe.M5, Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4 })
             {
+                var p = GetRuntimeParameters().ResolveForTimeframe(tf.Name);
                 // FIX: Always recompute from freshly-synced candles. The previous shortcut
                 // (reusing _currentRegimeResult for 15m, or skipping when cache had any value)
                 // caused stale regimes after offline gap recovery — the persisted regime could
@@ -793,7 +795,7 @@ public sealed class LiveTickProcessor
     {
         try
         {
-            var p = GetRuntimeParameters();
+            var p = GetRuntimeParameters().ResolveForTimeframe(tf.Name);
 
             // B-05: Gate indicators/signals when recent unresolved gaps exist
             if (await _auditRepo.HasRecentUnresolvedGapsAsync(symbol, lookbackMinutes: tf.Minutes * p.GapBlockLookbackBars, ct))
@@ -899,7 +901,7 @@ public sealed class LiveTickProcessor
         try
         {
             _logger.LogInformation("[LOG-TRACE] TryGenerateSignal: symbol={Symbol} tf={Tf} barTime={BarTime} close={Close} vol={Vol}", symbol, tf.Name, closedCandle.OpenTime.ToString("o"), closedCandle.MidClose, closedCandle.Volume);
-            var p = GetRuntimeParameters();
+            var p = GetRuntimeParameters().ResolveForTimeframe(tf.Name);
             var riskPolicy = p.ToRiskPolicy();
 
             var latestSnap = _latestSnaps.GetValueOrDefault(tf.Name);
@@ -1085,7 +1087,10 @@ public sealed class LiveTickProcessor
                     signal.Direction,
                     snap.CloseMid,
                     spreadPct,
-                    p.LiveEntrySlippageBufferPct);
+                    p,
+                    tf.Name,
+                    signal.ConfidenceScore,
+                    snap.Atr14);
 
                 // Build structure levels from candle history
                 var structureLevels = closedHistory.Count >= p.ExitStructureLookbackBars
@@ -1106,7 +1111,7 @@ public sealed class LiveTickProcessor
                     Structure = structureLevels,
                     SwingExtreme = swingExtreme
                 };
-                var exitPolicy = ExitEngine.BuildPolicy(p);
+                var exitPolicy = ExitEngine.BuildPolicy(p, tf.Name);
                 var exitResult = ExitEngine.Compute(exitCtx, exitPolicy);
 
                 // Risk USD (from legacy path — kept for position sizing)
@@ -1140,7 +1145,7 @@ public sealed class LiveTickProcessor
                     await _decisionAuditRepo.InsertDecisionAsync(persistedDecision, ct);
 
                     NotifyTelegramInBackground(
-                        TelegramMessageFormatter.NewSignal(fullSignal, persistedDecision, _currentRegimeResult, p.OutcomeTimeoutBars),
+                        TelegramMessageFormatter.NewSignal(fullSignal, persistedDecision, _currentRegimeResult, OutcomeEvaluator.GetTimeoutBars(p, tf)),
                         ct);
 
                     await LinkMlArtifactsAsync(mlArtifacts, fullSignal.SignalId, ct);
@@ -1207,7 +1212,8 @@ public sealed class LiveTickProcessor
     {
         try
         {
-            var p = GetRuntimeParameters();
+            var runtimeParams = GetRuntimeParameters();
+            var p = runtimeParams.ResolveForTimeframe(Timeframe.M1.Name);
 
             // TF-4: Check regime freshness
             if (_currentRegimeResult != null)
@@ -1236,7 +1242,7 @@ public sealed class LiveTickProcessor
             // instead of waiting for the once-per-hour 1h candle close.
             foreach (var tf in new[] { Timeframe.M5, Timeframe.M15, Timeframe.M30, Timeframe.H1 })
             {
-                await TryEvaluateRunningCandle(symbol, closed1mCandle, tf, p, ct);
+                await TryEvaluateRunningCandle(symbol, closed1mCandle, tf, runtimeParams.ResolveForTimeframe(tf.Name), ct);
             }
         }
         catch (Exception ex)
@@ -1457,7 +1463,10 @@ public sealed class LiveTickProcessor
                 signal.Direction,
                 snapshot.CloseMid,
                 spreadPct,
-                p.LiveEntrySlippageBufferPct);
+                p,
+                Timeframe.M1.Name,
+                signal.ConfidenceScore,
+                snapshot.Atr14);
 
             // Build structure levels from 1m candle history
             var scalpStructure = closed1m.Count >= 20
@@ -1504,7 +1513,7 @@ public sealed class LiveTickProcessor
                 await _decisionAuditRepo.InsertDecisionAsync(persistedDecision, ct);
 
                 NotifyTelegramInBackground(
-                    TelegramMessageFormatter.NewSignal(fullSignal, persistedDecision, _currentRegimeResult, p.OutcomeTimeoutBars),
+                    TelegramMessageFormatter.NewSignal(fullSignal, persistedDecision, _currentRegimeResult, OutcomeEvaluator.GetTimeoutBars(p, Timeframe.M1)),
                     ct);
 
                 await LinkMlArtifactsAsync(scalpMlArtifacts, fullSignal.SignalId, ct);
@@ -1767,7 +1776,10 @@ public sealed class LiveTickProcessor
                 signal.Direction,
                 snap.CloseMid,
                 spreadPct,
-                p.LiveEntrySlippageBufferPct);
+                p,
+                tf.Name,
+                signal.ConfidenceScore,
+                snap.Atr14);
 
             // Build structure levels from candle history
             var rcStructure = closedHistory.Count >= p.ExitStructureLookbackBars
@@ -1788,7 +1800,7 @@ public sealed class LiveTickProcessor
                 Structure = rcStructure,
                 SwingExtreme = swingExtreme
             };
-            var rcExitPolicy = ExitEngine.BuildPolicy(p);
+            var rcExitPolicy = ExitEngine.BuildPolicy(p, tf.Name);
             var rcExitResult = ExitEngine.Compute(rcExitCtx, rcExitPolicy);
 
             decimal riskUsd = p.AccountBalanceUsd * p.RiskPerTradePercent / 100m;
@@ -2201,7 +2213,9 @@ public sealed class LiveTickProcessor
         {
             // Use the signal's own timeframe for outcome evaluation (not always M5)
             var sigTf = Timeframe.ByName(sig.Timeframe);
-            var candlesAfter = await _repo.GetClosedCandlesAfterAsync(sigTf, symbol, sig.SignalTimeUtc, p.OutcomeTimeoutBars, ct);
+            var signalParams = p.ResolveForTimeframe(sigTf.Name);
+            var timeoutBars = OutcomeEvaluator.GetTimeoutBars(signalParams, sigTf);
+            var candlesAfter = await _repo.GetClosedCandlesAfterAsync(sigTf, symbol, sig.SignalTimeUtc, timeoutBars, ct);
             if (candlesAfter.Count == 0) continue;
 
             IReadOnlyList<RichCandle>? intrabarCandles = null;
@@ -2216,7 +2230,7 @@ public sealed class LiveTickProcessor
                     ct);
             }
 
-            var outcome = OutcomeEvaluator.Evaluate(sig, candlesAfter, p, sigTf, intrabarCandles,
+            var outcome = OutcomeEvaluator.Evaluate(sig, candlesAfter, signalParams, sigTf, intrabarCandles,
                 intrabarCandles != null ? Timeframe.M1 : null);
             if (outcome.OutcomeLabel == OutcomeLabel.PENDING) continue;
 
@@ -2243,7 +2257,7 @@ public sealed class LiveTickProcessor
                 try
                 {
                     var currentParams = GetRuntimeParameters();
-                    _adaptiveService.RecordOutcome(outcome, sig.MarketConditionClass, currentParams);
+                    _adaptiveService.RecordOutcome(outcome, sig.Timeframe, sig.MarketConditionClass, currentParams);
                 }
                 catch (Exception ex)
                 {

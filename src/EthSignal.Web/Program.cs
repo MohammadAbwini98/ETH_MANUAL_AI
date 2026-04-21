@@ -1440,6 +1440,45 @@ try
         return active != null ? Results.Ok(active) : Results.NotFound("No active parameter set");
     });
 
+    app.MapGet("/api/admin/parameter-sets/overview", async (
+        HttpContext ctx,
+        IParameterRepository paramRepo,
+        IParameterProvider paramProvider,
+        MarketAdaptiveParameterService adaptive) =>
+    {
+        if (RejectIfNotLoopback(ctx) is { } forbidden)
+            return forbidden;
+
+        var runtimeParameters = paramProvider.GetActive();
+        var activeBaseSet = await paramRepo.GetActiveAsync(runtimeParameters.StrategyVersion);
+        if (activeBaseSet == null)
+            return Results.NotFound("No active parameter set");
+
+        var adaptiveStatus = adaptive.GetStatus(runtimeParameters);
+        var timeframeSetups = adaptiveStatus.TimeframeProfiles
+            .OrderBy(p => Timeframe.ByNameOrDefault(p.Timeframe).Minutes)
+            .ToList();
+        var latestAdaptiveChange = adaptiveStatus.RecentChanges
+            .OrderByDescending(change => change.ChangedAtUtc)
+            .FirstOrDefault();
+        var latestAdaptiveChangeUtc = latestAdaptiveChange?.ChangedAtUtc
+            ?? timeframeSetups.OrderByDescending(setup => setup.LastChangedUtc)
+                .Select(setup => (DateTimeOffset?)setup.LastChangedUtc)
+                .FirstOrDefault();
+
+        return Results.Ok(new
+        {
+            baseSet = activeBaseSet,
+            baseActivatedUtc = activeBaseSet.ActivatedUtc,
+            timeframeSetups,
+            timeframeSetupCount = timeframeSetups.Count,
+            latestAdaptiveChangeUtc,
+            latestAdaptiveChangeTimeframe = latestAdaptiveChange?.Timeframe,
+            adaptiveEnabled = adaptiveStatus.Enabled,
+            primaryAdaptiveCondition = adaptiveStatus.CurrentCondition
+        });
+    });
+
     app.MapGet("/api/admin/parameter-sets/candidates", async (HttpContext ctx, IParameterRepository paramRepo, IParameterProvider paramProvider) =>
     {
         if (RejectIfNotLoopback(ctx) is { } forbidden)

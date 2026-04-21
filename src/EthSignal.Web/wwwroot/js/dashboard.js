@@ -2626,58 +2626,134 @@ async function refreshAdaptiveStatus() {
         setText('adaptive-tracked-count', d.trackedConditionCount);
         setText('adaptive-retro-count', d.retrospectiveOverlayCount);
 
-        const tbody = $('adaptive-conditions-body');
-        if (!tbody) return;
-
-        const conditions = d.conditionDetails || [];
-        if (conditions.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="5" style="color:var(--text-dim);text-align:center">No conditions tracked yet — outcomes accumulate as live signals resolve</td></tr>';
-            return;
+        const timeframeBody = $('adaptive-timeframes-body');
+        const profiles = d.timeframeProfiles || [];
+        if (timeframeBody) {
+            if (profiles.length === 0) {
+                timeframeBody.innerHTML = '<tr><td colspan="5" style="color:var(--text-dim);text-align:center">No timeframe adaptive setups have been persisted yet</td></tr>';
+            } else {
+                timeframeBody.innerHTML = profiles
+                    .sort((a, b) => timeframeSort(a.timeframe) - timeframeSort(b.timeframe))
+                    .map(p => {
+                        const condition = p.currentConditionClass || 'none';
+                        const strategy = `${escapeHtml(p.strategyVersion)} · ${escapeHtml(p.profileBucket)}`;
+                        const parameters = `C ${p.confidenceBuyThreshold}/${p.confidenceSellThreshold} · ATR ${fmt(p.minAtrThreshold, 2)} · SL ${fmt(p.stopAtrMultiplier, 2)}x · TP ${fmt(p.targetRMultiple, 2)}R · ML ${(Number(p.mlMinWinProbability || 0) * 100).toFixed(0)}%`;
+                        const hash = escapeHtml((p.effectiveParameterHash || '').substring(0, 8));
+                        const retro = p.hasRetrospectiveOverlay ? ' · retro' : '';
+                        return `<tr>
+                            <td style="color:var(--text);font-weight:600">${escapeHtml(p.timeframe)}</td>
+                            <td style="color:var(--text)">${strategy}</td>
+                            <td style="color:var(--text-sub)">
+                                <div>${escapeHtml(parameters)}</div>
+                                <div style="font-size:.65rem;color:var(--text-dim)">hash ${hash}${retro} · intensity ${fmt(p.effectiveIntensity, 2)}</div>
+                            </td>
+                            <td style="font-family:monospace;color:var(--text)">${escapeHtml(condition)}</td>
+                            <td style="color:var(--text-dim)">${toAmmanShort(p.lastChangedUtc)}</td>
+                        </tr>`;
+                    }).join('');
+            }
         }
 
-        const totalOutcomes = conditions.reduce((s, c) => s + c.outcomeCount, 0);
-        tbody.innerHTML = conditions
-            .sort((a, b) => b.outcomeCount - a.outcomeCount)
-            .map(c => {
-                const lowData = c.outcomeCount < 5;
-                const wrColor = lowData ? 'var(--text-dim)' : c.winRate >= 0.55 ? 'var(--green)' : c.winRate >= 0.45 ? 'var(--yellow)' : 'var(--red)';
-                const expColor = lowData ? 'var(--text-dim)' : c.expectancy >= 0.15 ? 'var(--green)' : c.expectancy >= 0 ? 'var(--yellow)' : 'var(--red)';
-                const lowBadge = lowData ? ' <span style="font-size:.6rem;color:var(--yellow);opacity:.7">(low data)</span>' : '';
-                return `<tr>
-                    <td style="font-family:monospace;font-size:.7rem;color:var(--text)">${escapeHtml(c.conditionKey)}${lowBadge}</td>
-                    <td style="color:var(--text)">${c.outcomeCount}</td>
-                    <td style="color:${wrColor}">${(c.winRate * 100).toFixed(1)}%</td>
-                    <td style="color:${expColor}">${Number(c.expectancy).toFixed(3)}R</td>
-                    <td>${c.hasRetrospectiveOverlay ? '<span style="color:var(--purple)">●</span>' : '<span style="color:var(--text-dim)">–</span>'}</td>
-                </tr>`;
-            }).join('')
-            + `<tr><td colspan="5" style="font-size:.65rem;color:var(--text-dim);text-align:right;padding-top:.3rem">${totalOutcomes} live outcomes tracked across ${conditions.length} conditions — accumulates as signals resolve</td></tr>`;
+        const tbody = $('adaptive-conditions-body');
+        const conditions = d.conditionDetails || [];
+        if (tbody) {
+            if (conditions.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-dim);text-align:center">No conditions tracked yet — outcomes accumulate as live signals resolve</td></tr>';
+            } else {
+                const totalOutcomes = conditions.reduce((s, c) => s + c.outcomeCount, 0);
+                tbody.innerHTML = conditions
+                    .sort((a, b) => {
+                        const tf = timeframeSort(a.timeframe) - timeframeSort(b.timeframe);
+                        return tf !== 0 ? tf : b.outcomeCount - a.outcomeCount;
+                    })
+                    .map(c => {
+                        const lowData = c.outcomeCount < 5;
+                        const wrColor = lowData ? 'var(--text-dim)' : c.winRate >= 0.55 ? 'var(--green)' : c.winRate >= 0.45 ? 'var(--yellow)' : 'var(--red)';
+                        const expColor = lowData ? 'var(--text-dim)' : c.expectancy >= 0.15 ? 'var(--green)' : c.expectancy >= 0 ? 'var(--yellow)' : 'var(--red)';
+                        const lowBadge = lowData ? ' <span style="font-size:.6rem;color:var(--yellow);opacity:.7">(low data)</span>' : '';
+                        return `<tr>
+                            <td style="color:var(--text);font-weight:600">${escapeHtml(c.timeframe)}</td>
+                            <td style="font-family:monospace;font-size:.7rem;color:var(--text)">${escapeHtml(c.conditionKey)}${lowBadge}</td>
+                            <td style="color:var(--text)">${c.outcomeCount}</td>
+                            <td style="color:${wrColor}">${(c.winRate * 100).toFixed(1)}%</td>
+                            <td style="color:${expColor}">${Number(c.expectancy).toFixed(3)}R</td>
+                            <td>${c.hasRetrospectiveOverlay ? '<span style="color:var(--purple)">●</span>' : '<span style="color:var(--text-dim)">–</span>'}</td>
+                        </tr>`;
+                    }).join('')
+                    + `<tr><td colspan="6" style="font-size:.65rem;color:var(--text-dim);text-align:right;padding-top:.3rem">${totalOutcomes} live outcomes tracked across ${conditions.length} timeframe conditions</td></tr>`;
+            }
+        }
+
+        const changesBody = $('adaptive-changes-body');
+        if (changesBody) {
+            const changes = d.recentChanges || [];
+            if (changes.length === 0) {
+                changesBody.innerHTML = '<tr><td colspan="5" style="color:var(--text-dim);text-align:center">No adaptive setup changes recorded yet</td></tr>';
+            } else {
+                changesBody.innerHTML = changes
+                    .map(c => {
+                        const setup = `C ${c.confidenceBuyThreshold}/${c.confidenceSellThreshold} · SL ${fmt(c.stopAtrMultiplier, 2)}x · TP ${fmt(c.targetRMultiple, 2)}R`;
+                        const hash = escapeHtml((c.currentParameterHash || '').substring(0, 8));
+                        return `<tr>
+                            <td style="color:var(--text-dim)">${toAmmanShort(c.changedAtUtc)}</td>
+                            <td style="color:var(--text);font-weight:600">${escapeHtml(c.timeframe)}</td>
+                            <td style="color:var(--text)">${escapeHtml(c.changeReason)}</td>
+                            <td style="font-family:monospace;color:var(--text)">${escapeHtml(c.currentConditionClass || 'none')}</td>
+                            <td style="color:var(--text-sub)">
+                                <div>${escapeHtml(c.strategyVersion)} · ${escapeHtml(c.profileBucket)} · ${setup}</div>
+                                <div style="font-size:.65rem;color:var(--text-dim)">hash ${hash}${c.hasRetrospectiveOverlay ? ' · retro' : ''}</div>
+                            </td>
+                        </tr>`;
+                    }).join('');
+            }
+        }
     } catch (e) {
         console.warn('Adaptive status refresh error:', e);
+    }
+}
+
+function timeframeSort(tf) {
+    switch ((tf || '').toLowerCase()) {
+        case '1m': return 1;
+        case '5m': return 5;
+        case '15m': return 15;
+        case '30m': return 30;
+        case '1h': return 60;
+        case '4h': return 240;
+        default: return 9999;
     }
 }
 
 // ─── Active Parameter Set ──────────────────────────────
 async function refreshActiveParameterSet() {
     try {
-        const r = await fetch('/api/admin/parameter-sets/active');
+        const r = await fetch('/api/admin/parameter-sets/overview');
         if (!r.ok) throw new Error(r.status);
         const d = await r.json();
+        const base = d.baseSet || d;
 
         const setText = (id, val) => { const el = $(id); if (el) el.textContent = val; };
         const setHtml = (id, val) => { const el = $(id); if (el) el.innerHTML = val; };
 
-        setText('ps-id', '#' + d.id);
-        setText('ps-version', d.strategyVersion);
-        setText('ps-hash', d.parameterHash);
-        setText('ps-created-by', d.createdBy || '--');
-        setText('ps-activated', toAmmanShort(d.activatedUtc));
-        setText('param-set-meta', `Set #${d.id} · ${d.strategyVersion} · ${d.parameterHash?.substring(0, 8)}`);
+        setText('ps-id', '#' + base.id);
+        setText('ps-version', base.strategyVersion);
+        setText('ps-hash', base.parameterHash);
+        setText('ps-created-by', base.createdBy || '--');
+        setText('ps-activated', toAmmanShort(d.baseActivatedUtc || base.activatedUtc));
+        setText('ps-runtime-changed', d.latestAdaptiveChangeUtc ? `${toAmmanShort(d.latestAdaptiveChangeUtc)}${d.latestAdaptiveChangeTimeframe ? ` · ${d.latestAdaptiveChangeTimeframe}` : ''}` : '—');
+        setText('ps-timeframe-count', d.timeframeSetupCount ?? 0);
+        setText('param-set-meta', `Base #${base.id} · ${base.strategyVersion} · ${base.parameterHash?.substring(0, 8)}`);
 
         const notesEl = $('ps-notes');
-        if (notesEl) notesEl.textContent = d.notes || '';
+        if (notesEl) {
+            const noteParts = [];
+            if (base.notes) noteParts.push(base.notes);
+            if (d.primaryAdaptiveCondition) noteParts.push(`Primary adaptive condition: ${d.primaryAdaptiveCondition}`);
+            noteParts.push(`Adaptive runtime: ${d.adaptiveEnabled ? 'enabled' : 'disabled'}`);
+            notesEl.textContent = noteParts.join(' · ');
+        }
 
-        const p = d.parameters || {};
+        const p = base.parameters || {};
 
         // Signal thresholds
         setText('ps-conf-buy', p.confidenceBuyThreshold ?? '--');
@@ -2702,6 +2778,27 @@ async function refreshActiveParameterSet() {
         setText('ps-adaptive-intensity', fmt(p.adaptiveOverlayIntensity, 2));
         setText('ps-adaptive-min-outcomes', p.adaptiveRetrospectiveMinOutcomes ?? '--');
         setText('ps-adaptive-window', p.adaptiveRetrospectiveWindowSize ?? '--');
+
+        const tfBody = $('ps-timeframes-body');
+        const setups = d.timeframeSetups || [];
+        if (tfBody) {
+            if (setups.length === 0) {
+                tfBody.innerHTML = '<tr><td colspan="4" style="color:var(--text-dim);text-align:center">No timeframe runtime setups have been persisted yet</td></tr>';
+            } else {
+                tfBody.innerHTML = setups
+                    .sort((a, b) => timeframeSort(a.timeframe) - timeframeSort(b.timeframe))
+                    .map(setup => {
+                        const strategy = `${escapeHtml(setup.strategyVersion)} · ${escapeHtml(setup.profileBucket)}`;
+                        const runtime = `C ${setup.confidenceBuyThreshold}/${setup.confidenceSellThreshold} · SL ${fmt(setup.stopAtrMultiplier, 2)}x · TP ${fmt(setup.targetRMultiple, 2)}R · ${escapeHtml((setup.effectiveParameterHash || '').substring(0, 8))}`;
+                        return `<tr>
+                            <td style="color:var(--text);font-weight:600">${escapeHtml(setup.timeframe)}</td>
+                            <td style="color:var(--text)">${strategy}</td>
+                            <td style="color:var(--text-sub)">${runtime}</td>
+                            <td style="color:var(--text-dim)">${toAmmanShort(setup.lastChangedUtc)}</td>
+                        </tr>`;
+                    }).join('');
+            }
+        }
     } catch (e) {
         console.warn('Active parameter set refresh error:', e);
     }

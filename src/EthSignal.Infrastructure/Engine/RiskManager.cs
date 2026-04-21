@@ -94,14 +94,47 @@ public static class RiskManager
         decimal referencePrice,
         decimal spreadPct,
         decimal entryBufferPct)
+        => EstimateLiveFillPrice(
+            direction,
+            referencePrice,
+            spreadPct,
+            StrategyParameters.Default with { LiveEntrySlippageBufferPct = entryBufferPct },
+            Timeframe.M5.Name,
+            confidenceScore: 0,
+            atr: 0m);
+
+    public static decimal EstimateLiveFillPrice(
+        SignalDirection direction,
+        decimal referencePrice,
+        decimal spreadPct,
+        StrategyParameters parameters,
+        string timeframe,
+        int confidenceScore,
+        decimal atr)
     {
         if (direction == SignalDirection.NO_TRADE || referencePrice <= 0)
             return referencePrice;
 
-        var effectiveBufferPct = Math.Max(0m, Math.Max(entryBufferPct, spreadPct / 2m));
+        var resolvedParameters = parameters.ResolveForTimeframe(timeframe);
+        var effectiveBufferPct = Math.Max(0m, Math.Max(resolvedParameters.LiveEntrySlippageBufferPct, spreadPct / 2m));
+        var atrBufferMultiplier = resolvedParameters.ResolveTimeframeProfileBucket(timeframe) switch
+        {
+            TimeframeProfileBucket.Fast => resolvedParameters.FastTimeframeEntryAtrMultiplier,
+            TimeframeProfileBucket.Long => resolvedParameters.LongTimeframeEntryAtrMultiplier,
+            _ => resolvedParameters.MidTimeframeEntryAtrMultiplier
+        };
+        var cappedAtrBuffer = atr > 0
+            ? Math.Min(atr * atrBufferMultiplier, referencePrice * resolvedParameters.EntryAtrBufferCapPct)
+            : 0m;
+        var confidenceMultiplier = confidenceScore >= resolvedParameters.ExitHighConfidenceThreshold
+            ? resolvedParameters.HighConfidenceEntryBufferMultiplier
+            : confidenceScore <= resolvedParameters.ExitLowConfidenceThreshold
+                ? resolvedParameters.LowConfidenceEntryBufferMultiplier
+                : 1m;
+        var absoluteBuffer = (referencePrice * effectiveBufferPct + cappedAtrBuffer) * confidenceMultiplier;
         var multiplier = direction == SignalDirection.BUY
-            ? 1m + effectiveBufferPct
-            : 1m - effectiveBufferPct;
+            ? 1m + absoluteBuffer / referencePrice
+            : 1m - absoluteBuffer / referencePrice;
 
         return referencePrice * multiplier;
     }

@@ -108,6 +108,12 @@ public sealed record StrategyParameters
     public decimal MinAtrThreshold { get; init; } = 0.8m;
     public decimal MinRiskRewardAfterRounding { get; init; } = 1.5m;
     public decimal LiveEntrySlippageBufferPct { get; init; } = 0.002m;
+    public decimal FastTimeframeEntryAtrMultiplier { get; init; } = 0.08m;
+    public decimal MidTimeframeEntryAtrMultiplier { get; init; } = 0.05m;
+    public decimal LongTimeframeEntryAtrMultiplier { get; init; } = 0.03m;
+    public decimal EntryAtrBufferCapPct { get; init; } = 0.0025m;
+    public decimal HighConfidenceEntryBufferMultiplier { get; init; } = 0.9m;
+    public decimal LowConfidenceEntryBufferMultiplier { get; init; } = 1.12m;
 
     // ─── FR-2: Scoped Position Capacity ─────────────────
     /// <summary>Maximum open signals per individual timeframe (0 = no per-TF limit, use global).</summary>
@@ -267,6 +273,10 @@ public sealed record StrategyParameters
     public decimal ExitIntradayMinAtrTpMultiplier { get; init; } = 1.5m;
     /// <summary>Intraday max ATR multiplier for TP projection range.</summary>
     public decimal ExitIntradayMaxAtrTpMultiplier { get; init; } = 3.0m;
+    /// <summary>Higher-timeframe min ATR multiplier for TP projection range.</summary>
+    public decimal ExitHigherTfMinAtrTpMultiplier { get; init; } = 2.2m;
+    /// <summary>Higher-timeframe max ATR multiplier for TP projection range.</summary>
+    public decimal ExitHigherTfMaxAtrTpMultiplier { get; init; } = 4.2m;
 
     /// <summary>Scalp TP1 R-multiple (tighter than HTF).</summary>
     public decimal ExitScalpTp1RMultiple { get; init; } = 0.8m;
@@ -277,6 +287,16 @@ public sealed record StrategyParameters
 
     /// <summary>Number of candles of lookback history for structure-aware exit analysis.</summary>
     public int ExitStructureLookbackBars { get; init; } = 50;
+    /// <summary>ATR fraction added beyond structure invalidation to reduce stop-outs from exact-level placement.</summary>
+    public decimal ExitStructureBufferAtrMultiplier { get; init; } = 0.15m;
+
+    // ─── Timeframe Profiles ────────────────────────────
+    /// <summary>
+    /// Bucketed profile overrides applied on top of the active parameter set.
+    /// Fast = 1m/5m, Mid = 15m/30m, Long = 1h/4h.
+    /// Missing values fall back to the active base parameters.
+    /// </summary>
+    public TimeframeStrategyProfileSet TimeframeProfiles { get; init; } = TimeframeStrategyProfileSet.Default;
 
     // ─── Helpers ────────────────────────────────────────
 
@@ -301,6 +321,22 @@ public sealed record StrategyParameters
     /// <summary>Validate constraints. Returns null if valid, error message if invalid.</summary>
     public string? Validate()
     {
+        var baseError = ValidateCore();
+        if (baseError != null)
+            return baseError;
+
+        foreach (var timeframe in Timeframe.Signal.Select(t => t.Name))
+        {
+            var resolvedError = ResolveForTimeframe(timeframe).ValidateCore();
+            if (resolvedError != null)
+                return $"{timeframe} timeframe profile invalid: {resolvedError}";
+        }
+
+        return null;
+    }
+
+    private string? ValidateCore()
+    {
         if (EmaFastPeriod >= EmaSlowPeriod)
             return $"EmaFastPeriod({EmaFastPeriod}) must be < EmaSlowPeriod({EmaSlowPeriod})";
         if (HardMaxRiskPercent < RiskPerTradePercent)
@@ -315,6 +351,12 @@ public sealed record StrategyParameters
             return "TargetRMultiple must be > 0";
         if (LiveEntrySlippageBufferPct < 0)
             return "LiveEntrySlippageBufferPct must be >= 0";
+        if (FastTimeframeEntryAtrMultiplier < 0 || MidTimeframeEntryAtrMultiplier < 0 || LongTimeframeEntryAtrMultiplier < 0)
+            return "Entry ATR multipliers must be >= 0";
+        if (EntryAtrBufferCapPct <= 0)
+            return "EntryAtrBufferCapPct must be > 0";
+        if (HighConfidenceEntryBufferMultiplier <= 0 || LowConfidenceEntryBufferMultiplier <= 0)
+            return "Entry buffer confidence multipliers must be > 0";
         if (ConfidenceBuyThreshold <= 0 || ConfidenceSellThreshold <= 0)
             return "Confidence thresholds must be > 0";
         if (OutcomeTimeoutBars <= 0)
@@ -327,11 +369,26 @@ public sealed record StrategyParameters
             return "Exit TP multiples must be strictly ascending";
         if (ExitScalpTp1RMultiple >= ExitScalpTp2RMultiple || ExitScalpTp2RMultiple >= ExitScalpTp3RMultiple)
             return "Scalp exit TP multiples must be strictly ascending";
+        if (ExitIntradayMinAtrTpMultiplier <= 0 || ExitIntradayMinAtrTpMultiplier >= ExitIntradayMaxAtrTpMultiplier)
+            return "Intraday ATR TP multipliers must be > 0 and strictly ascending";
+        if (ExitHigherTfMinAtrTpMultiplier <= 0 || ExitHigherTfMinAtrTpMultiplier >= ExitHigherTfMaxAtrTpMultiplier)
+            return "Higher timeframe ATR TP multipliers must be > 0 and strictly ascending";
         if (MinStopDistancePct <= 0)
             return "MinStopDistancePct must be > 0";
         if (MinStopDistancePct >= ExitMaxStopDistancePct)
             return $"MinStopDistancePct({MinStopDistancePct}) must be < ExitMaxStopDistancePct({ExitMaxStopDistancePct})";
+        if (ExitStructureBufferAtrMultiplier < 0)
+            return "ExitStructureBufferAtrMultiplier must be >= 0";
         return null;
+    }
+
+    public TimeframeProfileBucket ResolveTimeframeProfileBucket(string timeframe)
+        => TimeframeStrategyProfileSet.ResolveBucket(timeframe);
+
+    public StrategyParameters ResolveForTimeframe(string timeframe)
+    {
+        var profile = TimeframeProfiles.GetProfile(timeframe);
+        return profile.ApplyTo(this);
     }
 
     /// <summary>Deterministic JSON for hashing.</summary>

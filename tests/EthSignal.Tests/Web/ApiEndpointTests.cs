@@ -14,6 +14,7 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
 using Moq;
 
 namespace EthSignal.Tests.Web;
@@ -366,6 +367,123 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
     }
 
     [Fact]
+    public async Task Adaptive_Status_Returns_Timeframe_Profiles_And_Recent_Changes()
+    {
+        var parameters = StrategyParameters.Default with
+        {
+            TimeframeProfiles = TimeframeStrategyProfileSet.Recommended
+        };
+
+        var adaptive = new MarketAdaptiveParameterService(new Mock<ILogger<MarketAdaptiveParameterService>>().Object);
+        var m5Snapshot = MakeAdaptiveSnapshot("5m");
+        var h1Snapshot = MakeAdaptiveSnapshot("1h");
+        var regime = MakeAdaptiveRegime();
+        adaptive.AdaptParameters(parameters, m5Snapshot, regime, MakeAdaptiveCandle(DateTimeOffset.UtcNow.AddMinutes(-5)), Timeframe.M5, [m5Snapshot]);
+        adaptive.AdaptParameters(parameters, h1Snapshot, regime, MakeAdaptiveCandle(DateTimeOffset.UtcNow.AddHours(-1)), Timeframe.H1, [h1Snapshot]);
+        adaptive.RecordOutcome(new SignalOutcome
+        {
+            SignalId = Guid.NewGuid(),
+            OutcomeLabel = OutcomeLabel.WIN,
+            PnlR = 1.2m,
+            EvaluatedAtUtc = DateTimeOffset.UtcNow
+        }, "5m", "NORMAL_MODERATE", parameters);
+
+        var client = _factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureServices(services =>
+            {
+                services.RemoveAll<MarketAdaptiveParameterService>();
+                services.RemoveAll<IParameterProvider>();
+
+                var provider = new Mock<IParameterProvider>();
+                provider.Setup(p => p.GetActive()).Returns(parameters);
+                provider.Setup(p => p.RefreshAsync(It.IsAny<CancellationToken>())).ReturnsAsync(true);
+                provider.Setup(p => p.ForceOverrideMlMode(It.IsAny<MlMode>()));
+
+                services.AddSingleton(adaptive);
+                services.AddSingleton(provider.Object);
+            });
+        }).CreateClient();
+
+        var response = await client.GetAsync("/api/admin/adaptive/status");
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        var root = doc.RootElement;
+
+        root.GetProperty("timeframeProfiles").GetArrayLength().Should().BeGreaterThanOrEqualTo(2);
+        root.GetProperty("recentChanges").GetArrayLength().Should().BeGreaterThanOrEqualTo(2);
+        root.GetProperty("conditionDetails").EnumerateArray()
+            .Should().Contain(detail => detail.GetProperty("timeframe").GetString() == "5m");
+        root.GetProperty("timeframeProfiles").EnumerateArray()
+            .Should().Contain(profile => profile.GetProperty("timeframe").GetString() == "1h");
+    }
+
+    [Fact]
+    public async Task Parameter_Set_Overview_Returns_Base_Set_And_Timeframe_Runtime_Setups()
+    {
+        var parameters = StrategyParameters.Default with
+        {
+            TimeframeProfiles = TimeframeStrategyProfileSet.Recommended
+        };
+        var activatedAt = new DateTimeOffset(2026, 4, 21, 20, 47, 0, TimeSpan.Zero);
+        var baseSet = new StrategyParameterSet
+        {
+            Id = 21,
+            StrategyVersion = parameters.StrategyVersion,
+            ParameterHash = "base-overview-hash",
+            Parameters = parameters,
+            Status = ParameterSetStatus.Active,
+            CreatedBy = "tests",
+            ActivatedUtc = activatedAt,
+            Notes = "overview baseline"
+        };
+
+        var adaptive = new MarketAdaptiveParameterService(new Mock<ILogger<MarketAdaptiveParameterService>>().Object);
+        var m5Snapshot = MakeAdaptiveSnapshot("5m");
+        var h1Snapshot = MakeAdaptiveSnapshot("1h");
+        var regime = MakeAdaptiveRegime();
+        adaptive.AdaptParameters(parameters, m5Snapshot, regime, MakeAdaptiveCandle(DateTimeOffset.UtcNow.AddMinutes(-5)), Timeframe.M5, [m5Snapshot]);
+        adaptive.AdaptParameters(parameters, h1Snapshot, regime, MakeAdaptiveCandle(DateTimeOffset.UtcNow.AddHours(-1)), Timeframe.H1, [h1Snapshot]);
+
+        var client = _factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureServices(services =>
+            {
+                services.RemoveAll<MarketAdaptiveParameterService>();
+                services.RemoveAll<IParameterProvider>();
+                services.RemoveAll<IParameterRepository>();
+
+                var provider = new Mock<IParameterProvider>();
+                provider.Setup(p => p.GetActive()).Returns(parameters);
+                provider.Setup(p => p.RefreshAsync(It.IsAny<CancellationToken>())).ReturnsAsync(true);
+                provider.Setup(p => p.ForceOverrideMlMode(It.IsAny<MlMode>()));
+
+                var repository = new Mock<IParameterRepository>();
+                repository.Setup(r => r.GetActiveAsync(parameters.StrategyVersion, It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(baseSet);
+
+                services.AddSingleton(adaptive);
+                services.AddSingleton(provider.Object);
+                services.AddSingleton(repository.Object);
+            });
+        }).CreateClient();
+
+        var response = await client.GetAsync("/api/admin/parameter-sets/overview");
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        var root = doc.RootElement;
+
+        root.GetProperty("baseSet").GetProperty("id").GetInt64().Should().Be(21);
+        root.GetProperty("baseActivatedUtc").GetDateTimeOffset().Should().Be(activatedAt);
+        root.GetProperty("timeframeSetupCount").GetInt32().Should().BeGreaterThanOrEqualTo(2);
+        root.GetProperty("timeframeSetups").EnumerateArray()
+            .Should().Contain(profile => profile.GetProperty("timeframe").GetString() == "5m");
+        root.GetProperty("latestAdaptiveChangeUtc").ValueKind.Should().NotBe(JsonValueKind.Null);
+    }
+
+    [Fact]
     public async Task Admin_Endpoint_Rejects_NonLoopback_RemoteIp()
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, "/api/admin/ml/health");
@@ -569,6 +687,55 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
         latestDecision.GetProperty("evaluationId").GetGuid().Should().Be(unrelatedEvaluationId);
         latestDecision.GetProperty("timeframe").GetString().Should().Be("1m");
     }
+
+    private static IndicatorSnapshot MakeAdaptiveSnapshot(string timeframe) => new()
+    {
+        Symbol = "ETHUSD",
+        Timeframe = timeframe,
+        CandleOpenTimeUtc = DateTimeOffset.UtcNow.AddMinutes(-5),
+        Ema20 = 2090,
+        Ema50 = 2085,
+        Rsi14 = 52,
+        Macd = 0.5m,
+        MacdSignal = 0.3m,
+        MacdHist = 0.2m,
+        Atr14 = 10m,
+        Adx14 = 22,
+        PlusDi = 25,
+        MinusDi = 15,
+        VolumeSma20 = 100,
+        Vwap = 2080,
+        Spread = 1m,
+        CloseMid = 2100,
+        MidHigh = 2105,
+        MidLow = 2095,
+        IsProvisional = false
+    };
+
+    private static RegimeResult MakeAdaptiveRegime() => new()
+    {
+        Symbol = "ETHUSD",
+        CandleOpenTimeUtc = DateTimeOffset.UtcNow.AddMinutes(-15),
+        Regime = Regime.BULLISH,
+        RegimeScore = 5,
+        TriggeredConditions = ["all"],
+        DisqualifyingConditions = []
+    };
+
+    private static RichCandle MakeAdaptiveCandle(DateTimeOffset openTime) => new()
+    {
+        OpenTime = openTime,
+        BidOpen = 2097,
+        BidHigh = 2105,
+        BidLow = 2095,
+        BidClose = 2100,
+        AskOpen = 2098,
+        AskHigh = 2106,
+        AskLow = 2096,
+        AskClose = 2101,
+        Volume = 150,
+        IsClosed = true
+    };
 
     // ─── Test fixture with mocked services ────────────────
     public class TestApp : WebApplicationFactory<Program>

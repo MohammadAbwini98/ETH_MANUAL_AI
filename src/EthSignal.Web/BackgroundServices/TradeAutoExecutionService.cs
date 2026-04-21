@@ -111,6 +111,7 @@ public sealed class TradeAutoExecutionService : BackgroundService
                 var recent = await _signalRepository.GetSignalHistoryAsync(symbol, 100, ct)
                     ?? Array.Empty<SignalRecommendation>();
                 candidates.AddRange(recent
+                    .Where(s => s.Status == SignalStatus.OPEN)
                     .Where(s => s.Direction is SignalDirection.BUY or SignalDirection.SELL)
                     .Select(_mapper.FromRecommended));
             }
@@ -119,13 +120,17 @@ public sealed class TradeAutoExecutionService : BackgroundService
         if (settings.AllowedSourceTypes.Contains(SignalExecutionSourceType.Generated))
         {
             var recent = await _generatedHistory.GetHistoryAsync(symbol, 100, 0, null, ct);
-            candidates.AddRange(recent.Signals.Select(s => _mapper.FromGenerated(s.Signal)));
+            candidates.AddRange(recent.Signals
+                .Where(IsActionableGeneratedSignal)
+                .Select(s => _mapper.FromGenerated(s.Signal)));
         }
 
         if (settings.AllowedSourceTypes.Contains(SignalExecutionSourceType.Blocked))
         {
             var recent = await _blockedHistory.GetHistoryAsync(symbol, 100, 0, ct);
-            candidates.AddRange(recent.Signals.Select(s => _mapper.FromBlocked(s.Signal)));
+            candidates.AddRange(recent.Signals
+                .Where(IsActionableBlockedSignal)
+                .Select(s => _mapper.FromBlocked(s.Signal)));
         }
 
         foreach (var candidate in candidates
@@ -170,4 +175,14 @@ public sealed class TradeAutoExecutionService : BackgroundService
                 candidate.SourceType, candidate.SignalId, result.Status, result.Accepted);
         }
     }
+
+    private static bool IsActionableGeneratedSignal(GeneratedSignalWithOutcome item)
+        => item.Signal.Direction is SignalDirection.BUY or SignalDirection.SELL
+           && item.Signal.ExpiryTimeUtc > DateTimeOffset.UtcNow
+           && item.Outcome.OutcomeLabel == OutcomeLabel.PENDING;
+
+    private static bool IsActionableBlockedSignal(BlockedSignalWithOutcome item)
+        => item.Signal.Direction is SignalDirection.BUY or SignalDirection.SELL
+           && item.Signal.ExpiryTimeUtc > DateTimeOffset.UtcNow
+           && item.Outcome.OutcomeLabel == OutcomeLabel.PENDING;
 }

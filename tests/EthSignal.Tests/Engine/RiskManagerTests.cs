@@ -115,4 +115,17 @@ public class RiskManagerTests
         result.StopLoss.Should().Be(1984m);
         result.TakeProfit.Should().Be(2024m);
     }
+
+    [Fact]
+    public void EstimateLiveFillPrice_Uses_Wider_Buffer_For_Fast_LowConfidence_Than_Long_HighConfidence()
+    {
+        var parameters = StrategyParameters.Default;
+
+        var fastLowConfidence = RiskManager.EstimateLiveFillPrice(
+            SignalDirection.BUY, 2000m, 0.001m, parameters, "1m", confidenceScore: 45, atr: 18m);
+        var longHighConfidence = RiskManager.EstimateLiveFillPrice(
+            SignalDirection.BUY, 2000m, 0.001m, parameters, "1h", confidenceScore: 90, atr: 18m);
+
+        fastLowConfidence.Should().BeGreaterThan(longHighConfidence);
+    }
 }

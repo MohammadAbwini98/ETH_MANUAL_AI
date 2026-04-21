@@ -900,6 +900,27 @@ public sealed class DbMigrator : IDbMigrator
         await Exec(conn, @"
             ALTER TABLE ""ETH"".signals
             ADD COLUMN IF NOT EXISTS market_condition_class TEXT;", ct);
+        await Exec(conn, @"
+            ALTER TABLE ""ETH"".signals
+            ADD COLUMN IF NOT EXISTS evaluation_id UUID;", ct);
+        await Exec(conn, @"
+            ALTER TABLE ""ETH"".signals
+            ADD COLUMN IF NOT EXISTS tp1_price NUMERIC NOT NULL DEFAULT 0;", ct);
+        await Exec(conn, @"
+            ALTER TABLE ""ETH"".signals
+            ADD COLUMN IF NOT EXISTS tp2_price NUMERIC NOT NULL DEFAULT 0;", ct);
+        await Exec(conn, @"
+            ALTER TABLE ""ETH"".signals
+            ADD COLUMN IF NOT EXISTS tp3_price NUMERIC NOT NULL DEFAULT 0;", ct);
+        await Exec(conn, @"
+            ALTER TABLE ""ETH"".signals
+            ADD COLUMN IF NOT EXISTS risk_reward_ratio NUMERIC NOT NULL DEFAULT 0;", ct);
+        await Exec(conn, @"
+            ALTER TABLE ""ETH"".signals
+            ADD COLUMN IF NOT EXISTS exit_model TEXT;", ct);
+        await Exec(conn, @"
+            ALTER TABLE ""ETH"".signals
+            ADD COLUMN IF NOT EXISTS exit_explanation TEXT;", ct);
 
         // Add market_condition_class and adapted_parameters_json to signal_decision_audit table
         await Exec(conn, @"
@@ -924,6 +945,65 @@ public sealed class DbMigrator : IDbMigrator
                 overlay_json   JSONB       NOT NULL,
                 updated_utc    TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );", ct);
+
+        await Exec(conn, @"
+            CREATE TABLE IF NOT EXISTS ""ETH"".adaptive_timeframe_profile_states (
+                symbol                      TEXT        NOT NULL,
+                timeframe                   TEXT        NOT NULL,
+                strategy_version            TEXT        NOT NULL,
+                profile_bucket              TEXT        NOT NULL,
+                adaptive_enabled            BOOLEAN     NOT NULL DEFAULT TRUE,
+                retrospective_enabled       BOOLEAN     NOT NULL DEFAULT TRUE,
+                has_retrospective_overlay   BOOLEAN     NOT NULL DEFAULT FALSE,
+                effective_intensity         NUMERIC     NOT NULL DEFAULT 1.0,
+                current_condition_class     TEXT,
+                current_coarse_condition_key TEXT,
+                overlay_diffs_json          JSONB,
+                retrospective_overlay_json  JSONB,
+                base_parameters_json        JSONB       NOT NULL,
+                effective_parameters_json   JSONB       NOT NULL,
+                base_parameter_hash         TEXT        NOT NULL,
+                effective_parameter_hash    TEXT        NOT NULL,
+                last_evaluated_bar_utc      TIMESTAMPTZ NOT NULL,
+                last_changed_utc            TIMESTAMPTZ NOT NULL,
+                change_version              BIGINT      NOT NULL DEFAULT 0,
+                created_at_utc              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at_utc              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (symbol, timeframe)
+            );", ct);
+
+        await Exec(conn, @"
+            CREATE INDEX IF NOT EXISTS idx_adaptive_tf_profile_states_changed
+            ON ""ETH"".adaptive_timeframe_profile_states (last_changed_utc DESC, timeframe);", ct);
+
+        await Exec(conn, @"
+            CREATE TABLE IF NOT EXISTS ""ETH"".adaptive_timeframe_profile_changes (
+                id                          BIGSERIAL   PRIMARY KEY,
+                symbol                      TEXT        NOT NULL,
+                timeframe                   TEXT        NOT NULL,
+                strategy_version            TEXT        NOT NULL,
+                profile_bucket              TEXT        NOT NULL,
+                change_reason               TEXT        NOT NULL,
+                previous_condition_class    TEXT,
+                current_condition_class     TEXT,
+                previous_parameter_hash     TEXT,
+                current_parameter_hash      TEXT        NOT NULL,
+                adaptive_enabled            BOOLEAN     NOT NULL DEFAULT TRUE,
+                retrospective_enabled       BOOLEAN     NOT NULL DEFAULT TRUE,
+                has_retrospective_overlay   BOOLEAN     NOT NULL DEFAULT FALSE,
+                effective_intensity         NUMERIC     NOT NULL DEFAULT 1.0,
+                overlay_diffs_json          JSONB,
+                retrospective_overlay_json  JSONB,
+                base_parameters_json        JSONB       NOT NULL,
+                effective_parameters_json   JSONB       NOT NULL,
+                bar_time_utc                TIMESTAMPTZ NOT NULL,
+                changed_at_utc              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                change_version              BIGINT      NOT NULL DEFAULT 0
+            );", ct);
+
+        await Exec(conn, @"
+            CREATE INDEX IF NOT EXISTS idx_adaptive_tf_profile_changes_time
+            ON ""ETH"".adaptive_timeframe_profile_changes (changed_at_utc DESC, timeframe);", ct);
 
         // ─── Issue #12: parameter_activation_history dedup ───
         // Prevent duplicate activations of the same parameter set within a 1-second

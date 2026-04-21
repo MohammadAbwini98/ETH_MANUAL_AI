@@ -17,6 +17,12 @@ public static class StructureAnalyzer
         /// <summary>Recent swing highs sorted ascending by price.</summary>
         public required IReadOnlyList<decimal> SwingHighs { get; init; }
 
+        /// <summary>All resistance zones above current price, ordered nearest-first.</summary>
+        public IReadOnlyList<decimal> ResistanceZones { get; init; } = [];
+
+        /// <summary>All support zones below current price, ordered nearest-first.</summary>
+        public IReadOnlyList<decimal> SupportZones { get; init; } = [];
+
         /// <summary>Nearest support zone below current price (0 if none found).</summary>
         public decimal NearestSupport { get; init; }
 
@@ -86,6 +92,8 @@ public static class StructureAnalyzer
         {
             SwingHighs = swingHighs,
             SwingLows = swingLows,
+            ResistanceZones = resistancesAbove,
+            SupportZones = supportsBelow,
             NearestResistance = resistancesAbove.Count > 0 ? resistancesAbove[0] : 0,
             SecondResistance = resistancesAbove.Count > 1 ? resistancesAbove[1] : 0,
             NearestSupport = supportsBelow.Count > 0 ? supportsBelow[0] : 0,
@@ -131,20 +139,51 @@ public static class StructureAnalyzer
     public static decimal FindStructureTarget(
         StructureLevels levels,
         SignalDirection direction,
-        decimal entryPrice)
+        decimal entryPrice,
+        decimal minimumDistance = 0m)
     {
         if (direction == SignalDirection.BUY)
         {
-            return levels.NearestResistance > entryPrice
-                ? levels.NearestResistance
-                : levels.SecondResistance > entryPrice ? levels.SecondResistance : 0;
+            foreach (var resistance in EnumerateResistanceTargets(levels, entryPrice))
+            {
+                if (resistance - entryPrice >= minimumDistance)
+                    return resistance;
+            }
+
+            return 0;
         }
         else
         {
-            return levels.NearestSupport > 0 && levels.NearestSupport < entryPrice
-                ? levels.NearestSupport
-                : levels.SecondSupport > 0 && levels.SecondSupport < entryPrice ? levels.SecondSupport : 0;
+            foreach (var support in EnumerateSupportTargets(levels, entryPrice))
+            {
+                if (entryPrice - support >= minimumDistance)
+                    return support;
+            }
+
+            return 0;
         }
+    }
+
+    private static IEnumerable<decimal> EnumerateResistanceTargets(StructureLevels levels, decimal entryPrice)
+    {
+        if (levels.ResistanceZones.Count > 0)
+            return levels.ResistanceZones.Where(z => z > entryPrice).OrderBy(z => z);
+
+        return new[] { levels.NearestResistance, levels.SecondResistance }
+            .Where(z => z > entryPrice)
+            .Distinct()
+            .OrderBy(z => z);
+    }
+
+    private static IEnumerable<decimal> EnumerateSupportTargets(StructureLevels levels, decimal entryPrice)
+    {
+        if (levels.SupportZones.Count > 0)
+            return levels.SupportZones.Where(z => z > 0 && z < entryPrice).OrderByDescending(z => z);
+
+        return new[] { levels.NearestSupport, levels.SecondSupport }
+            .Where(z => z > 0 && z < entryPrice)
+            .Distinct()
+            .OrderByDescending(z => z);
     }
 
     /// <summary>Cluster nearby price levels and return zone midpoints.</summary>

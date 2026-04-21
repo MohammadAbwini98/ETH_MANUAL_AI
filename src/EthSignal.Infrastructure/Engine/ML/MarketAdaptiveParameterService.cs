@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using EthSignal.Domain.Models;
 using EthSignal.Infrastructure.Db;
@@ -13,48 +15,33 @@ namespace EthSignal.Infrastructure.Engine.ML;
 /// Two modes of adaptation:
 ///   1. Proactive: on every evaluation, classifies market conditions and applies
 ///      deterministic overlays based on observable indicators (immediate).
-///   2. Retrospective: refines overlays using rolling outcome windows per *coarse*
-///      condition class (Volatility × Trend) so reachability is realistic.
+///   2. Retrospective: refines overlays using rolling outcome windows per
+///      timeframe + coarse condition bucket so each timeframe evolves independently.
 ///
 /// Adapted parameters are per-evaluation (transient). Base parameters in the DB
-/// are never mutated. Outcome windows and retrospective overlays are persisted to
-/// DB so they survive process restarts.
+/// are never mutated. Outcome windows, retrospective overlays, and the latest
+/// active per-timeframe adaptive profile state are persisted to DB so they survive
+/// process restarts and can be surfaced on the dashboard.
 /// </summary>
 public sealed class MarketAdaptiveParameterService
 {
+    private const int LogSampleRate = 12;
+    private const int MaxRetrospectiveConfidenceDelta = 10;
+    private const int MaxRecentProfileChanges = 60;
+    private static readonly TimeSpan RetrospectiveExpiry = TimeSpan.FromHours(48);
+
     private readonly ILogger<MarketAdaptiveParameterService> _logger;
     private readonly AdaptiveParameterLogRepository? _logRepo;
     private readonly IAdaptiveStateRepository? _stateRepo;
-    private readonly IParameterRepository? _paramRepo;
 
-    // Per-coarse-condition outcome tracking for retrospective refinement.
-    // Coarse key (Volatility_Trend) gives 12 buckets and is reachable in practice.
     private readonly ConcurrentDictionary<string, OutcomeWindow> _conditionOutcomes = new();
     private readonly ConcurrentDictionary<string, ParameterOverlay> _retrospectiveOverlays = new();
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _snapshotLocks = new();
+    private readonly ConcurrentDictionary<string, TimeframeAdaptiveRuntimeState> _timeframeRuntimeStates = new();
+    private readonly ConcurrentQueue<AdaptiveTimeframeProfileChange> _recentProfileChanges = new();
 
-    // Debounce logging: log every Nth evaluation to avoid noise
-    private int _evaluationCount;
-    private const int LogSampleRate = 12; // ~every hour on 5m candles
-
-    // Max retrospective confidence delta per condition (safety cap)
-    private const int MaxRetrospectiveConfidenceDelta = 10;
-
-    // Retrospective overlay expiry
-    private static readonly TimeSpan RetrospectiveExpiry = TimeSpan.FromHours(48);
-
-    // Track last condition for change detection logging
-    private MarketConditionClass? _lastCondition;
-
-    // Issue #5: force the very first live evaluation after startup to write an
-    // adaptive_parameter_log row so there is no silence gap after restart.
-    private bool _forceLogOnFirstEvaluation = true;
-
-    // Runtime overrides (set via admin API, take precedence over DB config)
     private bool? _enabledOverride;
     private decimal? _intensityOverride;
-
-    // Lock for serializing snapshot writes per condition key
-    private readonly ConcurrentDictionary<string, SemaphoreSlim> _snapshotLocks = new();
 
     public MarketAdaptiveParameterService(
         ILogger<MarketAdaptiveParameterService> logger,
@@ -65,7 +52,6 @@ public sealed class MarketAdaptiveParameterService
         _logger = logger;
         _logRepo = logRepo;
         _stateRepo = stateRepo;
-        _paramRepo = paramRepo;
     }
 
     /// <summary>Runtime override: enable/disable adaptive system (null = use DB config).</summary>
@@ -83,9 +69,8 @@ public sealed class MarketAdaptiveParameterService
     }
 
     /// <summary>
-    /// Issue #3: Reload persisted outcome windows + retrospective overlays from the DB.
-    /// Call once at startup before the live tick processor begins evaluating.
-    /// Safe to call without a state repository (no-op).
+    /// Reload persisted adaptive state so retrospective overlays and latest
+    /// per-timeframe adaptive setups survive restart.
     /// </summary>
     public async Task LoadStateAsync(CancellationToken ct = default)
     {
@@ -110,9 +95,24 @@ public sealed class MarketAdaptiveParameterService
             foreach (var entry in overlays)
                 _retrospectiveOverlays[entry.ConditionKey] = entry.Overlay;
 
+            var profileStates = await _stateRepo.LoadTimeframeProfileStatesAsync(ct);
+            foreach (var state in profileStates)
+            {
+                var runtime = _timeframeRuntimeStates.GetOrAdd(state.Timeframe, _ => new TimeframeAdaptiveRuntimeState());
+                lock (runtime.Gate)
+                {
+                    runtime.CurrentProfile = state;
+                    runtime.LastConditionKey = state.CurrentConditionClass;
+                }
+            }
+
+            var recentChanges = await _stateRepo.LoadRecentTimeframeProfileChangesAsync(MaxRecentProfileChanges, ct);
+            foreach (var change in recentChanges.OrderBy(c => c.ChangedAtUtc))
+                EnqueueRecentChange(change);
+
             _logger.LogInformation(
-                "[Adaptive] State rehydrated: {Conditions} outcome windows, {Overlays} retrospective overlays",
-                _conditionOutcomes.Count, _retrospectiveOverlays.Count);
+                "[Adaptive] State rehydrated: {Conditions} outcome windows, {Overlays} retrospective overlays, {Profiles} timeframe profiles",
+                _conditionOutcomes.Count, _retrospectiveOverlays.Count, profileStates.Count);
         }
         catch (Exception ex)
         {
@@ -132,76 +132,110 @@ public sealed class MarketAdaptiveParameterService
         Timeframe tf,
         IReadOnlyList<IndicatorSnapshot> recentSnapshots)
     {
-        var isEnabled = _enabledOverride ?? baseParams.AdaptiveParametersEnabled;
+        var resolvedBaseParams = baseParams.ResolveForTimeframe(tf.Name);
+        var isEnabled = _enabledOverride ?? resolvedBaseParams.AdaptiveParametersEnabled;
         if (!isEnabled)
-            return (baseParams, MarketConditionClass.Default);
+            return (resolvedBaseParams, MarketConditionClass.Default);
 
-        // 1. Compute ATR SMA50 from snapshot buffer
         var atrSma50 = MarketConditionClassifier.ComputeAtrSma50(recentSnapshots);
+        var condition = MarketConditionClassifier.Classify(snap, regime, candle, atrSma50, resolvedBaseParams);
+        var conditionKey = condition.ToKey();
+        var scopedCoarseKey = ToScopedConditionKey(tf.Name, conditionKey);
 
-        // 2. Classify market condition
-        var condition = MarketConditionClassifier.Classify(snap, regime, candle, atrSma50, baseParams);
-
-        // 3. Get retrospective overlay (if exists and not expired) — keyed by COARSE bucket
         ParameterOverlay? retroOverlay = null;
-        if (baseParams.AdaptiveRetrospectiveEnabled)
+        if (resolvedBaseParams.AdaptiveRetrospectiveEnabled)
         {
-            var key = condition.ToCoarseKey();
-            if (_retrospectiveOverlays.TryGetValue(key, out var overlay))
+            if (_retrospectiveOverlays.TryGetValue(scopedCoarseKey, out var overlay))
             {
-                if (_conditionOutcomes.TryGetValue(key, out var window)
+                if (_conditionOutcomes.TryGetValue(scopedCoarseKey, out var window)
                     && (DateTimeOffset.UtcNow - window.LastUpdated) < RetrospectiveExpiry)
                 {
                     retroOverlay = overlay;
                 }
                 else
                 {
-                    _retrospectiveOverlays.TryRemove(key, out _);
-                    _ = _stateRepo?.DeleteRetrospectiveOverlayAsync(key, CancellationToken.None);
-                    _logger.LogInformation(
-                        "[Adaptive] Retrospective overlay expired for {Condition}", key);
+                    _retrospectiveOverlays.TryRemove(scopedCoarseKey, out _);
+                    _ = _stateRepo?.DeleteRetrospectiveOverlayAsync(scopedCoarseKey, CancellationToken.None);
+                    _logger.LogInformation("[Adaptive:{Timeframe}] Retrospective overlay expired for {Condition}",
+                        tf.Name, scopedCoarseKey);
                 }
             }
         }
 
-        // 4. Apply overlays with intensity scaling
-        var intensity = _intensityOverride ?? baseParams.AdaptiveOverlayIntensity;
+        var intensity = _intensityOverride ?? resolvedBaseParams.AdaptiveOverlayIntensity;
         var adapted = AdaptiveOverlayResolver.ApplyOverlays(
-            baseParams, condition, intensity, retroOverlay);
+            resolvedBaseParams, condition, intensity, retroOverlay);
 
-        // 5. Log on condition change, post-restart force, or at sample rate
-        _evaluationCount++;
-        var conditionChanged = _lastCondition != null && _lastCondition != condition;
-        var forceFirst = _forceLogOnFirstEvaluation;
-        if (conditionChanged)
+        var runtime = _timeframeRuntimeStates.GetOrAdd(tf.Name, _ => new TimeframeAdaptiveRuntimeState());
+        AdaptiveTimeframeProfileState? newProfileState = null;
+        AdaptiveTimeframeProfileChange? profileChange = null;
+        bool shouldLog;
+        bool conditionChanged;
+        bool forceFirst;
+
+        lock (runtime.Gate)
         {
-            _logger.LogInformation(
-                "[Adaptive] Condition changed: {From} → {To}",
-                _lastCondition, condition);
+            runtime.EvaluationCount++;
+            conditionChanged = runtime.LastConditionKey != null
+                && !string.Equals(runtime.LastConditionKey, conditionKey, StringComparison.Ordinal);
+            forceFirst = runtime.ForceLogOnFirstEvaluation;
+            shouldLog = runtime.EvaluationCount % LogSampleRate == 0 || conditionChanged || forceFirst;
+
+            if (conditionChanged)
+            {
+                _logger.LogInformation("[Adaptive:{Timeframe}] Condition changed: {From} → {To}",
+                    tf.Name, runtime.LastConditionKey, conditionKey);
+            }
+
+            var baseHash = ComputeHash(resolvedBaseParams.ToJson());
+            var effectiveHash = ComputeHash(adapted.ToJson());
+            var overlayDiffs = BuildOverlayDiffsJson(resolvedBaseParams, adapted);
+            var currentProfile = BuildProfileState(
+                snap.Symbol,
+                tf.Name,
+                resolvedBaseParams,
+                adapted,
+                condition,
+                retroOverlay,
+                intensity,
+                overlayDiffs,
+                baseHash,
+                effectiveHash,
+                candle.OpenTime,
+                previous: runtime.CurrentProfile);
+
+            if (HasProfileChanged(runtime.CurrentProfile, currentProfile))
+            {
+                newProfileState = currentProfile;
+                profileChange = BuildProfileChange(runtime.CurrentProfile, currentProfile, candle.OpenTime);
+                runtime.CurrentProfile = currentProfile;
+            }
+
+            runtime.LastConditionKey = conditionKey;
+            if (shouldLog)
+                runtime.ForceLogOnFirstEvaluation = false;
         }
-        _lastCondition = condition;
 
-        if (_evaluationCount % LogSampleRate == 0 || conditionChanged || forceFirst)
+        if (shouldLog)
         {
-            LogAdaptation(baseParams, adapted, condition, retroOverlay != null);
+            LogAdaptation(tf.Name, resolvedBaseParams, adapted, condition, retroOverlay != null);
 
             if (_logRepo != null)
             {
-                var overlayDiffs = BuildOverlayDiffsJson(baseParams, adapted);
                 var entry = new AdaptiveParameterLogEntry
                 {
                     BarTimeUtc = candle.OpenTime,
-                    ConditionClass = condition.ToKey(),
+                    ConditionClass = conditionKey,
                     VolatilityTier = condition.Volatility.ToString(),
                     TrendStrength = condition.Trend.ToString(),
                     TradingSession = condition.Session.ToString(),
                     SpreadQuality = condition.Spread.ToString(),
                     VolumeTier = condition.Volume.ToString(),
-                    BaseConfidenceBuy = baseParams.ConfidenceBuyThreshold,
+                    BaseConfidenceBuy = resolvedBaseParams.ConfidenceBuyThreshold,
                     AdaptedConfidenceBuy = adapted.ConfidenceBuyThreshold,
-                    BaseConfidenceSell = baseParams.ConfidenceSellThreshold,
+                    BaseConfidenceSell = resolvedBaseParams.ConfidenceSellThreshold,
                     AdaptedConfidenceSell = adapted.ConfidenceSellThreshold,
-                    OverlayDeltasJson = overlayDiffs,
+                    OverlayDeltasJson = BuildOverlayDiffsJson(resolvedBaseParams, adapted),
                     Atr14 = snap.Atr14,
                     AtrSma50 = atrSma50,
                     Adx14 = snap.Adx14,
@@ -210,22 +244,20 @@ public sealed class MarketAdaptiveParameterService
                 };
                 _ = _logRepo.LogAsync(entry, CancellationToken.None);
             }
-
-            _forceLogOnFirstEvaluation = false;
         }
 
-        // 6. Persist adapted parameters as a live snapshot on condition change
-        if ((conditionChanged || forceFirst) && _paramRepo != null)
-        {
-            _ = PersistAdaptedSnapshotAsync(adapted, condition, CancellationToken.None);
-        }
+        if (profileChange != null)
+            EnqueueRecentChange(profileChange);
+
+        if (newProfileState != null)
+            _ = PersistProfileStateAsync(newProfileState, profileChange, CancellationToken.None);
 
         return (adapted, condition);
     }
 
     /// <summary>
     /// Build the per-decision overlay diff JSON for the audit table. Public so call sites
-    /// can stamp the same JSON onto SignalDecision records (Gap #2 / Issue #1).
+    /// can stamp the same JSON onto SignalDecision records.
     /// </summary>
     public static string? BuildOverlayDiffsJson(StrategyParameters baseParams, StrategyParameters adapted)
     {
@@ -251,40 +283,54 @@ public sealed class MarketAdaptiveParameterService
         return diffs.Count > 0 ? JsonSerializer.Serialize(diffs) : null;
     }
 
-    /// <summary>
-    /// Record a resolved outcome for retrospective refinement.
-    /// Call after outcome resolution with the condition class active at signal generation.
-    ///
-    /// Issue #8: WIN, LOSS, and EXPIRED are all included so high-signal-rate conditions
-    /// that produce expirations are properly penalized in expectancy.
-    /// </summary>
     public void RecordOutcome(SignalOutcome outcome, string? conditionClassKey, StrategyParameters baseParams)
-    {
-        if (string.IsNullOrEmpty(conditionClassKey)) return;
+        => RecordOutcome(outcome, baseParams.TimeframePrimary, conditionClassKey, baseParams);
 
-        // Include WIN, LOSS, EXPIRED. AMBIGUOUS (multiple hits same bar) is intentionally
-        // excluded because the realised PnL is undefined under our resolution rules.
+    /// <summary>
+    /// Record a resolved outcome for retrospective refinement. Timeframe is part of the
+    /// state key so each timeframe evolves independently.
+    /// </summary>
+    public void RecordOutcome(
+        SignalOutcome outcome,
+        string timeframe,
+        string? conditionClassKey,
+        StrategyParameters baseParams)
+    {
+        if (string.IsNullOrEmpty(conditionClassKey))
+            return;
+
         if (outcome.OutcomeLabel is not (OutcomeLabel.WIN or OutcomeLabel.LOSS or OutcomeLabel.EXPIRED))
             return;
 
-        // Translate full key (or pre-coarsened key) to the coarse bucket used for
-        // retrospective accumulation. Accept both formats so older signals still feed in.
-        var key = ToCoarseKeyFromAny(conditionClassKey);
-
-        var window = _conditionOutcomes.GetOrAdd(key, _ => new OutcomeWindow(baseParams.AdaptiveRetrospectiveWindowSize));
+        var resolvedParams = baseParams.ResolveForTimeframe(timeframe);
+        var key = ToScopedConditionKey(timeframe, conditionClassKey);
+        var window = _conditionOutcomes.GetOrAdd(key, _ => new OutcomeWindow(resolvedParams.AdaptiveRetrospectiveWindowSize));
         window.Add(outcome);
 
-        // Persist updated window snapshot (best-effort, fire-and-forget)
         _ = PersistOutcomeWindowAsync(key, window, CancellationToken.None);
 
-        // Issue #4: honour the configured threshold instead of a hardcoded 15
-        if (window.Count >= baseParams.AdaptiveRetrospectiveMinOutcomes)
-            RecomputeRetrospective(key, window);
+        if (window.Count >= resolvedParams.AdaptiveRetrospectiveMinOutcomes)
+            RecomputeRetrospective(timeframe, key, window);
     }
 
-    /// <summary>Current adaptive status for admin API.</summary>
+    /// <summary>Current adaptive status for admin API / dashboard.</summary>
     public AdaptiveStatus GetStatus(StrategyParameters baseParams)
     {
+        var profiles = _timeframeRuntimeStates.Values
+            .Select(state =>
+            {
+                lock (state.Gate)
+                {
+                    return state.CurrentProfile;
+                }
+            })
+            .Where(state => state != null)
+            .Select(state => ToView(state!))
+            .OrderBy(state => Timeframe.ByNameOrDefault(state.Timeframe).Minutes)
+            .ToList();
+
+        var primaryCurrent = profiles.FirstOrDefault(p => string.Equals(p.Timeframe, baseParams.TimeframePrimary, StringComparison.OrdinalIgnoreCase));
+
         return new AdaptiveStatus
         {
             Enabled = _enabledOverride ?? baseParams.AdaptiveParametersEnabled,
@@ -292,21 +338,36 @@ public sealed class MarketAdaptiveParameterService
             Intensity = _intensityOverride ?? baseParams.AdaptiveOverlayIntensity,
             IntensityOverride = _intensityOverride,
             RetrospectiveEnabled = baseParams.AdaptiveRetrospectiveEnabled,
-            CurrentCondition = _lastCondition?.ToKey(),
+            CurrentCondition = primaryCurrent?.CurrentConditionClass,
             TrackedConditionCount = _conditionOutcomes.Count,
             RetrospectiveOverlayCount = _retrospectiveOverlays.Count,
-            ConditionDetails = _conditionOutcomes.Select(kvp => new ConditionDetail
-            {
-                ConditionKey = kvp.Key,
-                OutcomeCount = kvp.Value.Count,
-                WinRate = kvp.Value.WinRate,
-                Expectancy = kvp.Value.Expectancy,
-                HasRetrospectiveOverlay = _retrospectiveOverlays.ContainsKey(kvp.Key)
-            }).ToList()
+            ConditionDetails = _conditionOutcomes
+                .Select(kvp =>
+                {
+                    var parsed = ParseScopedConditionKey(kvp.Key);
+                    return new ConditionDetail
+                    {
+                        Timeframe = parsed.Timeframe,
+                        ConditionKey = parsed.ConditionKey,
+                        OutcomeCount = kvp.Value.Count,
+                        WinRate = kvp.Value.WinRate,
+                        Expectancy = kvp.Value.Expectancy,
+                        HasRetrospectiveOverlay = _retrospectiveOverlays.ContainsKey(kvp.Key)
+                    };
+                })
+                .OrderBy(detail => Timeframe.ByNameOrDefault(detail.Timeframe).Minutes)
+                .ThenByDescending(detail => detail.OutcomeCount)
+                .ToList(),
+            TimeframeProfiles = profiles,
+            RecentChanges = _recentProfileChanges
+                .OrderByDescending(change => change.ChangedAtUtc)
+                .Take(20)
+                .Select(ToView)
+                .ToList()
         };
     }
 
-    private void RecomputeRetrospective(string conditionKey, OutcomeWindow window)
+    private void RecomputeRetrospective(string timeframe, string conditionKey, OutcomeWindow window)
     {
         var expectancy = window.Expectancy;
 
@@ -317,7 +378,6 @@ public sealed class MarketAdaptiveParameterService
             confDelta = 3;
         else if (expectancy <= 0.40m)
         {
-            // Healthy range — remove any retrospective overlay
             if (_retrospectiveOverlays.TryRemove(conditionKey, out _))
                 _ = _stateRepo?.DeleteRetrospectiveOverlayAsync(conditionKey, CancellationToken.None);
             return;
@@ -338,8 +398,8 @@ public sealed class MarketAdaptiveParameterService
         _ = _stateRepo?.UpsertRetrospectiveOverlayAsync(conditionKey, overlay, CancellationToken.None);
 
         _logger.LogInformation(
-            "[Adaptive] Retrospective update: {Condition} expectancy={Exp:F3}R → confDelta={Delta}",
-            conditionKey, expectancy, confDelta);
+            "[Adaptive:{Timeframe}] Retrospective update: {Condition} expectancy={Exp:F3}R → confDelta={Delta}",
+            timeframe, conditionKey, expectancy, confDelta);
     }
 
     private async Task PersistOutcomeWindowAsync(string key, OutcomeWindow window, CancellationToken ct)
@@ -350,8 +410,7 @@ public sealed class MarketAdaptiveParameterService
         await sem.WaitAsync(ct);
         try
         {
-            var snapshot = window.Snapshot();
-            await _stateRepo.UpsertOutcomeWindowAsync(key, snapshot, ct);
+            await _stateRepo.UpsertOutcomeWindowAsync(key, window.Snapshot(), ct);
         }
         catch (Exception ex)
         {
@@ -363,58 +422,165 @@ public sealed class MarketAdaptiveParameterService
         }
     }
 
-    private async Task PersistAdaptedSnapshotAsync(
-        StrategyParameters adapted, MarketConditionClass condition, CancellationToken ct)
+    private async Task PersistProfileStateAsync(
+        AdaptiveTimeframeProfileState state,
+        AdaptiveTimeframeProfileChange? change,
+        CancellationToken ct)
     {
+        if (_stateRepo == null) return;
+
         try
         {
-            var hash = ComputeHash(adapted.ToJson());
-            var activeSet = await _paramRepo!.GetActiveAsync(adapted.StrategyVersion, ct);
-
-            var set = new StrategyParameterSet
-            {
-                StrategyVersion = adapted.StrategyVersion,
-                ParameterHash = hash,
-                Parameters = adapted,
-                Status = ParameterSetStatus.Active,
-                CreatedUtc = DateTimeOffset.UtcNow,
-                CreatedBy = "adaptive-live",
-                Notes = $"Adaptive snapshot: {condition.ToKey()}"
-            };
-
-            var id = await _paramRepo.InsertAsync(set, ct);
-            if (activeSet != null)
-                await _paramRepo.ActivateAsync(id, activeSet.Id, "adaptive-live",
-                    $"Market condition changed to {condition.ToKey()}", ct);
-
-            _logger.LogInformation(
-                "[Adaptive] Persisted live parameter snapshot id={Id} condition={Condition}",
-                id, condition.ToKey());
+            await _stateRepo.UpsertTimeframeProfileStateAsync(state, ct);
+            if (change != null)
+                await _stateRepo.AppendTimeframeProfileChangeAsync(change, ct);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "[Adaptive] Failed to persist adapted parameter snapshot");
+            _logger.LogWarning(ex, "[Adaptive] Timeframe profile persistence failed for {Symbol}/{Timeframe}",
+                state.Symbol, state.Timeframe);
         }
     }
 
-    private static string ComputeHash(string json)
+    private static string ToScopedConditionKey(string timeframe, string conditionKey)
+        => $"{timeframe.Trim().ToLowerInvariant()}|{ToCoarseKeyFromAny(conditionKey)}";
+
+    private static (string Timeframe, string ConditionKey) ParseScopedConditionKey(string scopedKey)
     {
-        var bytes = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(json));
-        return Convert.ToHexString(bytes)[..16].ToLowerInvariant();
+        var parts = scopedKey.Split('|', 2, StringSplitOptions.TrimEntries);
+        return parts.Length == 2
+            ? (parts[0], parts[1])
+            : ("legacy", ToCoarseKeyFromAny(scopedKey));
     }
 
     private static string ToCoarseKeyFromAny(string conditionKey)
     {
-        // Full key format: Volatility_Trend_Session_Spread_Volume
-        // Coarse key format: Volatility_Trend
-        // If the supplied key already has only two segments treat it as already coarse.
         var parts = conditionKey.Split('_');
         if (parts.Length >= 2)
             return $"{parts[0]}_{parts[1]}";
         return conditionKey;
     }
 
+    private static string ComputeHash(string json)
+    {
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(json));
+        return Convert.ToHexString(bytes)[..16].ToLowerInvariant();
+    }
+
+    private static bool HasProfileChanged(AdaptiveTimeframeProfileState? previous, AdaptiveTimeframeProfileState current)
+    {
+        if (previous == null)
+            return true;
+
+        return !string.Equals(previous.CurrentConditionClass, current.CurrentConditionClass, StringComparison.Ordinal)
+               || !string.Equals(previous.CurrentCoarseConditionKey, current.CurrentCoarseConditionKey, StringComparison.Ordinal)
+               || !string.Equals(previous.BaseParameterHash, current.BaseParameterHash, StringComparison.Ordinal)
+               || !string.Equals(previous.EffectiveParameterHash, current.EffectiveParameterHash, StringComparison.Ordinal)
+               || previous.HasRetrospectiveOverlay != current.HasRetrospectiveOverlay
+               || previous.AdaptiveEnabled != current.AdaptiveEnabled
+               || previous.RetrospectiveEnabled != current.RetrospectiveEnabled
+               || previous.EffectiveIntensity != current.EffectiveIntensity
+               || previous.ProfileBucket != current.ProfileBucket
+               || !string.Equals(previous.StrategyVersion, current.StrategyVersion, StringComparison.Ordinal);
+    }
+
+    private static AdaptiveTimeframeProfileState BuildProfileState(
+        string symbol,
+        string timeframe,
+        StrategyParameters baseParameters,
+        StrategyParameters effectiveParameters,
+        MarketConditionClass condition,
+        ParameterOverlay? retrospectiveOverlay,
+        decimal intensity,
+        string? overlayDiffsJson,
+        string baseHash,
+        string effectiveHash,
+        DateTimeOffset barTimeUtc,
+        AdaptiveTimeframeProfileState? previous)
+    {
+        return new AdaptiveTimeframeProfileState
+        {
+            Symbol = symbol,
+            Timeframe = timeframe,
+            StrategyVersion = effectiveParameters.StrategyVersion,
+            ProfileBucket = effectiveParameters.ResolveTimeframeProfileBucket(timeframe),
+            AdaptiveEnabled = effectiveParameters.AdaptiveParametersEnabled,
+            RetrospectiveEnabled = effectiveParameters.AdaptiveRetrospectiveEnabled,
+            HasRetrospectiveOverlay = retrospectiveOverlay != null,
+            EffectiveIntensity = intensity,
+            CurrentConditionClass = condition.ToKey(),
+            CurrentCoarseConditionKey = condition.ToCoarseKey(),
+            OverlayDiffsJson = overlayDiffsJson,
+            RetrospectiveOverlay = retrospectiveOverlay,
+            BaseParameters = baseParameters,
+            EffectiveParameters = effectiveParameters,
+            BaseParameterHash = baseHash,
+            EffectiveParameterHash = effectiveHash,
+            LastEvaluatedBarUtc = barTimeUtc,
+            LastChangedUtc = DateTimeOffset.UtcNow,
+            ChangeVersion = previous?.ChangeVersion + 1 ?? 1
+        };
+    }
+
+    private static AdaptiveTimeframeProfileChange BuildProfileChange(
+        AdaptiveTimeframeProfileState? previous,
+        AdaptiveTimeframeProfileState current,
+        DateTimeOffset barTimeUtc)
+    {
+        var reasons = new List<string>();
+        if (previous == null)
+        {
+            reasons.Add("initialised");
+        }
+        else
+        {
+            if (!string.Equals(previous.CurrentConditionClass, current.CurrentConditionClass, StringComparison.Ordinal))
+                reasons.Add("condition");
+            if (!string.Equals(previous.BaseParameterHash, current.BaseParameterHash, StringComparison.Ordinal))
+                reasons.Add("base-parameters");
+            if (!string.Equals(previous.EffectiveParameterHash, current.EffectiveParameterHash, StringComparison.Ordinal))
+                reasons.Add("effective-parameters");
+            if (previous.HasRetrospectiveOverlay != current.HasRetrospectiveOverlay)
+                reasons.Add("retrospective-overlay");
+            if (previous.EffectiveIntensity != current.EffectiveIntensity)
+                reasons.Add("intensity");
+        }
+
+        return new AdaptiveTimeframeProfileChange
+        {
+            Symbol = current.Symbol,
+            Timeframe = current.Timeframe,
+            StrategyVersion = current.StrategyVersion,
+            ProfileBucket = current.ProfileBucket,
+            ChangeReason = reasons.Count > 0 ? string.Join(", ", reasons) : "refresh",
+            PreviousConditionClass = previous?.CurrentConditionClass,
+            CurrentConditionClass = current.CurrentConditionClass,
+            PreviousParameterHash = previous?.EffectiveParameterHash,
+            CurrentParameterHash = current.EffectiveParameterHash,
+            AdaptiveEnabled = current.AdaptiveEnabled,
+            RetrospectiveEnabled = current.RetrospectiveEnabled,
+            HasRetrospectiveOverlay = current.HasRetrospectiveOverlay,
+            EffectiveIntensity = current.EffectiveIntensity,
+            OverlayDiffsJson = current.OverlayDiffsJson,
+            RetrospectiveOverlay = current.RetrospectiveOverlay,
+            BaseParameters = current.BaseParameters,
+            EffectiveParameters = current.EffectiveParameters,
+            BarTimeUtc = barTimeUtc,
+            ChangedAtUtc = current.LastChangedUtc,
+            ChangeVersion = current.ChangeVersion
+        };
+    }
+
+    private void EnqueueRecentChange(AdaptiveTimeframeProfileChange change)
+    {
+        _recentProfileChanges.Enqueue(change);
+        while (_recentProfileChanges.Count > MaxRecentProfileChanges && _recentProfileChanges.TryDequeue(out _))
+        {
+        }
+    }
+
     private void LogAdaptation(
+        string timeframe,
         StrategyParameters baseParams,
         StrategyParameters adapted,
         MarketConditionClass condition,
@@ -435,11 +601,68 @@ public sealed class MarketAdaptiveParameterService
         if (parts.Count == 0) return;
 
         _logger.LogInformation(
-            "[Adaptive] Condition={Condition} retro={HasRetro} {Changes}",
-            condition, hasRetro, string.Join(" ", parts));
+            "[Adaptive:{Timeframe}] Condition={Condition} retro={HasRetro} {Changes}",
+            timeframe, condition, hasRetro, string.Join(" ", parts));
     }
 
-    /// <summary>Rolling outcome window per condition class.</summary>
+    private static AdaptiveTimeframeProfileView ToView(AdaptiveTimeframeProfileState state)
+    {
+        var p = state.EffectiveParameters;
+        return new AdaptiveTimeframeProfileView
+        {
+            Timeframe = state.Timeframe,
+            StrategyVersion = state.StrategyVersion,
+            ProfileBucket = state.ProfileBucket.ToString(),
+            AdaptiveEnabled = state.AdaptiveEnabled,
+            RetrospectiveEnabled = state.RetrospectiveEnabled,
+            HasRetrospectiveOverlay = state.HasRetrospectiveOverlay,
+            EffectiveIntensity = state.EffectiveIntensity,
+            CurrentConditionClass = state.CurrentConditionClass,
+            EffectiveParameterHash = state.EffectiveParameterHash,
+            ConfidenceBuyThreshold = p.ConfidenceBuyThreshold,
+            ConfidenceSellThreshold = p.ConfidenceSellThreshold,
+            PullbackZonePct = p.PullbackZonePct,
+            MinAtrThreshold = p.MinAtrThreshold,
+            StopAtrMultiplier = p.StopAtrMultiplier,
+            TargetRMultiple = p.TargetRMultiple,
+            MlMinWinProbability = p.MlMinWinProbability,
+            NeutralRegimePolicy = p.NeutralRegimePolicy.ToString(),
+            LastChangedUtc = state.LastChangedUtc
+        };
+    }
+
+    private static AdaptiveTimeframeProfileChangeView ToView(AdaptiveTimeframeProfileChange change)
+    {
+        var p = change.EffectiveParameters;
+        return new AdaptiveTimeframeProfileChangeView
+        {
+            Timeframe = change.Timeframe,
+            StrategyVersion = change.StrategyVersion,
+            ProfileBucket = change.ProfileBucket.ToString(),
+            ChangeReason = change.ChangeReason,
+            PreviousConditionClass = change.PreviousConditionClass,
+            CurrentConditionClass = change.CurrentConditionClass,
+            CurrentParameterHash = change.CurrentParameterHash,
+            HasRetrospectiveOverlay = change.HasRetrospectiveOverlay,
+            EffectiveIntensity = change.EffectiveIntensity,
+            ConfidenceBuyThreshold = p.ConfidenceBuyThreshold,
+            ConfidenceSellThreshold = p.ConfidenceSellThreshold,
+            StopAtrMultiplier = p.StopAtrMultiplier,
+            TargetRMultiple = p.TargetRMultiple,
+            ChangedAtUtc = change.ChangedAtUtc
+        };
+    }
+
+    private sealed class TimeframeAdaptiveRuntimeState
+    {
+        public object Gate { get; } = new();
+        public int EvaluationCount { get; set; }
+        public bool ForceLogOnFirstEvaluation { get; set; } = true;
+        public string? LastConditionKey { get; set; }
+        public AdaptiveTimeframeProfileState? CurrentProfile { get; set; }
+    }
+
+    /// <summary>Rolling outcome window per timeframe/condition bucket.</summary>
     internal sealed class OutcomeWindow
     {
         private readonly Queue<SignalOutcome> _outcomes = new();
@@ -491,11 +714,6 @@ public sealed class MarketAdaptiveParameterService
             {
                 lock (_lock)
                 {
-                    // Issue #8: WIN, LOSS, EXPIRED all count toward expectancy.
-                    // Use the actual realised PnlR mean across resolved outcomes — this
-                    // generalises the original (winRate * avgWin - lossRate * avgLoss)
-                    // formula and naturally absorbs EXPIRED outcomes whose PnlR may be
-                    // small positive, small negative, or zero.
                     var resolved = _outcomes.Where(o =>
                         o.OutcomeLabel is OutcomeLabel.WIN or OutcomeLabel.LOSS or OutcomeLabel.EXPIRED).ToArray();
                     if (resolved.Length < 5) return 0m;
@@ -520,13 +738,56 @@ public sealed record AdaptiveStatus
     public int TrackedConditionCount { get; init; }
     public int RetrospectiveOverlayCount { get; init; }
     public List<ConditionDetail> ConditionDetails { get; init; } = [];
+    public List<AdaptiveTimeframeProfileView> TimeframeProfiles { get; init; } = [];
+    public List<AdaptiveTimeframeProfileChangeView> RecentChanges { get; init; } = [];
 }
 
 public sealed record ConditionDetail
 {
+    public required string Timeframe { get; init; }
     public required string ConditionKey { get; init; }
     public int OutcomeCount { get; init; }
     public decimal WinRate { get; init; }
     public decimal Expectancy { get; init; }
     public bool HasRetrospectiveOverlay { get; init; }
+}
+
+public sealed record AdaptiveTimeframeProfileView
+{
+    public required string Timeframe { get; init; }
+    public required string StrategyVersion { get; init; }
+    public required string ProfileBucket { get; init; }
+    public bool AdaptiveEnabled { get; init; }
+    public bool RetrospectiveEnabled { get; init; }
+    public bool HasRetrospectiveOverlay { get; init; }
+    public decimal EffectiveIntensity { get; init; }
+    public string? CurrentConditionClass { get; init; }
+    public required string EffectiveParameterHash { get; init; }
+    public int ConfidenceBuyThreshold { get; init; }
+    public int ConfidenceSellThreshold { get; init; }
+    public decimal PullbackZonePct { get; init; }
+    public decimal MinAtrThreshold { get; init; }
+    public decimal StopAtrMultiplier { get; init; }
+    public decimal TargetRMultiple { get; init; }
+    public decimal MlMinWinProbability { get; init; }
+    public required string NeutralRegimePolicy { get; init; }
+    public DateTimeOffset LastChangedUtc { get; init; }
+}
+
+public sealed record AdaptiveTimeframeProfileChangeView
+{
+    public required string Timeframe { get; init; }
+    public required string StrategyVersion { get; init; }
+    public required string ProfileBucket { get; init; }
+    public required string ChangeReason { get; init; }
+    public string? PreviousConditionClass { get; init; }
+    public string? CurrentConditionClass { get; init; }
+    public required string CurrentParameterHash { get; init; }
+    public bool HasRetrospectiveOverlay { get; init; }
+    public decimal EffectiveIntensity { get; init; }
+    public int ConfidenceBuyThreshold { get; init; }
+    public int ConfidenceSellThreshold { get; init; }
+    public decimal StopAtrMultiplier { get; init; }
+    public decimal TargetRMultiple { get; init; }
+    public DateTimeOffset ChangedAtUtc { get; init; }
 }

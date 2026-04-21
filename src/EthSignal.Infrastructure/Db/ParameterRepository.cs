@@ -15,8 +15,12 @@ public sealed class ParameterRepository : IParameterRepository
         _connectionString = connectionString;
     }
 
+    private Task EnsureSchemaAsync(CancellationToken ct) =>
+        RuntimeDbSchemaGuard.EnsureMigratedAsync(_connectionString, ct);
+
     public async Task<StrategyParameterSet?> GetActiveAsync(string strategyVersion, CancellationToken ct = default)
     {
+        await EnsureSchemaAsync(ct);
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
 
@@ -26,6 +30,7 @@ public sealed class ParameterRepository : IParameterRepository
                    parent_parameter_set_id, objective_function_version, code_version
             FROM ""ETH"".strategy_parameter_sets
             WHERE strategy_version = @sv AND status = 'Active'
+            ORDER BY activated_utc DESC NULLS LAST, created_utc DESC, id DESC
             LIMIT 1;", conn);
         cmd.Parameters.AddWithValue("sv", strategyVersion);
 
@@ -36,6 +41,7 @@ public sealed class ParameterRepository : IParameterRepository
 
     public async Task<StrategyParameterSet?> GetByIdAsync(long id, CancellationToken ct = default)
     {
+        await EnsureSchemaAsync(ct);
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
 
@@ -54,6 +60,7 @@ public sealed class ParameterRepository : IParameterRepository
 
     public async Task<long> InsertAsync(StrategyParameterSet set, CancellationToken ct = default)
     {
+        await EnsureSchemaAsync(ct);
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
 
@@ -84,32 +91,35 @@ public sealed class ParameterRepository : IParameterRepository
 
     public async Task ActivateAsync(long id, long? previousId, string? activatedBy, string? reason, CancellationToken ct = default)
     {
+        await EnsureSchemaAsync(ct);
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
         await using var tx = await conn.BeginTransactionAsync(ct);
 
-        // Retire ALL currently active sets (across all strategy versions)
         await using var retireCmd = new NpgsqlCommand(@"
             UPDATE ""ETH"".strategy_parameter_sets
             SET status = 'Retired', retired_utc = NOW()
-            WHERE status = 'Active' AND id != @id;", conn);
+            WHERE status = 'Active'
+              AND id != @id
+              AND strategy_version = (
+                  SELECT strategy_version
+                  FROM ""ETH"".strategy_parameter_sets
+                  WHERE id = @id
+              );", conn, tx);
         retireCmd.Parameters.AddWithValue("id", id);
         await retireCmd.ExecuteNonQueryAsync(ct);
 
-        // Activate the new set
         await using var activateCmd = new NpgsqlCommand(@"
             UPDATE ""ETH"".strategy_parameter_sets
-            SET status = 'Active', activated_utc = NOW()
-            WHERE id = @id;", conn);
+            SET status = 'Active', activated_utc = NOW(), retired_utc = NULL
+            WHERE id = @id;", conn, tx);
         activateCmd.Parameters.AddWithValue("id", id);
         await activateCmd.ExecuteNonQueryAsync(ct);
 
-        // Issue #12: Deduplicate activation history — skip if the same parameter set
-        // was the most recent activation (prevents unbounded growth on restarts)
         await using var dedupCmd = new NpgsqlCommand(@"
             SELECT 1 FROM ""ETH"".parameter_activation_history
             WHERE parameter_set_id = @id
-            ORDER BY activated_utc DESC LIMIT 1;", conn);
+            ORDER BY activated_utc DESC LIMIT 1;", conn, tx);
         dedupCmd.Parameters.AddWithValue("id", id);
         var alreadyLatest = await dedupCmd.ExecuteScalarAsync(ct) != null;
 
@@ -118,7 +128,7 @@ public sealed class ParameterRepository : IParameterRepository
             await using var histCmd = new NpgsqlCommand(@"
                 INSERT INTO ""ETH"".parameter_activation_history
                     (parameter_set_id, previous_set_id, activated_utc, activated_by, promotion_reason)
-                VALUES (@id, @prev, NOW(), @by, @reason);", conn);
+                VALUES (@id, @prev, NOW(), @by, @reason);", conn, tx);
             histCmd.Parameters.AddWithValue("id", id);
             histCmd.Parameters.AddWithValue("prev", (object?)previousId ?? DBNull.Value);
             histCmd.Parameters.AddWithValue("by", (object?)activatedBy ?? DBNull.Value);
@@ -131,6 +141,7 @@ public sealed class ParameterRepository : IParameterRepository
 
     public async Task UpdateStatusAsync(long id, ParameterSetStatus status, CancellationToken ct = default)
     {
+        await EnsureSchemaAsync(ct);
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
 
@@ -143,6 +154,7 @@ public sealed class ParameterRepository : IParameterRepository
 
     public async Task<IReadOnlyList<StrategyParameterSet>> GetCandidatesAsync(string strategyVersion, CancellationToken ct = default)
     {
+        await EnsureSchemaAsync(ct);
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
 

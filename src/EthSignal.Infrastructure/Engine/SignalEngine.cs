@@ -48,6 +48,7 @@ public static class SignalEngine
     {
         var tf = evaluationTf ?? Timeframe.M5;
         var tfName = tf.Name;
+        p = p.ResolveForTimeframe(tfName);
         // Read all thresholds from parameters
         int wRegime = p.WeightRegime;
         int wPullback = p.WeightPullback;
@@ -295,6 +296,7 @@ public static class SignalEngine
         Timeframe? evaluationTf = null,
         (SignalRecommendation Rec, SignalDecision Dec)? preComputed = null)
     {
+        p = p.ResolveForTimeframe((evaluationTf ?? Timeframe.M5).Name);
         // Step 1-5: Use pre-computed result if available, otherwise run the full rule-based engine
         var (rec, dec) = preComputed ?? EvaluateWithDecision(symbol, regime, snap, prevSnap, candle, p,
             sourceMode, parameterSetId, evaluationTf);

@@ -1102,7 +1102,7 @@
                                     id="adaptive-intensity-override" style="color:var(--text)">--</span></div>
                             <div><span style="color:var(--text-dim)">Retrospective:</span> <span
                                     id="adaptive-retro-enabled" style="color:var(--text)">--</span></div>
-                            <div><span style="color:var(--text-dim)">Current Condition:</span> <span
+                            <div><span style="color:var(--text-dim)">Primary Condition:</span> <span
                                     id="adaptive-current-condition" style="color:var(--text)">--</span></div>
                             <div><span style="color:var(--text-dim)">Tracked:</span> <span
                                     id="adaptive-tracked-count" style="color:var(--text)">--</span></div>
@@ -1110,11 +1110,32 @@
                                     id="adaptive-retro-count" style="color:var(--text)">--</span></div>
                         </div>
                         <div style="font-size:.75rem;color:var(--text-sub);margin-bottom:.3rem;font-weight:600">
+                            Active Timeframe Setups</div>
+                        <div style="max-height:180px;overflow-y:auto;margin-bottom:.5rem">
+                            <table class="table table-sm table-dark table-hover mb-0" style="font-size:.72rem">
+                                <thead>
+                                    <tr>
+                                        <th>TF</th>
+                                        <th>Strategy</th>
+                                        <th>Parameters</th>
+                                        <th>Condition</th>
+                                        <th>Changed</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="adaptive-timeframes-body">
+                                    <tr>
+                                        <td colspan="5" style="color:var(--text-dim);text-align:center">Loading...</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                        <div style="font-size:.75rem;color:var(--text-sub);margin-bottom:.3rem;font-weight:600">
                             Condition Outcomes</div>
-                        <div style="max-height:220px;overflow-y:auto">
+                        <div style="max-height:180px;overflow-y:auto;margin-bottom:.5rem">
                             <table class="table table-sm table-dark table-hover mb-0" style="font-size:.75rem">
                                 <thead>
                                     <tr>
+                                        <th>TF</th>
                                         <th>Condition</th>
                                         <th>Outcomes</th>
                                         <th>Win Rate</th>
@@ -1123,6 +1144,26 @@
                                     </tr>
                                 </thead>
                                 <tbody id="adaptive-conditions-body">
+                                    <tr>
+                                        <td colspan="6" style="color:var(--text-dim);text-align:center">Loading...</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                        <div style="font-size:.75rem;color:var(--text-sub);margin-bottom:.3rem;font-weight:600">
+                            Recent Adaptive Changes</div>
+                        <div style="max-height:180px;overflow-y:auto">
+                            <table class="table table-sm table-dark table-hover mb-0" style="font-size:.72rem">
+                                <thead>
+                                    <tr>
+                                        <th>When</th>
+                                        <th>TF</th>
+                                        <th>Reason</th>
+                                        <th>Condition</th>
+                                        <th>Setup</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="adaptive-changes-body">
                                     <tr>
                                         <td colspan="5" style="color:var(--text-dim);text-align:center">Loading...</td>
                                     </tr>
@@ -1136,7 +1177,7 @@
             <div class="col-md-7">
                 <div class="card">
                     <div class="card-header d-flex justify-content-between align-items-center">
-                        <span>Active Parameter Set</span>
+                        <span>Base Active Parameter Set</span>
                         <span id="param-set-meta" style="font-size:.7rem;color:var(--text-dim)">--</span>
                     </div>
                     <div class="card-body">
@@ -1148,11 +1189,18 @@
                                     style="font-size:.7rem;color:var(--text)">--</code></div>
                             <div><span style="color:var(--text-dim)">Created By:</span> <span
                                     id="ps-created-by" style="color:var(--text)">--</span></div>
-                            <div><span style="color:var(--text-dim)">Activated:</span> <span id="ps-activated" style="color:var(--text)">--</span>
+                            <div><span style="color:var(--text-dim)">Base Activated:</span> <span id="ps-activated" style="color:var(--text)">--</span>
+                            </div>
+                            <div><span style="color:var(--text-dim)">Latest TF Change:</span> <span id="ps-runtime-changed" style="color:var(--text)">--</span>
+                            </div>
+                            <div><span style="color:var(--text-dim)">TF Setups:</span> <span id="ps-timeframe-count" style="color:var(--text)">--</span>
                             </div>
                         </div>
                         <div id="ps-notes"
                             style="font-size:.72rem;color:var(--text-sub);margin-bottom:.4rem;font-style:italic"></div>
+                        <div style="font-size:.68rem;color:var(--text-dim);margin-bottom:.5rem">
+                            Live signal generation keeps one base active parameter set, then resolves timeframe-specific profiles and adaptive runtime overlays on top of it without re-activating the base row.
+                        </div>
                         <div class="row g-2">
                             <div class="col-md-4">
                                 <div style="font-size:.72rem;color:var(--blue);font-weight:600;margin-bottom:.2rem">
@@ -1236,6 +1284,24 @@
                                 </table>
                             </div>
                         </div>
+                        <div style="font-size:.72rem;color:var(--blue);font-weight:600;margin:.7rem 0 .25rem 0">
+                            Current Timeframe Runtime Setups
+                        </div>
+                        <table class="table table-sm table-dark mb-0" style="font-size:.72rem">
+                            <thead>
+                                <tr>
+                                    <th>TF</th>
+                                    <th>Strategy</th>
+                                    <th>Setup</th>
+                                    <th>Changed</th>
+                                </tr>
+                            </thead>
+                            <tbody id="ps-timeframes-body">
+                                <tr>
+                                    <td colspan="4" style="color:var(--text-dim);text-align:center">Loading...</td>
+                                </tr>
+                            </tbody>
+                        </table>
                     </div>
                 </div>
             </div>
@@ -1678,7 +1744,7 @@
         </div>
     </div>
 
-    <script src="js/dashboard.js?v=20"></script>
+    <script src="js/dashboard.js?v=22"></script>
 </body>
 
 </html>

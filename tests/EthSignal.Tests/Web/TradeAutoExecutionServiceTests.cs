@@ -146,6 +146,92 @@ public sealed class TradeAutoExecutionServiceTests
             It.IsAny<CancellationToken>()), Times.Once);
     }
 
+    [Fact]
+    public async Task RunOnceAsync_Skips_Closed_Recommended_Signals()
+    {
+        var signalRepo = new Mock<ISignalRepository>();
+        signalRepo.Setup(r => r.GetSignalHistoryAsync("ETHUSD", It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync([
+                CreateRecommendedSignal() with { Status = SignalStatus.CLOSED }
+            ]);
+
+        var queueService = new Mock<ITradeExecutionQueueService>();
+        var sut = CreateSut(
+            signalRepo: signalRepo,
+            queueService: queueService,
+            portalOverrides: new PortalOverrides { RecommendedSignalExecutionEnabled = true },
+            allowedSourceTypes: [SignalExecutionSourceType.Recommended]);
+
+        await sut.RunOnceAsync(CancellationToken.None);
+
+        queueService.Verify(s => s.EnqueueAsync(It.IsAny<TradeExecutionRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task RunOnceAsync_Skips_NonPending_And_Expired_Generated_And_Blocked_Signals()
+    {
+        var generatedHistory = new Mock<IGeneratedSignalHistoryService>();
+        generatedHistory.Setup(s => s.GetHistoryAsync("ETHUSD", 100, 0, null, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new GeneratedSignalHistoryPage
+            {
+                Signals =
+                [
+                    new GeneratedSignalWithOutcome
+                    {
+                        Signal = CreateGeneratedSignal() with { ExpiryTimeUtc = DateTimeOffset.UtcNow.AddMinutes(-1) },
+                        Outcome = CreateOutcome()
+                    },
+                    new GeneratedSignalWithOutcome
+                    {
+                        Signal = CreateGeneratedSignal(),
+                        Outcome = CreateOutcome(OutcomeLabel.WIN)
+                    }
+                ],
+                Stats = new PerformanceStats(),
+                Total = 2,
+                Page = 1,
+                PageSize = 100
+            });
+
+        var blockedHistory = new Mock<IBlockedSignalHistoryService>();
+        blockedHistory.Setup(s => s.GetHistoryAsync("ETHUSD", 100, 0, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new BlockedSignalHistoryPage
+            {
+                Signals =
+                [
+                    new BlockedSignalWithOutcome
+                    {
+                        Signal = CreateBlockedSignal() with { ExpiryTimeUtc = DateTimeOffset.UtcNow.AddMinutes(-1) },
+                        Outcome = CreateOutcome()
+                    },
+                    new BlockedSignalWithOutcome
+                    {
+                        Signal = CreateBlockedSignal(),
+                        Outcome = CreateOutcome(OutcomeLabel.LOSS)
+                    }
+                ],
+                Stats = new PerformanceStats(),
+                Total = 2,
+                Page = 1,
+                PageSize = 100
+            });
+
+        var queueService = new Mock<ITradeExecutionQueueService>();
+        var sut = CreateSut(
+            generatedHistory: generatedHistory,
+            blockedHistory: blockedHistory,
+            queueService: queueService,
+            allowedSourceTypes:
+            [
+                SignalExecutionSourceType.Generated,
+                SignalExecutionSourceType.Blocked
+            ]);
+
+        await sut.RunOnceAsync(CancellationToken.None);
+
+        queueService.Verify(s => s.EnqueueAsync(It.IsAny<TradeExecutionRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
     private static TradeAutoExecutionService CreateSut(
         Mock<ISignalRepository>? signalRepo = null,
         Mock<IGeneratedSignalHistoryService>? generatedHistory = null,
@@ -265,14 +351,19 @@ public sealed class TradeAutoExecutionServiceTests
         ExpiryTimeUtc = DateTimeOffset.UtcNow.AddHours(2)
     };
 
-    private static SignalOutcome CreateOutcome() => new()
+    private static SignalOutcome CreateOutcome(OutcomeLabel label = OutcomeLabel.PENDING) => new()
     {
         SignalId = Guid.NewGuid(),
-        OutcomeLabel = OutcomeLabel.WIN,
-        BarsObserved = 5,
-        TpHit = true,
-        SlHit = false,
-        PnlR = 1.5m,
-        ClosedAtUtc = DateTimeOffset.UtcNow
+        OutcomeLabel = label,
+        BarsObserved = label == OutcomeLabel.PENDING ? 0 : 5,
+        TpHit = label == OutcomeLabel.WIN,
+        SlHit = label == OutcomeLabel.LOSS,
+        PnlR = label switch
+        {
+            OutcomeLabel.WIN => 1.5m,
+            OutcomeLabel.LOSS => -1.0m,
+            _ => 0m
+        },
+        ClosedAtUtc = label == OutcomeLabel.PENDING ? null : DateTimeOffset.UtcNow
     };
 }

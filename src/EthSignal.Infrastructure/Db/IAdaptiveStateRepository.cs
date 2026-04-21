@@ -14,6 +14,11 @@ public interface IAdaptiveStateRepository
     Task<IReadOnlyList<RetrospectiveOverlayRecord>> LoadRetrospectiveOverlaysAsync(CancellationToken ct = default);
     Task UpsertRetrospectiveOverlayAsync(string conditionKey, ParameterOverlay overlay, CancellationToken ct = default);
     Task DeleteRetrospectiveOverlayAsync(string conditionKey, CancellationToken ct = default);
+
+    Task<IReadOnlyList<AdaptiveTimeframeProfileState>> LoadTimeframeProfileStatesAsync(CancellationToken ct = default);
+    Task UpsertTimeframeProfileStateAsync(AdaptiveTimeframeProfileState state, CancellationToken ct = default);
+    Task AppendTimeframeProfileChangeAsync(AdaptiveTimeframeProfileChange change, CancellationToken ct = default);
+    Task<IReadOnlyList<AdaptiveTimeframeProfileChange>> LoadRecentTimeframeProfileChangesAsync(int limit, CancellationToken ct = default);
 }
 
 public sealed record OutcomeWindowSnapshot

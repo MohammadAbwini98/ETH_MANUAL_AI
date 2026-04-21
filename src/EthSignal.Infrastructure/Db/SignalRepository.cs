@@ -15,8 +15,12 @@ public sealed class SignalRepository : ISignalRepository
         _connectionString = connectionString;
     }
 
+    private Task EnsureSchemaAsync(CancellationToken ct) =>
+        RuntimeDbSchemaGuard.EnsureMigratedAsync(_connectionString, ct);
+
     public async Task InsertSignalAsync(SignalRecommendation signal, CancellationToken ct = default)
     {
+        await EnsureSchemaAsync(ct);
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
 
@@ -63,6 +67,7 @@ public sealed class SignalRepository : ISignalRepository
 
     public async Task InsertOutcomeAsync(SignalOutcome outcome, CancellationToken ct = default)
     {
+        await EnsureSchemaAsync(ct);
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
 
@@ -98,13 +103,16 @@ public sealed class SignalRepository : ISignalRepository
 
     public async Task<SignalRecommendation?> GetSignalByIdAsync(Guid signalId, CancellationToken ct = default)
     {
+        await EnsureSchemaAsync(ct);
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
 
         await using var cmd = new NpgsqlCommand(@"
             SELECT symbol, signal_id, timeframe, signal_time_utc, direction,
                    entry_price, tp_price, sl_price, risk_percent, risk_usd,
-                   confidence_score, regime, strategy_version, reasons_json, status
+                   confidence_score, regime, strategy_version, reasons_json, status,
+                   market_condition_class, evaluation_id,
+                   tp1_price, tp2_price, tp3_price, risk_reward_ratio, exit_model, exit_explanation
             FROM ""ETH"".signals
             WHERE signal_id = @id
             LIMIT 1;", conn);
@@ -117,13 +125,16 @@ public sealed class SignalRepository : ISignalRepository
 
     public async Task<SignalRecommendation?> GetLatestSignalAsync(string symbol, CancellationToken ct = default)
     {
+        await EnsureSchemaAsync(ct);
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
 
         await using var cmd = new NpgsqlCommand(@"
             SELECT signal_id, timeframe, signal_time_utc, direction,
                    entry_price, tp_price, sl_price, risk_percent, risk_usd,
-                   confidence_score, regime, strategy_version, reasons_json, status
+                   confidence_score, regime, strategy_version, reasons_json, status,
+                   market_condition_class, evaluation_id,
+                   tp1_price, tp2_price, tp3_price, risk_reward_ratio, exit_model, exit_explanation
             FROM ""ETH"".signals
             WHERE symbol = @s ORDER BY signal_time_utc DESC LIMIT 1;", conn);
         cmd.Parameters.AddWithValue("s", symbol);
@@ -138,13 +149,16 @@ public sealed class SignalRepository : ISignalRepository
         DateTimeOffset before,
         CancellationToken ct = default)
     {
+        await EnsureSchemaAsync(ct);
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
 
         await using var cmd = new NpgsqlCommand(@"
             SELECT signal_id, timeframe, signal_time_utc, direction,
                    entry_price, tp_price, sl_price, risk_percent, risk_usd,
-                   confidence_score, regime, strategy_version, reasons_json, status
+                   confidence_score, regime, strategy_version, reasons_json, status,
+                   market_condition_class, evaluation_id,
+                   tp1_price, tp2_price, tp3_price, risk_reward_ratio, exit_model, exit_explanation
             FROM ""ETH"".signals
             WHERE symbol = @s AND signal_time_utc < @before
             ORDER BY signal_time_utc DESC
@@ -160,6 +174,7 @@ public sealed class SignalRepository : ISignalRepository
     public async Task<SignalRecommendation?> GetLatestPrimaryTimeframeSignalAsync(
         string symbol, string primaryTimeframe, CancellationToken ct = default)
     {
+        await EnsureSchemaAsync(ct);
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
 
@@ -167,7 +182,9 @@ public sealed class SignalRepository : ISignalRepository
             WITH preferred AS (
                 SELECT signal_id, timeframe, signal_time_utc, direction,
                        entry_price, tp_price, sl_price, risk_percent, risk_usd,
-                       confidence_score, regime, strategy_version, reasons_json, status
+                       confidence_score, regime, strategy_version, reasons_json, status,
+                       market_condition_class, evaluation_id,
+                       tp1_price, tp2_price, tp3_price, risk_reward_ratio, exit_model, exit_explanation
                 FROM ""ETH"".signals
                 WHERE symbol = @s AND timeframe = @tf
                 ORDER BY signal_time_utc DESC
@@ -176,7 +193,9 @@ public sealed class SignalRepository : ISignalRepository
             fallback AS (
                 SELECT signal_id, timeframe, signal_time_utc, direction,
                        entry_price, tp_price, sl_price, risk_percent, risk_usd,
-                       confidence_score, regime, strategy_version, reasons_json, status
+                       confidence_score, regime, strategy_version, reasons_json, status,
+                       market_condition_class, evaluation_id,
+                       tp1_price, tp2_price, tp3_price, risk_reward_ratio, exit_model, exit_explanation
                 FROM ""ETH"".signals
                 WHERE symbol = @s
                 ORDER BY signal_time_utc DESC
@@ -199,13 +218,16 @@ public sealed class SignalRepository : ISignalRepository
 
     public async Task<IReadOnlyList<SignalRecommendation>> GetSignalHistoryAsync(string symbol, int limit, CancellationToken ct = default)
     {
+        await EnsureSchemaAsync(ct);
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
 
         await using var cmd = new NpgsqlCommand(@"
             SELECT signal_id, timeframe, signal_time_utc, direction,
                    entry_price, tp_price, sl_price, risk_percent, risk_usd,
-                   confidence_score, regime, strategy_version, reasons_json, status
+                   confidence_score, regime, strategy_version, reasons_json, status,
+                   market_condition_class, evaluation_id,
+                   tp1_price, tp2_price, tp3_price, risk_reward_ratio, exit_model, exit_explanation
             FROM ""ETH"".signals
             WHERE symbol = @s ORDER BY signal_time_utc DESC LIMIT @n;", conn);
         cmd.Parameters.AddWithValue("s", symbol);
@@ -226,13 +248,16 @@ public sealed class SignalRepository : ISignalRepository
         int limit,
         CancellationToken ct = default)
     {
+        await EnsureSchemaAsync(ct);
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
 
         await using var cmd = new NpgsqlCommand(@"
             SELECT signal_id, timeframe, signal_time_utc, direction,
                    entry_price, tp_price, sl_price, risk_percent, risk_usd,
-                   confidence_score, regime, strategy_version, reasons_json, status
+                   confidence_score, regime, strategy_version, reasons_json, status,
+                   market_condition_class, evaluation_id,
+                   tp1_price, tp2_price, tp3_price, risk_reward_ratio, exit_model, exit_explanation
             FROM ""ETH"".signals
             WHERE symbol = @s
               AND timeframe = @tf
@@ -259,6 +284,7 @@ public sealed class SignalRepository : ISignalRepository
 
     public async Task<IReadOnlyList<SignalOutcome>> GetOutcomesAsync(string symbol, DateTimeOffset from, DateTimeOffset to, string? strategyVersion, CancellationToken ct = default)
     {
+        await EnsureSchemaAsync(ct);
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
 
@@ -304,6 +330,7 @@ public sealed class SignalRepository : ISignalRepository
 
     public async Task<IReadOnlyList<SignalRecommendation>> GetOpenSignalsAsync(string symbol, CancellationToken ct = default)
     {
+        await EnsureSchemaAsync(ct);
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
 
@@ -311,7 +338,8 @@ public sealed class SignalRepository : ISignalRepository
             SELECT signal_id, timeframe, signal_time_utc, direction,
                    entry_price, tp_price, sl_price, risk_percent, risk_usd,
                    confidence_score, regime, strategy_version, reasons_json, status,
-                   market_condition_class
+                   market_condition_class, evaluation_id,
+                   tp1_price, tp2_price, tp3_price, risk_reward_ratio, exit_model, exit_explanation
             FROM ""ETH"".signals
             WHERE symbol = @s AND status = 'OPEN'
             ORDER BY signal_time_utc;", conn);
@@ -326,6 +354,7 @@ public sealed class SignalRepository : ISignalRepository
 
     public async Task UpdateSignalStatusAsync(Guid signalId, SignalStatus status, CancellationToken ct = default)
     {
+        await EnsureSchemaAsync(ct);
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
 
@@ -341,6 +370,7 @@ public sealed class SignalRepository : ISignalRepository
         if (features.Count == 0)
             return;
 
+        await EnsureSchemaAsync(ct);
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
         var sql = new StringBuilder(@"
@@ -372,6 +402,7 @@ public sealed class SignalRepository : ISignalRepository
 
     public async Task<IReadOnlyList<SignalWithOutcome>> GetSignalHistoryWithOutcomesAsync(string symbol, int limit, int offset, CancellationToken ct = default)
     {
+        await EnsureSchemaAsync(ct);
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
 
@@ -379,6 +410,8 @@ public sealed class SignalRepository : ISignalRepository
             SELECT s.signal_id, s.timeframe, s.signal_time_utc, s.direction,
                    s.entry_price, s.tp_price, s.sl_price, s.risk_percent, s.risk_usd,
                    s.confidence_score, s.regime, s.strategy_version, s.reasons_json, s.status,
+                   s.market_condition_class, s.evaluation_id,
+                   s.tp1_price, s.tp2_price, s.tp3_price, s.risk_reward_ratio, s.exit_model, s.exit_explanation,
                    o.outcome_label, o.pnl_r, o.bars_observed, o.tp_hit, o.sl_hit, o.partial_win,
                    o.mfe_price, o.mae_price, o.mfe_r, o.mae_r, o.closed_at_utc
             FROM ""ETH"".signals s
@@ -396,22 +429,22 @@ public sealed class SignalRepository : ISignalRepository
         {
             var signal = ReadSignal(symbol, r);
             SignalOutcome? outcome = null;
-            if (!r.IsDBNull(14))
+            if (!r.IsDBNull(22))
             {
                 outcome = new SignalOutcome
                 {
                     SignalId = r.GetGuid(0),
-                    OutcomeLabel = Enum.Parse<OutcomeLabel>(r.GetString(14)),
-                    PnlR = r.GetDecimal(15),
-                    BarsObserved = r.GetInt32(16),
-                    TpHit = r.GetBoolean(17),
-                    SlHit = r.GetBoolean(18),
-                    PartialWin = r.GetBoolean(19),
-                    MfePrice = r.GetDecimal(20),
-                    MaePrice = r.GetDecimal(21),
-                    MfeR = r.GetDecimal(22),
-                    MaeR = r.GetDecimal(23),
-                    ClosedAtUtc = r.IsDBNull(24) ? null : r.GetFieldValue<DateTimeOffset>(24)
+                    OutcomeLabel = Enum.Parse<OutcomeLabel>(r.GetString(22)),
+                    PnlR = r.GetDecimal(23),
+                    BarsObserved = r.GetInt32(24),
+                    TpHit = r.GetBoolean(25),
+                    SlHit = r.GetBoolean(26),
+                    PartialWin = r.GetBoolean(27),
+                    MfePrice = r.GetDecimal(28),
+                    MaePrice = r.GetDecimal(29),
+                    MfeR = r.GetDecimal(30),
+                    MaeR = r.GetDecimal(31),
+                    ClosedAtUtc = r.IsDBNull(32) ? null : r.GetFieldValue<DateTimeOffset>(32)
                 };
             }
             results.Add(new SignalWithOutcome { Signal = signal, Outcome = outcome });
@@ -421,6 +454,7 @@ public sealed class SignalRepository : ISignalRepository
 
     public async Task<int> GetSignalCountAsync(string symbol, CancellationToken ct = default)
     {
+        await EnsureSchemaAsync(ct);
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
 
@@ -455,7 +489,15 @@ public sealed class SignalRepository : ISignalRepository
         Regime = Enum.Parse<Regime>(r.GetString(10)),
         StrategyVersion = r.GetString(11),
         Reasons = ParseReasons(r.GetString(12)),
-        Status = Enum.Parse<SignalStatus>(r.GetString(13))
+        Status = Enum.Parse<SignalStatus>(r.GetString(13)),
+        MarketConditionClass = r.IsDBNull(14) ? null : r.GetString(14),
+        EvaluationId = r.IsDBNull(15) ? null : r.GetGuid(15),
+        Tp1Price = r.IsDBNull(16) ? 0m : r.GetDecimal(16),
+        Tp2Price = r.IsDBNull(17) ? 0m : r.GetDecimal(17),
+        Tp3Price = r.IsDBNull(18) ? 0m : r.GetDecimal(18),
+        RiskRewardRatio = r.IsDBNull(19) ? 0m : r.GetDecimal(19),
+        ExitModel = r.IsDBNull(20) ? null : r.GetString(20),
+        ExitExplanation = r.IsDBNull(21) ? null : r.GetString(21)
     };
 
     private static SignalRecommendation ReadSignalFromRowWithSymbol(NpgsqlDataReader r) => new()
@@ -474,7 +516,15 @@ public sealed class SignalRepository : ISignalRepository
         Regime = Enum.Parse<Regime>(r.GetString(11)),
         StrategyVersion = r.GetString(12),
         Reasons = ParseReasons(r.GetString(13)),
-        Status = Enum.Parse<SignalStatus>(r.GetString(14))
+        Status = Enum.Parse<SignalStatus>(r.GetString(14)),
+        MarketConditionClass = r.IsDBNull(15) ? null : r.GetString(15),
+        EvaluationId = r.IsDBNull(16) ? null : r.GetGuid(16),
+        Tp1Price = r.IsDBNull(17) ? 0m : r.GetDecimal(17),
+        Tp2Price = r.IsDBNull(18) ? 0m : r.GetDecimal(18),
+        Tp3Price = r.IsDBNull(19) ? 0m : r.GetDecimal(19),
+        RiskRewardRatio = r.IsDBNull(20) ? 0m : r.GetDecimal(20),
+        ExitModel = r.IsDBNull(21) ? null : r.GetString(21),
+        ExitExplanation = r.IsDBNull(22) ? null : r.GetString(22)
     };
 
     private static SignalRecommendation ReadSignalWithCondition(string symbol, NpgsqlDataReader r) => new()
@@ -494,6 +544,13 @@ public sealed class SignalRepository : ISignalRepository
         StrategyVersion = r.GetString(11),
         Reasons = ParseReasons(r.GetString(12)),
         Status = Enum.Parse<SignalStatus>(r.GetString(13)),
-        MarketConditionClass = r.IsDBNull(14) ? null : r.GetString(14)
+        MarketConditionClass = r.IsDBNull(14) ? null : r.GetString(14),
+        EvaluationId = r.IsDBNull(15) ? null : r.GetGuid(15),
+        Tp1Price = r.IsDBNull(16) ? 0m : r.GetDecimal(16),
+        Tp2Price = r.IsDBNull(17) ? 0m : r.GetDecimal(17),
+        Tp3Price = r.IsDBNull(18) ? 0m : r.GetDecimal(18),
+        RiskRewardRatio = r.IsDBNull(19) ? 0m : r.GetDecimal(19),
+        ExitModel = r.IsDBNull(20) ? null : r.GetString(20),
+        ExitExplanation = r.IsDBNull(21) ? null : r.GetString(21)
     };
 }

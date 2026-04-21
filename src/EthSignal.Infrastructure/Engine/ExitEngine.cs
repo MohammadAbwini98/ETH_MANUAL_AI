@@ -87,6 +87,7 @@ public static class ExitEngine
         public decimal ScalpMaxAtrTpMultiplier { get; init; } = 1.5m;
         public decimal IntradayMinAtrTpMultiplier { get; init; } = 1.5m;
         public decimal IntradayMaxAtrTpMultiplier { get; init; } = 3.0m;
+        public decimal StructureBufferAtrMultiplier { get; init; } = 0.15m;
 
         // Risk
         public decimal AccountBalanceUsd { get; init; } = 50m;
@@ -135,7 +136,7 @@ public static class ExitEngine
                 ctx.Structure, ctx.Direction, ctx.EntryPrice);
             if (invalidation > 0)
             {
-                structureStop = Math.Abs(ctx.EntryPrice - invalidation);
+                structureStop = Math.Abs(ctx.EntryPrice - invalidation) + ctx.Atr * policy.StructureBufferAtrMultiplier;
                 explanation.Add($"Structure invalidation: {invalidation:F2} (dist={structureStop:F4})");
             }
         }
@@ -193,7 +194,21 @@ public static class ExitEngine
         // 2. TAKE PROFIT — Layered calculation
         // ═══════════════════════════════════════════════════════
 
-        // Layer 1: Structure-based TP target
+        // Layer 1: ATR-based TP projection
+        bool isScalp = ctx.Timeframe == "1m";
+        decimal minAtrTpMult = isScalp ? policy.ScalpMinAtrTpMultiplier : policy.IntradayMinAtrTpMultiplier;
+        decimal maxAtrTpMult = isScalp ? policy.ScalpMaxAtrTpMultiplier : policy.IntradayMaxAtrTpMultiplier;
+        decimal atrTpDistance = policy.DefaultRewardToRisk * finalStopDistance;
+        decimal atrTpMin = minAtrTpMult * ctx.Atr;
+        decimal atrTpMax = maxAtrTpMult * ctx.Atr;
+        explanation.Add($"ATR TP range: [{atrTpMin:F4}–{atrTpMax:F4}]");
+
+        // Start with the R:R target, but keep it inside the ATR-realistic band.
+        decimal baseTpDistance = Math.Clamp(atrTpDistance, atrTpMin, atrTpMax);
+        if (baseTpDistance != atrTpDistance)
+            explanation.Add($"ATR TP band applied: {atrTpDistance:F4} → {baseTpDistance:F4}");
+
+        // Layer 2: Structure-based TP target
         decimal structureTarget = 0;
         if (ctx.Structure != null)
         {
@@ -204,49 +219,65 @@ public static class ExitEngine
         decimal structureTargetDistance = structureTarget > 0
             ? Math.Abs(structureTarget - ctx.EntryPrice)
             : 0;
+        decimal selectedStructureTarget = 0m;
 
         if (structureTarget > 0)
             explanation.Add($"Structure TP target: {structureTarget:F2} (dist={structureTargetDistance:F4})");
 
-        // Layer 2: ATR-based TP projection
-        bool isScalp = ctx.Timeframe == "1m";
-        decimal minAtrTpMult = isScalp ? policy.ScalpMinAtrTpMultiplier : policy.IntradayMinAtrTpMultiplier;
-        decimal maxAtrTpMult = isScalp ? policy.ScalpMaxAtrTpMultiplier : policy.IntradayMaxAtrTpMultiplier;
-        decimal atrTpDistance = policy.DefaultRewardToRisk * finalStopDistance;
-        decimal atrTpMin = minAtrTpMult * ctx.Atr;
-        decimal atrTpMax = maxAtrTpMult * ctx.Atr;
-        explanation.Add($"ATR TP range: [{atrTpMin:F4}–{atrTpMax:F4}]");
-
         // Layer 3: Choose the best TP distance
-        // Start with R:R-based distance, clamp to ATR-realistic range
-        decimal baseTpDistance = atrTpDistance;
-
-        // If structure target exists and is within the ATR-realistic range, prefer it
+        // If structure target exists and is within the ATR-realistic range, prefer it.
         if (structureTargetDistance > 0)
         {
             if (structureTargetDistance >= atrTpMin && structureTargetDistance <= atrTpMax)
             {
-                // Structure target is realistic — use it
+                // Structure target is realistic — use it.
                 baseTpDistance = structureTargetDistance;
+                selectedStructureTarget = structureTarget;
                 explanation.Add("Using structure-based TP (within ATR range)");
             }
             else if (structureTargetDistance < atrTpMin)
             {
-                // Structure target is too close — structure blocks realistic target
-                // Check if the R:R would still be acceptable
+                // A very near structure level is often just local noise on HTFs.
+                // Try the next meaningful structure before rejecting the setup.
                 decimal rr = structureTargetDistance / finalStopDistance;
                 if (rr >= policy.MinRewardToRisk)
                 {
                     baseTpDistance = structureTargetDistance;
+                    selectedStructureTarget = structureTarget;
                     explanation.Add($"Using conservative structure TP (R:R={rr:F2} acceptable)");
                 }
                 else
                 {
-                    return Reject($"Structure target too close: dist={structureTargetDistance:F4}, " +
-                        $"R:R={rr:F2} < min({policy.MinRewardToRisk}), structure blocks realistic target");
+                    var alternateStructureTarget = ctx.Structure != null
+                        ? StructureAnalyzer.FindStructureTarget(ctx.Structure, ctx.Direction, ctx.EntryPrice, atrTpMin)
+                        : 0m;
+                    var alternateStructureDistance = alternateStructureTarget > 0
+                        ? Math.Abs(alternateStructureTarget - ctx.EntryPrice)
+                        : 0m;
+
+                    if (alternateStructureDistance >= atrTpMin && alternateStructureDistance <= atrTpMax)
+                    {
+                        baseTpDistance = alternateStructureDistance;
+                        selectedStructureTarget = alternateStructureTarget;
+                        explanation.Add(
+                            $"Nearest structure too close (R:R={rr:F2}); using next structure target {alternateStructureTarget:F2}");
+                    }
+                    else if (!isScalp)
+                    {
+                        explanation.Add(
+                            $"Nearest structure too close (R:R={rr:F2}); falling back to ATR-based TP for {ctx.Timeframe}");
+                    }
+                    else
+                    {
+                        return Reject($"Structure target too close: dist={structureTargetDistance:F4}, " +
+                            $"R:R={rr:F2} < min({policy.MinRewardToRisk}), structure blocks realistic target");
+                    }
                 }
             }
-            // If structure target is above ATR max, use the ATR-capped distance
+            else
+            {
+                explanation.Add("Structure target beyond ATR TP cap; using ATR-based TP band");
+            }
         }
 
         // Layer 4: Regime adjustment to TP
@@ -272,7 +303,7 @@ public static class ExitEngine
             confidenceMultiplier = policy.LowConfidenceTpReduce;
             explanation.Add($"Low confidence ({ctx.ConfidenceScore}) TP reduce: ×{confidenceMultiplier}");
         }
-        decimal finalTpDistance = regimeAdjustedTp * confidenceMultiplier;
+        decimal finalTpDistance = Math.Clamp(regimeAdjustedTp * confidenceMultiplier, atrTpMin, atrTpMax);
 
         // Layer 6: Enforce minimum R:R
         decimal actualRR = finalStopDistance > 0 ? finalTpDistance / finalStopDistance : 0;
@@ -320,19 +351,19 @@ public static class ExitEngine
         }
 
         // If structure target is significant, align TP2 with it
-        if (structureTarget > 0)
+        if (selectedStructureTarget > 0)
         {
-            decimal structDist = Math.Abs(structureTarget - ctx.EntryPrice);
+            decimal structDist = Math.Abs(selectedStructureTarget - ctx.EntryPrice);
             if (structDist > tp1Distance && structDist < tp3Distance)
             {
-                tp2 = structureTarget;
+                tp2 = selectedStructureTarget;
                 explanation.Add($"TP2 aligned with structure target: {tp2:F2}");
             }
         }
 
         // Determine exit model used
         string exitModel = structureStop > 0
-            ? (structureTargetDistance > 0 ? "STRUCTURE_FULL" : "STRUCTURE_SL_ONLY")
+            ? (selectedStructureTarget > 0 ? "STRUCTURE_FULL" : "STRUCTURE_SL_ONLY")
             : "ATR_BASED";
 
         return new ExitResult
@@ -375,6 +406,7 @@ public static class ExitEngine
         ScalpMaxAtrTpMultiplier = p.ExitScalpMaxAtrTpMultiplier,
         IntradayMinAtrTpMultiplier = p.ExitIntradayMinAtrTpMultiplier,
         IntradayMaxAtrTpMultiplier = p.ExitIntradayMaxAtrTpMultiplier,
+        StructureBufferAtrMultiplier = p.ExitStructureBufferAtrMultiplier,
         AccountBalanceUsd = p.AccountBalanceUsd,
         RiskPercentPerTrade = p.RiskPerTradePercent,
         HardMaxRiskPercent = p.HardMaxRiskPercent,
@@ -382,21 +414,65 @@ public static class ExitEngine
         MaxSpreadPct = p.MaxSpreadPct
     };
 
+    public static ExitPolicy BuildPolicy(StrategyParameters p, string timeframe)
+    {
+        var resolved = p.ResolveForTimeframe(timeframe);
+        var bucket = resolved.ResolveTimeframeProfileBucket(timeframe);
+        var intradayMinAtrTpMultiplier = bucket == TimeframeProfileBucket.Long
+            ? resolved.ExitHigherTfMinAtrTpMultiplier
+            : resolved.ExitIntradayMinAtrTpMultiplier;
+        var intradayMaxAtrTpMultiplier = bucket == TimeframeProfileBucket.Long
+            ? resolved.ExitHigherTfMaxAtrTpMultiplier
+            : resolved.ExitIntradayMaxAtrTpMultiplier;
+
+        return new ExitPolicy
+        {
+            AtrMultiplier = resolved.StopAtrMultiplier,
+            SpreadSlippageBufferPct = resolved.LiveEntrySlippageBufferPct,
+            MinStopDistancePct = resolved.MinStopDistancePct,
+            MaxStopDistancePct = resolved.ExitMaxStopDistancePct,
+            MinRewardToRisk = resolved.MinRiskRewardAfterRounding,
+            DefaultRewardToRisk = resolved.TargetRMultiple,
+            Tp1RMultiple = resolved.ExitTp1RMultiple,
+            Tp2RMultiple = resolved.ExitTp2RMultiple,
+            Tp3RMultiple = resolved.ExitTp3RMultiple,
+            TrendingTpMultiplier = resolved.ExitTrendingTpMultiplier,
+            TrendingSlMultiplier = resolved.ExitTrendingSlMultiplier,
+            RangingTpMultiplier = resolved.ExitRangingTpMultiplier,
+            RangingSlMultiplier = resolved.ExitRangingSlMultiplier,
+            HighConfidenceTpBoost = resolved.ExitHighConfidenceTpBoost,
+            LowConfidenceTpReduce = resolved.ExitLowConfidenceTpReduce,
+            HighConfidenceThreshold = resolved.ExitHighConfidenceThreshold,
+            LowConfidenceThreshold = resolved.ExitLowConfidenceThreshold,
+            ScalpMinAtrTpMultiplier = resolved.ExitScalpMinAtrTpMultiplier,
+            ScalpMaxAtrTpMultiplier = resolved.ExitScalpMaxAtrTpMultiplier,
+            IntradayMinAtrTpMultiplier = intradayMinAtrTpMultiplier,
+            IntradayMaxAtrTpMultiplier = intradayMaxAtrTpMultiplier,
+            StructureBufferAtrMultiplier = resolved.ExitStructureBufferAtrMultiplier,
+            AccountBalanceUsd = resolved.AccountBalanceUsd,
+            RiskPercentPerTrade = resolved.RiskPerTradePercent,
+            HardMaxRiskPercent = resolved.HardMaxRiskPercent,
+            MinAtrThreshold = resolved.MinAtrThreshold,
+            MaxSpreadPct = resolved.MaxSpreadPct
+        };
+    }
+
     /// <summary>Build a scalp-specific ExitPolicy.</summary>
     public static ExitPolicy BuildScalpPolicy(StrategyParameters p)
     {
-        var policy = BuildPolicy(p);
+        var resolved = p.ResolveForTimeframe(Timeframe.M1.Name);
+        var policy = BuildPolicy(resolved, Timeframe.M1.Name);
         return policy with
         {
-            AtrMultiplier = p.ScalpStopAtrMultiplier,
-            DefaultRewardToRisk = p.ScalpTargetRMultiple,
-            MinAtrThreshold = p.ScalpMinAtr,
+            AtrMultiplier = resolved.ScalpStopAtrMultiplier,
+            DefaultRewardToRisk = resolved.ScalpTargetRMultiple,
+            MinAtrThreshold = resolved.ScalpMinAtr,
             // Tighter TPs for scalps
-            Tp1RMultiple = p.ExitScalpTp1RMultiple,
-            Tp2RMultiple = p.ExitScalpTp2RMultiple,
-            Tp3RMultiple = p.ExitScalpTp3RMultiple,
-            ScalpMinAtrTpMultiplier = p.ExitScalpMinAtrTpMultiplier,
-            ScalpMaxAtrTpMultiplier = p.ExitScalpMaxAtrTpMultiplier
+            Tp1RMultiple = resolved.ExitScalpTp1RMultiple,
+            Tp2RMultiple = resolved.ExitScalpTp2RMultiple,
+            Tp3RMultiple = resolved.ExitScalpTp3RMultiple,
+            ScalpMinAtrTpMultiplier = resolved.ExitScalpMinAtrTpMultiplier,
+            ScalpMaxAtrTpMultiplier = resolved.ExitScalpMaxAtrTpMultiplier
         };
     }
 

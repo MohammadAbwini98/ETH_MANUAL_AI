@@ -1,4 +1,5 @@
 using EthSignal.Domain.Models;
+using EthSignal.Infrastructure.Db;
 using EthSignal.Infrastructure.Engine.ML;
 using FluentAssertions;
 using Microsoft.Extensions.Logging;
@@ -324,6 +325,99 @@ public class AdaptiveAuditFixTests
         // Second call at the same condition should NOT force-log
         var (adapted2, _) = service.AdaptParameters(p, snap, regime, candle, Timeframe.M5, recentSnaps);
         adapted2.Should().NotBeNull();
+    }
+
+    [Fact]
+    public void Issue13_AdaptParameters_Does_Not_Persist_Global_Parameter_Snapshots()
+    {
+        var logger = new Mock<ILogger<MarketAdaptiveParameterService>>().Object;
+        var paramRepo = new Mock<IParameterRepository>(MockBehavior.Strict);
+        var service = new MarketAdaptiveParameterService(logger, paramRepo: paramRepo.Object);
+
+        var p = BaseParams();
+        var snap = MakeSnap();
+        var regime = MakeRegime();
+        var candle = MakeCandle();
+        var recentSnaps = new List<IndicatorSnapshot> { snap };
+
+        service.AdaptParameters(p, snap, regime, candle, Timeframe.M5, recentSnaps);
+
+        paramRepo.Verify(r => r.GetActiveAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        paramRepo.Verify(r => r.InsertAsync(It.IsAny<StrategyParameterSet>(), It.IsAny<CancellationToken>()), Times.Never);
+        paramRepo.Verify(r => r.ActivateAsync(It.IsAny<long>(), It.IsAny<long?>(), It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public void Issue14_RecordOutcome_Is_Isolated_Per_Timeframe()
+    {
+        var logger = new Mock<ILogger<MarketAdaptiveParameterService>>().Object;
+        var service = new MarketAdaptiveParameterService(logger);
+        var p = BaseParams();
+
+        service.RecordOutcome(MakeOutcome(OutcomeLabel.WIN, 1.2m), "1m", "NORMAL_MODERATE", p);
+        service.RecordOutcome(MakeOutcome(OutcomeLabel.LOSS, -1.0m), "1h", "NORMAL_MODERATE", p);
+
+        var status = service.GetStatus(p);
+        status.ConditionDetails.Should().ContainSingle(d =>
+            d.Timeframe == "1m" &&
+            d.ConditionKey == "NORMAL_MODERATE" &&
+            d.OutcomeCount == 1);
+        status.ConditionDetails.Should().ContainSingle(d =>
+            d.Timeframe == "1h" &&
+            d.ConditionKey == "NORMAL_MODERATE" &&
+            d.OutcomeCount == 1);
+    }
+
+    [Fact]
+    public void Issue14_AdaptParameters_Persists_Independent_Timeframe_Profile_States()
+    {
+        var logger = new Mock<ILogger<MarketAdaptiveParameterService>>().Object;
+        var stateRepo = new Mock<IAdaptiveStateRepository>();
+        stateRepo.Setup(r => r.UpsertTimeframeProfileStateAsync(It.IsAny<AdaptiveTimeframeProfileState>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        stateRepo.Setup(r => r.AppendTimeframeProfileChangeAsync(It.IsAny<AdaptiveTimeframeProfileChange>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        var service = new MarketAdaptiveParameterService(logger, stateRepo: stateRepo.Object);
+        var p = BaseParams() with
+        {
+            TimeframeProfiles = TimeframeStrategyProfileSet.Recommended
+        };
+
+        var m1Snap = MakeSnap() with { Timeframe = "1m" };
+        var h1Snap = MakeSnap() with { Timeframe = "1h", CandleOpenTimeUtc = DateTimeOffset.UtcNow.AddHours(-1) };
+        var regime = MakeRegime();
+        var m1Candle = MakeCandle();
+        var h1Candle = MakeCandle() with { OpenTime = DateTimeOffset.UtcNow.AddHours(-1) };
+
+        service.AdaptParameters(p, m1Snap, regime, m1Candle, Timeframe.M1, new List<IndicatorSnapshot> { m1Snap });
+        service.AdaptParameters(p, h1Snap, regime, h1Candle, Timeframe.H1, new List<IndicatorSnapshot> { h1Snap });
+
+        SpinWait.SpinUntil(() => stateRepo.Invocations.Count >= 4, TimeSpan.FromSeconds(1))
+            .Should().BeTrue("each timeframe should persist its own current state and change row");
+
+        var status = service.GetStatus(p);
+        status.TimeframeProfiles.Should().ContainSingle(profile =>
+            profile.Timeframe == "1m" &&
+            profile.StopAtrMultiplier == p.TimeframeProfiles.M1.StopAtrMultiplier);
+        status.TimeframeProfiles.Should().ContainSingle(profile =>
+            profile.Timeframe == "1h" &&
+            profile.TargetRMultiple == p.TimeframeProfiles.H1.TargetRMultiple);
+        status.RecentChanges.Should().Contain(change => change.Timeframe == "1m");
+        status.RecentChanges.Should().Contain(change => change.Timeframe == "1h");
+
+        stateRepo.Verify(r => r.UpsertTimeframeProfileStateAsync(
+            It.Is<AdaptiveTimeframeProfileState>(state => state.Timeframe == "1m"),
+            It.IsAny<CancellationToken>()), Times.Once);
+        stateRepo.Verify(r => r.UpsertTimeframeProfileStateAsync(
+            It.Is<AdaptiveTimeframeProfileState>(state => state.Timeframe == "1h"),
+            It.IsAny<CancellationToken>()), Times.Once);
+        stateRepo.Verify(r => r.AppendTimeframeProfileChangeAsync(
+            It.Is<AdaptiveTimeframeProfileChange>(change => change.Timeframe == "1m"),
+            It.IsAny<CancellationToken>()), Times.Once);
+        stateRepo.Verify(r => r.AppendTimeframeProfileChangeAsync(
+            It.Is<AdaptiveTimeframeProfileChange>(change => change.Timeframe == "1h"),
+            It.IsAny<CancellationToken>()), Times.Once);
     }
 
     // ═══════════════════════════════════════════════════════

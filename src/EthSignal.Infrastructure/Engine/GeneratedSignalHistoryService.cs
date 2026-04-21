@@ -264,7 +264,8 @@ public sealed class GeneratedSignalHistoryService : IGeneratedSignalHistoryServi
         }
 
         var timeframe = Timeframe.ByNameOrDefault(row.Timeframe);
-        var parameters = ParseParameters(row.EffectiveRuntimeParametersJson, row.ParameterSetId);
+        var parameters = ParseParameters(row.EffectiveRuntimeParametersJson, row.ParameterSetId)
+            .ResolveForTimeframe(timeframe.Name);
         var indicators = ParseIndicators(row.IndicatorsJson);
         var regime = ParseRegime(row.Regime);
         var signalTimeUtc = row.BarTimeUtc.Add(timeframe.Duration);
@@ -287,7 +288,7 @@ public sealed class GeneratedSignalHistoryService : IGeneratedSignalHistoryServi
         var atr = TryGetIndicator(indicators, "atr14") ?? 0m;
         var spreadPct = closeMid > 0 ? spread / closeMid : 0m;
         var estimatedEntry = closeMid > 0
-            ? RiskManager.EstimateLiveFillPrice(direction, closeMid, spreadPct, parameters.LiveEntrySlippageBufferPct)
+            ? RiskManager.EstimateLiveFillPrice(direction, closeMid, spreadPct, parameters, timeframe.Name, row.ConfidenceScore, atr)
             : 0m;
 
         var recentCandles = closedHistory.TakeLast(5).ToList();
@@ -320,7 +321,7 @@ public sealed class GeneratedSignalHistoryService : IGeneratedSignalHistoryServi
 
         var exitPolicy = timeframe == Timeframe.M1 || ParseOrigin(row.Origin) == DecisionOrigin.SCALP_1M
             ? ExitEngine.BuildScalpPolicy(parameters)
-            : ExitEngine.BuildPolicy(parameters);
+            : ExitEngine.BuildPolicy(parameters, timeframe.Name);
 
         var exitResult = ExitEngine.Compute(exitContext, exitPolicy);
         var usedFallbackExit = false;
