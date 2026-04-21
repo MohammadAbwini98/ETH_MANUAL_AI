@@ -8,6 +8,10 @@ namespace EthSignal.Infrastructure.Trading;
 public sealed class TradeExecutionQueueService : ITradeExecutionQueueService
 {
     private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web);
+    private static readonly TimeSpan ProcessingRecoveryWindow = TimeSpan.FromMinutes(2);
+    private static readonly TimeSpan ForceMarketRetryDelay = TimeSpan.FromMilliseconds(250);
+    private static readonly TimeSpan CapacityRetryDelay = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan DefaultRetryDelay = TimeSpan.FromSeconds(2);
 
     private readonly ITradeExecutionQueueRepository _queueRepository;
     private readonly IExecutedTradeRepository _executedTradeRepository;
@@ -15,7 +19,9 @@ public sealed class TradeExecutionQueueService : ITradeExecutionQueueService
     private readonly ITradeExecutionService _executionService;
     private readonly IAccountSnapshotService _accountSnapshotService;
     private readonly ILogger<TradeExecutionQueueService> _logger;
-    private readonly Func<TimeSpan, CancellationToken, Task> _delayAsync;
+    private readonly SemaphoreSlim _dispatchLock = new(1, 1);
+    private readonly SemaphoreSlim _workSignal = new(0, 1);
+    private int _workPending;
 
     public TradeExecutionQueueService(
         ITradeExecutionQueueRepository queueRepository,
@@ -23,8 +29,7 @@ public sealed class TradeExecutionQueueService : ITradeExecutionQueueService
         ITradeExecutionPolicy policy,
         ITradeExecutionService executionService,
         IAccountSnapshotService accountSnapshotService,
-        ILogger<TradeExecutionQueueService> logger,
-        Func<TimeSpan, CancellationToken, Task>? delayAsync = null)
+        ILogger<TradeExecutionQueueService> logger)
     {
         _queueRepository = queueRepository;
         _executedTradeRepository = executedTradeRepository;
@@ -32,7 +37,6 @@ public sealed class TradeExecutionQueueService : ITradeExecutionQueueService
         _executionService = executionService;
         _accountSnapshotService = accountSnapshotService;
         _logger = logger;
-        _delayAsync = delayAsync ?? Task.Delay;
     }
 
     public async Task<TradeExecutionQueueResult> EnqueueAsync(TradeExecutionRequest request, CancellationToken ct = default)
@@ -64,6 +68,7 @@ public sealed class TradeExecutionQueueService : ITradeExecutionQueueService
         var existingQueue = await _queueRepository.GetActiveBySourceSignalAsync(request.Candidate.SignalId, request.Candidate.SourceType, ct);
         if (existingQueue != null)
         {
+            NotifyWorkAvailable();
             return new TradeExecutionQueueResult
             {
                 Accepted = true,
@@ -90,11 +95,16 @@ public sealed class TradeExecutionQueueService : ITradeExecutionQueueService
         };
 
         var queueEntryId = await _queueRepository.InsertAsync(entry, ct);
+        var counts = await _queueRepository.GetStatusCountsAsync(ct);
         _logger.LogInformation(
-            "[TradeExecutionQueue] Queued {SourceType} signal {SignalId} as queue entry {QueueEntryId}",
+            "[TradeExecutionQueue] Enqueued {SourceType} signal {SignalId} as queue entry {QueueEntryId} (Queued={QueuedCount}, Processing={ProcessingCount})",
             request.Candidate.SourceType,
             request.Candidate.SignalId,
-            queueEntryId);
+            queueEntryId,
+            counts.QueuedCount,
+            counts.ProcessingCount);
+
+        NotifyWorkAvailable();
 
         return new TradeExecutionQueueResult
         {
@@ -111,85 +121,87 @@ public sealed class TradeExecutionQueueService : ITradeExecutionQueueService
         if (!settings.Enabled)
             return 0;
 
-        var processed = 0;
-        var queueConcurrentRequestLimit = Math.Clamp(settings.QueueConcurrentRequestLimit, 1, 3);
-        var queueCooldown = TimeSpan.FromMilliseconds(Math.Clamp(settings.QueueCooldownMilliseconds, 0, 500));
-        while (!ct.IsCancellationRequested)
+        if (!await _dispatchLock.WaitAsync(0, ct))
+            return 0;
+
+        try
         {
-            var activeTrades = await GetActiveTradeCountAsync(settings, ct);
-            var availableCapacity = settings.MaxConcurrentOpenTrades - activeTrades;
-            if (availableCapacity <= 0)
+            var recovered = await _queueRepository.RequeueStaleProcessingAsync(DateTimeOffset.UtcNow - ProcessingRecoveryWindow, ct);
+            if (recovered > 0)
             {
-                _logger.LogInformation(
-                    "[TradeExecutionQueue] Waiting for free capacity before processing queued trades ({ActiveTrades}/{MaxConcurrentOpenTrades})",
-                    activeTrades,
-                    settings.MaxConcurrentOpenTrades);
-                break;
+                _logger.LogWarning(
+                    "[TradeExecutionQueue] Recovered {RecoveredCount} stale processing queue entries back to Queued",
+                    recovered);
             }
 
-            var batchSize = Math.Min(availableCapacity, queueConcurrentRequestLimit);
-            var entries = new List<QueuedTradeExecution>(batchSize);
-            for (var i = 0; i < batchSize; i++)
+            var context = await GetDispatchContextAsync(settings, ct);
+            if (context.QueuedCount == 0)
+                return 0;
+
+            if (context.AvailableDispatchSlots <= 0)
             {
-                var entry = await _queueRepository.GetNextQueuedAsync(ct);
-                if (entry == null)
+                LogBlockedCapacity(context);
+                return 0;
+            }
+
+            var dispatched = 0;
+            while (!ct.IsCancellationRequested && dispatched < context.AvailableDispatchSlots)
+            {
+                var claimed = await _queueRepository.TryClaimNextQueuedAsync(DateTimeOffset.UtcNow, ct);
+                if (claimed == null)
                     break;
 
-                var processingEntry = entry with
-                {
-                    Status = TradeExecutionQueueStatus.Processing,
-                    UpdatedAtUtc = DateTimeOffset.UtcNow
-                };
-                await _queueRepository.UpdateAsync(processingEntry, ct);
-                entries.Add(processingEntry);
+                dispatched++;
+                _logger.LogInformation(
+                    "[TradeExecutionQueue] Dequeued queue entry {QueueEntryId} for {SourceType} signal {SignalId} (Dispatch {DispatchIndex}/{DispatchCapacity})",
+                    claimed.QueueEntryId,
+                    claimed.SourceType,
+                    claimed.SignalId,
+                    dispatched,
+                    context.AvailableDispatchSlots);
+
+                _ = ProcessEntryInBackgroundAsync(claimed, ct);
             }
 
-            if (entries.Count == 0)
-                break;
-
-            var results = await Task.WhenAll(entries.Select(entry => ProcessEntryAsync(entry, ct)));
-            processed += results.Count(result => result.Status != TradeExecutionQueueStatus.Queued);
-
-            if (entries.Count == queueConcurrentRequestLimit
-                && queueCooldown > TimeSpan.Zero
-                && await _queueRepository.HasQueuedAsync(ct))
+            if (dispatched > 0)
             {
                 _logger.LogInformation(
-                    "[TradeExecutionQueue] Applied cooldown of {CooldownMs}ms after a full {BatchSize}-request queue burst",
-                    queueCooldown.TotalMilliseconds,
-                    entries.Count);
-                await _delayAsync(queueCooldown, ct);
+                    "[TradeExecutionQueue] Dispatched {DispatchedCount} queued execution request(s) (BrokerOpen={BrokerOpenTradeCount}, PendingSubmitted={PendingSubmissionCount}, Processing={ProcessingCount}, QueuedRemainingApprox={QueuedRemaining})",
+                    dispatched,
+                    context.BrokerOpenTradeCount,
+                    context.PendingSubmissionCount,
+                    context.ProcessingCount + dispatched,
+                    Math.Max(0, context.QueuedCount - dispatched));
             }
-        }
 
-        return processed;
+            return dispatched;
+        }
+        finally
+        {
+            _dispatchLock.Release();
+        }
     }
 
     public async Task<TradeExecutionQueueSnapshot> GetSnapshotAsync(int limit = 50, CancellationToken ct = default)
     {
         var settings = _policy.GetSettings();
+        var context = await GetDispatchContextAsync(settings, ct);
         var serverTimeUtc = DateTimeOffset.UtcNow;
-        var account = await _accountSnapshotService.GetLatestAsync(ct);
-        var activeTradeCount = await _executedTradeRepository.GetActiveExecutedTradeCountAsync(new ExecutedTradeQuery
-        {
-            AccountId = account.AccountId,
-            AccountName = account.AccountName,
-            IsDemo = settings.DemoOnly ? true : null
-        }, ct);
-        var counts = await _queueRepository.GetStatusCountsAsync(ct);
         var entries = await _queueRepository.GetActiveEntriesAsync(limit, ct);
 
         return new TradeExecutionQueueSnapshot
         {
             ServerTimeUtc = serverTimeUtc,
-            ActiveTradeCount = activeTradeCount,
+            ActiveTradeCount = context.BrokerOpenTradeCount + context.PendingSubmissionCount,
+            BrokerOpenTradeCount = context.BrokerOpenTradeCount,
+            PendingSubmissionCount = context.PendingSubmissionCount,
             MaxConcurrentOpenTrades = settings.MaxConcurrentOpenTrades,
             QueueConcurrentRequestLimit = Math.Clamp(settings.QueueConcurrentRequestLimit, 1, 3),
-            QueueCooldownMilliseconds = Math.Clamp(settings.QueueCooldownMilliseconds, 0, 500),
-            QueuedCount = counts.QueuedCount,
-            ProcessingCount = counts.ProcessingCount,
-            CompletedCount = counts.CompletedCount,
-            FailedCount = counts.FailedCount,
+            AvailableDispatchSlots = context.AvailableDispatchSlots,
+            QueuedCount = context.QueuedCount,
+            ProcessingCount = context.ProcessingCount,
+            CompletedCount = context.CompletedCount,
+            FailedCount = context.FailedCount,
             Entries = entries.Select(entry => new TradeExecutionQueueEntrySnapshot
             {
                 QueueEntryId = entry.QueueEntryId,
@@ -212,7 +224,61 @@ public sealed class TradeExecutionQueueService : ITradeExecutionQueueService
         };
     }
 
-    private async Task<QueuedTradeExecution> ProcessEntryAsync(QueuedTradeExecution entry, CancellationToken ct)
+    public async Task WaitForWorkAsync(CancellationToken ct = default)
+    {
+        await _workSignal.WaitAsync(ct);
+        Interlocked.Exchange(ref _workPending, 0);
+    }
+
+    public void NotifyWorkAvailable()
+    {
+        if (Interlocked.Exchange(ref _workPending, 1) != 0)
+            return;
+
+        try
+        {
+            _workSignal.Release();
+        }
+        catch (SemaphoreFullException)
+        {
+            Interlocked.Exchange(ref _workPending, 1);
+        }
+    }
+
+    private async Task ProcessEntryInBackgroundAsync(QueuedTradeExecution entry, CancellationToken ct)
+    {
+        var signalNextDispatch = true;
+        try
+        {
+            signalNextDispatch = await ProcessEntryAsync(entry, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            signalNextDispatch = false;
+        }
+        catch (Exception ex)
+        {
+            signalNextDispatch = true;
+            _logger.LogError(ex, "[TradeExecutionQueue] Queue entry {QueueEntryId} crashed during execution", entry.QueueEntryId);
+
+            var failed = entry with
+            {
+                Status = TradeExecutionQueueStatus.Failed,
+                FailureReason = "QueueDispatchFailed",
+                ErrorDetails = ex.Message,
+                UpdatedAtUtc = DateTimeOffset.UtcNow,
+                ProcessedAtUtc = DateTimeOffset.UtcNow
+            };
+            await _queueRepository.UpdateAsync(failed, ct);
+        }
+        finally
+        {
+            if (signalNextDispatch && !ct.IsCancellationRequested)
+                NotifyWorkAvailable();
+        }
+    }
+
+    private async Task<bool> ProcessEntryAsync(QueuedTradeExecution entry, CancellationToken ct)
     {
         var existingTrade = await _executedTradeRepository.GetBySourceSignalAsync(entry.SignalId, entry.SourceType, ct);
         if (existingTrade != null && !IsRetryableTerminalStatus(existingTrade.Status))
@@ -227,7 +293,7 @@ public sealed class TradeExecutionQueueService : ITradeExecutionQueueService
                 ProcessedAtUtc = DateTimeOffset.UtcNow
             };
             await _queueRepository.UpdateAsync(duplicate, ct);
-            return duplicate;
+            return true;
         }
 
         TradeExecutionCandidate? candidate;
@@ -247,7 +313,7 @@ public sealed class TradeExecutionQueueService : ITradeExecutionQueueService
             };
             await _queueRepository.UpdateAsync(invalid, ct);
             _logger.LogError(ex, "[TradeExecutionQueue] Failed to deserialize queue entry {QueueEntryId}", entry.QueueEntryId);
-            return invalid;
+            return true;
         }
 
         if (candidate == null)
@@ -261,8 +327,14 @@ public sealed class TradeExecutionQueueService : ITradeExecutionQueueService
                 ProcessedAtUtc = DateTimeOffset.UtcNow
             };
             await _queueRepository.UpdateAsync(invalid, ct);
-            return invalid;
+            return true;
         }
+
+        _logger.LogInformation(
+            "[TradeExecutionQueue] Starting execution for queue entry {QueueEntryId} ({SourceType} signal {SignalId})",
+            entry.QueueEntryId,
+            entry.SourceType,
+            entry.SignalId);
 
         var result = await _executionService.ExecuteAsync(new TradeExecutionRequest
         {
@@ -272,23 +344,15 @@ public sealed class TradeExecutionQueueService : ITradeExecutionQueueService
             ForceMarketExecution = entry.ForceMarketExecution
         }, ct);
 
-        if (!result.Success && string.Equals(result.FailureReason, "MaxConcurrentOpenTrades", StringComparison.Ordinal))
+        if (result.RetryRequested || (!result.Success && string.Equals(result.FailureReason, "MaxConcurrentOpenTrades", StringComparison.Ordinal)))
         {
-            var requeued = entry with
-            {
-                Status = TradeExecutionQueueStatus.Queued,
-                FailureReason = result.FailureReason,
-                ErrorDetails = result.Message,
-                UpdatedAtUtc = DateTimeOffset.UtcNow
-            };
-            await _queueRepository.UpdateAsync(requeued, ct);
-            return requeued;
+            await DeferRetryAsync(entry, result, ct);
+            return false;
         }
 
-        var completedStatus = result.Success ? TradeExecutionQueueStatus.Completed : TradeExecutionQueueStatus.Failed;
         var processed = entry with
         {
-            Status = completedStatus,
+            Status = TradeExecutionQueueStatus.Completed,
             ExecutedTradeId = result.ExecutedTradeId,
             FailureReason = result.FailureReason,
             ErrorDetails = result.ErrorDetails ?? result.Message,
@@ -298,24 +362,86 @@ public sealed class TradeExecutionQueueService : ITradeExecutionQueueService
         await _queueRepository.UpdateAsync(processed, ct);
 
         _logger.LogInformation(
-            "[TradeExecutionQueue] Processed queue entry {QueueEntryId} for {SourceType} signal {SignalId} -> {Status}",
+            "[TradeExecutionQueue] Processed queue entry {QueueEntryId} for {SourceType} signal {SignalId} -> {QueueStatus} / TradeStatus={TradeStatus}",
             entry.QueueEntryId,
             entry.SourceType,
             entry.SignalId,
-            processed.Status);
+            processed.Status,
+            result.Status);
 
-        return processed;
+        return true;
     }
 
-    private async Task<int> GetActiveTradeCountAsync(TradeExecutionPolicySettings settings, CancellationToken ct)
+    private async Task<DispatchContext> GetDispatchContextAsync(TradeExecutionPolicySettings settings, CancellationToken ct)
     {
-        var account = await _accountSnapshotService.GetLatestAsync(ct);
-        return await _executedTradeRepository.GetActiveExecutedTradeCountAsync(new ExecutedTradeQuery
+        var counts = await _queueRepository.GetStatusCountsAsync(ct);
+        var account = await TryGetQueueAccountSnapshotAsync(settings, ct);
+
+        if (account == null)
+        {
+            return new DispatchContext(
+                BrokerOpenTradeCount: 0,
+                PendingSubmissionCount: 0,
+                QueuedCount: counts.QueuedCount,
+                ProcessingCount: counts.ProcessingCount,
+                CompletedCount: counts.CompletedCount,
+                FailedCount: counts.FailedCount,
+                AvailableDispatchSlots: 0);
+        }
+
+        var pendingSubmissionCount = await _executedTradeRepository.GetPendingOrSubmittedTradeCountAsync(new ExecutedTradeQuery
         {
             AccountId = account.AccountId,
             AccountName = account.AccountName,
             IsDemo = settings.DemoOnly ? true : null
         }, ct);
+
+        var requestCapacity = Math.Max(0, Math.Clamp(settings.QueueConcurrentRequestLimit, 1, 3) - counts.ProcessingCount);
+        var openTradeCapacity = Math.Max(0, settings.MaxConcurrentOpenTrades - account.OpenPositions - pendingSubmissionCount - counts.ProcessingCount);
+
+        return new DispatchContext(
+            BrokerOpenTradeCount: account.OpenPositions,
+            PendingSubmissionCount: pendingSubmissionCount,
+            QueuedCount: counts.QueuedCount,
+            ProcessingCount: counts.ProcessingCount,
+            CompletedCount: counts.CompletedCount,
+            FailedCount: counts.FailedCount,
+            AvailableDispatchSlots: Math.Max(0, Math.Min(requestCapacity, openTradeCapacity)));
+    }
+
+    private async Task<AccountSnapshot?> TryGetQueueAccountSnapshotAsync(TradeExecutionPolicySettings settings, CancellationToken ct)
+    {
+        try
+        {
+            return await _accountSnapshotService.GetLatestAsync(ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "[TradeExecutionQueue] Failed to refresh broker account snapshot; attempting to use the latest persisted snapshot");
+            return settings.DemoOnly
+                ? await _executedTradeRepository.GetLatestAccountSnapshotAsync(accountName: null, isDemo: true, ct)
+                : await _executedTradeRepository.GetLatestAccountSnapshotAsync(ct);
+        }
+    }
+
+    private void LogBlockedCapacity(DispatchContext context)
+    {
+        if (context.ProcessingCount >= Math.Clamp(_policy.GetSettings().QueueConcurrentRequestLimit, 1, 3))
+        {
+            _logger.LogInformation(
+                "[TradeExecutionQueue] Execution blocked because all request slots are in use ({ProcessingCount}/{MaxConcurrentRequests}); queued items remain waiting in FIFO order",
+                context.ProcessingCount,
+                Math.Clamp(_policy.GetSettings().QueueConcurrentRequestLimit, 1, 3));
+            return;
+        }
+
+        _logger.LogInformation(
+            "[TradeExecutionQueue] Execution blocked because broker open-trade capacity is full (BrokerOpen={BrokerOpenTradeCount}, PendingSubmitted={PendingSubmissionCount}, Processing={ProcessingCount}, MaxOpenTrades={MaxConcurrentOpenTrades}, Queued={QueuedCount})",
+            context.BrokerOpenTradeCount,
+            context.PendingSubmissionCount,
+            context.ProcessingCount,
+            _policy.GetSettings().MaxConcurrentOpenTrades,
+            context.QueuedCount);
     }
 
     private static bool IsRetryableTerminalStatus(ExecutedTradeStatus status)
@@ -323,4 +449,70 @@ public sealed class TradeExecutionQueueService : ITradeExecutionQueueService
 
     private static bool IsExcludedExecutionTimeframe(string? timeframe)
         => string.Equals(timeframe?.Trim(), "1m", StringComparison.OrdinalIgnoreCase);
+
+    private async Task DeferRetryAsync(QueuedTradeExecution entry, TradeExecutionResult result, CancellationToken ct)
+    {
+        var retryPending = entry with
+        {
+            Status = TradeExecutionQueueStatus.Processing,
+            FailureReason = result.FailureReason,
+            ErrorDetails = result.ErrorDetails ?? result.Message,
+            ForceMarketExecution = entry.ForceMarketExecution || result.RetryWithForceMarketExecution,
+            UpdatedAtUtc = DateTimeOffset.UtcNow,
+            ProcessedAtUtc = null
+        };
+        await _queueRepository.UpdateAsync(retryPending, ct);
+
+        var retryDelay = ResolveRetryDelay(result);
+        _logger.LogInformation(
+            "[TradeExecutionQueue] Deferred retry for queue entry {QueueEntryId} signal {SignalId} by {DelayMs}ms (Reason={Reason}, ForceMarketExecution={ForceMarketExecution})",
+            entry.QueueEntryId,
+            entry.SignalId,
+            retryDelay.TotalMilliseconds,
+            result.FailureReason,
+            retryPending.ForceMarketExecution);
+
+        _ = ResumeDeferredRetryAsync(retryPending, retryDelay, ct);
+    }
+
+    private async Task ResumeDeferredRetryAsync(QueuedTradeExecution entry, TimeSpan delay, CancellationToken ct)
+    {
+        try
+        {
+            await Task.Delay(delay, ct);
+            var requeued = entry with
+            {
+                Status = TradeExecutionQueueStatus.Queued,
+                UpdatedAtUtc = DateTimeOffset.UtcNow
+            };
+            await _queueRepository.UpdateAsync(requeued, ct);
+            if (!ct.IsCancellationRequested)
+                NotifyWorkAvailable();
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "[TradeExecutionQueue] Failed to resume deferred retry for queue entry {QueueEntryId}", entry.QueueEntryId);
+        }
+    }
+
+    private static TimeSpan ResolveRetryDelay(TradeExecutionResult result)
+    {
+        if (result.RetryWithForceMarketExecution)
+            return ForceMarketRetryDelay;
+        if (string.Equals(result.FailureReason, "MaxConcurrentOpenTrades", StringComparison.Ordinal))
+            return CapacityRetryDelay;
+        return DefaultRetryDelay;
+    }
+
+    private sealed record DispatchContext(
+        int BrokerOpenTradeCount,
+        int PendingSubmissionCount,
+        int QueuedCount,
+        int ProcessingCount,
+        int CompletedCount,
+        int FailedCount,
+        int AvailableDispatchSlots);
 }

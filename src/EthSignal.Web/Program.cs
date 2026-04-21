@@ -35,7 +35,6 @@ Log.Logger = new LoggerConfiguration()
 
 try
 {
-
     var builder = WebApplication.CreateBuilder(args);
     builder.Host.UseSerilog();
 
@@ -307,6 +306,11 @@ try
     builder.Services.AddSingleton<ITradeExecutionPolicy, TradeExecutionPolicy>();
     builder.Services.AddSingleton<ITradeExecutionService, TradeExecutionService>();
     builder.Services.AddSingleton<ITradeExecutionQueueService, TradeExecutionQueueService>();
+    builder.Services.AddSingleton<IExecutedTradeResetService>(sp =>
+        new ExecutedTradeResetService(
+            connString,
+            sp.GetRequiredService<TradeExecutionRuntimeState>(),
+            sp.GetRequiredService<ILogger<ExecutedTradeResetService>>()));
     builder.Services.AddSingleton<TradeLifecycleReconciliationService>();
     builder.Services.AddSingleton<MlTrainingState>();
     builder.Services.AddSingleton<MlTrainingService>();
@@ -679,7 +683,12 @@ try
     {
         var primaryTimeframe = paramProvider.GetActive().TimeframePrimary;
         var latestSignal = await signalRepo.GetLatestSignalAsync(symbol);
+        SignalDecision? linkedDecision = null;
+        if (latestSignal?.EvaluationId is Guid evaluationId && evaluationId != Guid.Empty)
+            linkedDecision = await decisionRepo.GetDecisionByEvaluationIdAsync(evaluationId);
+
         var latestDecision = await decisionRepo.GetLatestDecisionAsync(symbol);
+        var decisionForCard = latestSignal == null ? latestDecision : linkedDecision;
         MlPrediction? latestPrediction = null;
         if (latestSignal != null)
             latestPrediction = await mlPredictionRepo.GetBySignalIdAsync(latestSignal.SignalId);
@@ -688,25 +697,33 @@ try
         latestPrediction ??= await mlPredictionRepo.GetLatestAsync(symbol, predictionTimeframe, "actionable");
         latestPrediction ??= await mlPredictionRepo.GetLatestAsync(symbol, predictionTimeframe, "all");
 
+        static object? MapDecision(SignalDecision? decision)
+            => decision != null ? new
+            {
+                decisionId = decision.DecisionId,
+                evaluationId = decision.EvaluationId == Guid.Empty ? (Guid?)null : decision.EvaluationId,
+                symbol = decision.Symbol,
+                timeframe = decision.Timeframe,
+                barTime = decision.BarTimeUtc,
+                decisionTime = decision.DecisionTimeUtc,
+                decisionType = decision.DecisionType.ToString(),
+                outcomeCategory = decision.OutcomeCategory.ToString(),
+                regime = decision.UsedRegime?.ToString(),
+                reasonCodes = decision.ReasonCodes.Select(r => r.ToString()).ToList(),
+                reasonDetails = decision.ReasonDetails,
+                confidenceScore = decision.ConfidenceScore,
+                blendedConfidence = decision.BlendedConfidence,
+                effectiveThreshold = decision.EffectiveThreshold,
+                sourceMode = decision.SourceMode.ToString()
+            } : null;
+
         return Results.Ok(new
         {
             signal = latestSignal,
-            decision = latestDecision != null ? new
-            {
-                decisionId = latestDecision.DecisionId,
-                symbol = latestDecision.Symbol,
-                barTime = latestDecision.BarTimeUtc,
-                decisionTime = latestDecision.DecisionTimeUtc,
-                decisionType = latestDecision.DecisionType.ToString(),
-                outcomeCategory = latestDecision.OutcomeCategory.ToString(),
-                regime = latestDecision.UsedRegime?.ToString(),
-                reasonCodes = latestDecision.ReasonCodes.Select(r => r.ToString()).ToList(),
-                reasonDetails = latestDecision.ReasonDetails,
-                confidenceScore = latestDecision.ConfidenceScore,
-                blendedConfidence = latestDecision.BlendedConfidence,
-                effectiveThreshold = latestDecision.EffectiveThreshold,
-                sourceMode = latestDecision.SourceMode.ToString()
-            } : (object?)null,
+            decision = MapDecision(decisionForCard),
+            latestDecision = latestDecision?.DecisionId == decisionForCard?.DecisionId
+                ? null
+                : MapDecision(latestDecision),
             mlPrediction = latestPrediction
         });
     });
@@ -913,6 +930,16 @@ try
         return result.Success ? Results.Ok(result) : Results.BadRequest(result);
     });
 
+    app.MapPost("/api/executed-trades/reset", async (
+        HttpContext ctx,
+        IExecutedTradeResetService resetService,
+        CancellationToken ct) =>
+    {
+        if (RejectIfNotLoopback(ctx) is { } reject) return reject;
+        var result = await resetService.ResetAsync(ct);
+        return Results.Ok(result);
+    });
+
     app.MapGet("/api/trading/account-summary", async (
         IAccountSnapshotService accountSnapshotService,
         IExecutedTradeRepository repository,
@@ -976,14 +1003,20 @@ try
         var latestSnapshot = capitalTradingClient.IsDemoEnvironment
             ? await repository.GetLatestAccountSnapshotAsync(preferredDemoAccountName, isDemo: true, ct)
             : await repository.GetLatestAccountSnapshotAsync(ct);
+        var effectiveAccountName = runtimeState.ActiveAccountName ?? latestSnapshot?.AccountName;
         return Results.Ok(new BrokerHealthSnapshot
         {
             DemoOnly = settings.DemoOnly && capitalTradingClient.IsDemoEnvironment,
             SessionReady = runtimeState.SessionReady,
             ExecutionEnabled = settings.Enabled,
-            AccountName = runtimeState.ActiveAccountName ?? latestSnapshot?.AccountName,
+            RequiredDemoAccountName = preferredDemoAccountName,
+            AccountName = effectiveAccountName,
             AccountId = runtimeState.ActiveAccountId ?? latestSnapshot?.AccountId,
             ActiveAccountIsDemo = runtimeState.ActiveAccountIsDemo ?? latestSnapshot?.IsDemo,
+            ActiveAccountMatchesRequiredDemo = capitalTradingClient.IsDemoEnvironment
+                ? !string.IsNullOrWhiteSpace(effectiveAccountName)
+                    && string.Equals(effectiveAccountName, preferredDemoAccountName, StringComparison.Ordinal)
+                : null,
             LastSyncUtc = runtimeState.LastSyncUtc ?? latestSnapshot?.CapturedAtUtc,
             LatestAccountResolutionUtc = runtimeState.LastAccountResolutionUtc,
             AccountSelectionSource = runtimeState.AccountSelectionSource,
@@ -2135,171 +2168,178 @@ try
         Log.Information("Database migration completed");
     }
 
-    // Seed the default active parameter set if none exists, then refresh cache.
-    // StrategyParameters.Default keeps MlMode=SHADOW so first-run behavior remains safe.
+    if (app.Environment.IsEnvironment("Testing"))
     {
-        var paramRepo = app.Services.GetRequiredService<IParameterRepository>();
-        var pp = app.Services.GetRequiredService<IParameterProvider>();
-
-        var active = await paramRepo.GetActiveAsync(EthSignal.Domain.Models.StrategyParameters.Default.StrategyVersion);
-        if (active == null)
+        Log.Information("Skipping startup warmup for Testing environment");
+    }
+    else
+    {
+        // Seed the default active parameter set if none exists, then refresh cache.
+        // StrategyParameters.Default keeps MlMode=SHADOW so first-run behavior remains safe.
         {
-            var defaults = EthSignal.Domain.Models.StrategyParameters.Default;
-            var hash = System.Security.Cryptography.SHA256.HashData(
-                System.Text.Encoding.UTF8.GetBytes(defaults.ToJson()));
-            var hashStr = Convert.ToHexString(hash)[..16].ToLowerInvariant();
+            var paramRepo = app.Services.GetRequiredService<IParameterRepository>();
+            var pp = app.Services.GetRequiredService<IParameterProvider>();
 
-            var setId = await paramRepo.InsertAsync(new EthSignal.Domain.Models.StrategyParameterSet
+            var active = await paramRepo.GetActiveAsync(EthSignal.Domain.Models.StrategyParameters.Default.StrategyVersion);
+            if (active == null)
             {
-                StrategyVersion = defaults.StrategyVersion,
-                ParameterHash = hashStr,
-                Parameters = defaults,
-                Status = EthSignal.Domain.Models.ParameterSetStatus.Active,
-                CreatedBy = "startup-seed",
-                Notes = "Auto-seeded default parameter set"
-            });
-            await paramRepo.ActivateAsync(setId, null, "startup-seed", "initial default seeding");
-            Log.Information("Seeded default parameter set id={Id} hash={Hash} mlMode={MlMode}", setId, hashStr, defaults.MlMode);
+                var defaults = EthSignal.Domain.Models.StrategyParameters.Default;
+                var hash = System.Security.Cryptography.SHA256.HashData(
+                    System.Text.Encoding.UTF8.GetBytes(defaults.ToJson()));
+                var hashStr = Convert.ToHexString(hash)[..16].ToLowerInvariant();
+
+                var setId = await paramRepo.InsertAsync(new EthSignal.Domain.Models.StrategyParameterSet
+                {
+                    StrategyVersion = defaults.StrategyVersion,
+                    ParameterHash = hashStr,
+                    Parameters = defaults,
+                    Status = EthSignal.Domain.Models.ParameterSetStatus.Active,
+                    CreatedBy = "startup-seed",
+                    Notes = "Auto-seeded default parameter set"
+                });
+                await paramRepo.ActivateAsync(setId, null, "startup-seed", "initial default seeding");
+                Log.Information("Seeded default parameter set id={Id} hash={Hash} mlMode={MlMode}", setId, hashStr, defaults.MlMode);
+            }
+            else
+            {
+                Log.Information("Active parameter set found: id={Id} hash={Hash} version={Version}",
+                    active.Id, active.ParameterHash, active.StrategyVersion);
+            }
+
+            await pp.RefreshAsync();
+            var loaded = pp.GetActive();
+            Log.Information("ParameterProvider loaded: version={Version} warmup={WarmUp} adxThreshold={Adx}",
+                loaded.StrategyVersion, loaded.WarmUpPeriod, loaded.AdxTrendThreshold);
         }
-        else
+
+        // Issue #3: rehydrate persisted adaptive state so retrospective overlays survive restart
         {
-            Log.Information("Active parameter set found: id={Id} hash={Hash} version={Version}",
-                active.Id, active.ParameterHash, active.StrategyVersion);
+            var adaptive = app.Services.GetRequiredService<MarketAdaptiveParameterService>();
+            await adaptive.LoadStateAsync();
         }
 
-        await pp.RefreshAsync();
-        var loaded = pp.GetActive();
-        Log.Information("ParameterProvider loaded: version={Version} warmup={WarmUp} adxThreshold={Adx}",
-            loaded.StrategyVersion, loaded.WarmUpPeriod, loaded.AdxTrendThreshold);
-    }
-
-    // Issue #3: rehydrate persisted adaptive state so retrospective overlays survive restart
-    {
-        var adaptive = app.Services.GetRequiredService<MarketAdaptiveParameterService>();
-        await adaptive.LoadStateAsync();
-    }
-
-    // ML: Auto-promote the strongest validated candidate before inference loads
-    try
-    {
-        var mlPromotion = app.Services.GetRequiredService<MlModelPromotionService>();
-        var mlInference = app.Services.GetRequiredService<MlInferenceService>();
-        mlInference.SetParameterProvider(app.Services.GetRequiredService<IParameterProvider>());
-        mlInference.SetFrequencyManager(app.Services.GetRequiredService<SignalFrequencyManager>());
-
-        // Build the accuracy-first promotion context from current diagnostics
-        // so drift / calibration / class-balance can block promotion.
-        MlPromotionContext? promotionContext = null;
+        // ML: Auto-promote the strongest validated candidate before inference loads
         try
         {
-            var diagSvcStartup = app.Services.GetRequiredService<IMlDataDiagnosticsService>();
-            var ppStartup = app.Services.GetRequiredService<IParameterProvider>();
-            var pStartup = ppStartup.GetActive();
-            var diagStartup = await diagSvcStartup.GetReportAsync(
-                symbol, "all", pStartup.MlMinWinProbability);
-            promotionContext = new MlPromotionContext
-            {
-                FeatureDriftStatus = diagStartup.FeatureDrift.Status,
-                LabeledSamples = diagStartup.ClassBalance.LabeledSamples,
-                Wins = diagStartup.ClassBalance.Wins,
-                Losses = diagStartup.ClassBalance.Losses,
-                CalibrationSampleCount = diagStartup.Calibration.SampleCount,
-                CalibrationBrier = diagStartup.Calibration.BrierScore > 0m
-                    ? diagStartup.Calibration.BrierScore
-                    : null,
-                ThresholdLift = diagStartup.Calibration.ThresholdLift
-            };
-        }
-        catch (Exception diagEx)
-        {
-            Log.Warning(diagEx,
-                "Startup: promotion context diagnostics lookup failed — proceeding with metadata-only gates");
-        }
+            var mlPromotion = app.Services.GetRequiredService<MlModelPromotionService>();
+            var mlInference = app.Services.GetRequiredService<MlInferenceService>();
+            mlInference.SetParameterProvider(app.Services.GetRequiredService<IParameterProvider>());
+            mlInference.SetFrequencyManager(app.Services.GetRequiredService<SignalFrequencyManager>());
 
-        var promotion = await mlPromotion.PromoteBestModelAsync("outcome_predictor", CancellationToken.None, promotionContext);
-        if (promotion.Activated && promotion.SelectedModel != null)
-        {
-            Log.Information(
-                "Startup: auto-promoted ML model {Version} (AUC={Auc:F4} Brier={Brier:F4} Samples={Samples}) | Reason={Reason}",
-                promotion.SelectedModel.ModelVersion,
-                promotion.SelectedModel.AucRoc,
-                promotion.SelectedModel.BrierScore,
-                promotion.SelectedModel.TrainingSampleCount,
-                promotion.Reason);
-        }
-        else
-        {
-            Log.Information("Startup: ML promotion check kept current model ({Reason})", promotion.Reason);
-        }
-
-        await mlInference.LoadActiveModelAsync();
-        if (mlInference.IsReady && !mlInference.IsHeuristicFallback)
-        {
-            Log.Information("ML model loaded: {Version} ({Format})",
-                mlInference.ActiveModelVersion, mlInference.ActiveModelFormat);
-
-            // Optional startup auto-activation: only switch MlMode to ACTIVE when
-            // explicitly enabled in parameters. SHADOW remains the default.
-            // Accuracy-first gate: heuristic fallback must NEVER auto-activate —
-            // it is only used in SHADOW/annotation mode.
+            // Build the accuracy-first promotion context from current diagnostics
+            // so drift / calibration / class-balance can block promotion.
+            MlPromotionContext? promotionContext = null;
             try
             {
-                var autoPp = app.Services.GetRequiredService<IParameterProvider>();
-                var autoParamRepo = app.Services.GetRequiredService<IParameterRepository>();
-                var currentParams = autoPp.GetActive();
-                if (!currentParams.MlAutoActivateOnStartup)
+                var diagSvcStartup = app.Services.GetRequiredService<IMlDataDiagnosticsService>();
+                var ppStartup = app.Services.GetRequiredService<IParameterProvider>();
+                var pStartup = ppStartup.GetActive();
+                var diagStartup = await diagSvcStartup.GetReportAsync(
+                    symbol, "all", pStartup.MlMinWinProbability);
+                promotionContext = new MlPromotionContext
                 {
-                    Log.Information(
-                        "Startup: MlMode remains {Mode} because MlAutoActivateOnStartup is disabled by default",
-                        currentParams.MlMode);
-                }
-                else if (currentParams.MlMode != MlMode.ACTIVE)
-                {
-                    var updatedParams = currentParams with { MlMode = MlMode.ACTIVE };
-                    var autoHash = System.Security.Cryptography.SHA256.HashData(
-                        System.Text.Encoding.UTF8.GetBytes(updatedParams.ToJson()));
-                    var autoHashStr = Convert.ToHexString(autoHash)[..16].ToLowerInvariant();
-
-                    var autoSetId = await autoParamRepo.InsertAsync(new StrategyParameterSet
-                    {
-                        StrategyVersion = updatedParams.StrategyVersion,
-                        ParameterHash = autoHashStr,
-                        Parameters = updatedParams,
-                        Status = ParameterSetStatus.Active,
-                        CreatedBy = "startup-ml-auto-activate",
-                        Notes = $"Auto-switched MlMode {currentParams.MlMode} → ACTIVE (healthy model {mlInference.ActiveModelVersion} loaded at startup)"
-                    });
-                    await autoParamRepo.ActivateAsync(autoSetId, null, "startup-ml-auto-activate",
-                        $"ML auto-activated (model {mlInference.ActiveModelVersion})");
-                    await autoPp.RefreshAsync();
-                    Log.Information(
-                        "Startup: auto-switched MlMode {Previous} → ACTIVE (model {Version} healthy)",
-                        currentParams.MlMode, mlInference.ActiveModelVersion);
-                }
-                else
-                {
-                    Log.Information("Startup: MlMode already ACTIVE — no switch required");
-                }
+                    FeatureDriftStatus = diagStartup.FeatureDrift.Status,
+                    LabeledSamples = diagStartup.ClassBalance.LabeledSamples,
+                    Wins = diagStartup.ClassBalance.Wins,
+                    Losses = diagStartup.ClassBalance.Losses,
+                    CalibrationSampleCount = diagStartup.Calibration.SampleCount,
+                    CalibrationBrier = diagStartup.Calibration.BrierScore > 0m
+                        ? diagStartup.Calibration.BrierScore
+                        : null,
+                    ThresholdLift = diagStartup.Calibration.ThresholdLift
+                };
             }
-            catch (Exception autoEx)
+            catch (Exception diagEx)
             {
-                Log.Warning(autoEx, "Startup: ML auto-activation failed (non-fatal) — current MlMode retained");
+                Log.Warning(diagEx,
+                    "Startup: promotion context diagnostics lookup failed — proceeding with metadata-only gates");
+            }
+
+            var promotion = await mlPromotion.PromoteBestModelAsync("outcome_predictor", CancellationToken.None, promotionContext);
+            if (promotion.Activated && promotion.SelectedModel != null)
+            {
+                Log.Information(
+                    "Startup: auto-promoted ML model {Version} (AUC={Auc:F4} Brier={Brier:F4} Samples={Samples}) | Reason={Reason}",
+                    promotion.SelectedModel.ModelVersion,
+                    promotion.SelectedModel.AucRoc,
+                    promotion.SelectedModel.BrierScore,
+                    promotion.SelectedModel.TrainingSampleCount,
+                    promotion.Reason);
+            }
+            else
+            {
+                Log.Information("Startup: ML promotion check kept current model ({Reason})", promotion.Reason);
+            }
+
+            await mlInference.LoadActiveModelAsync();
+            if (mlInference.IsReady && !mlInference.IsHeuristicFallback)
+            {
+                Log.Information("ML model loaded: {Version} ({Format})",
+                    mlInference.ActiveModelVersion, mlInference.ActiveModelFormat);
+
+                // Optional startup auto-activation: only switch MlMode to ACTIVE when
+                // explicitly enabled in parameters. SHADOW remains the default.
+                // Accuracy-first gate: heuristic fallback must NEVER auto-activate —
+                // it is only used in SHADOW/annotation mode.
+                try
+                {
+                    var autoPp = app.Services.GetRequiredService<IParameterProvider>();
+                    var autoParamRepo = app.Services.GetRequiredService<IParameterRepository>();
+                    var currentParams = autoPp.GetActive();
+                    if (!currentParams.MlAutoActivateOnStartup)
+                    {
+                        Log.Information(
+                            "Startup: MlMode remains {Mode} because MlAutoActivateOnStartup is disabled by default",
+                            currentParams.MlMode);
+                    }
+                    else if (currentParams.MlMode != MlMode.ACTIVE)
+                    {
+                        var updatedParams = currentParams with { MlMode = MlMode.ACTIVE };
+                        var autoHash = System.Security.Cryptography.SHA256.HashData(
+                            System.Text.Encoding.UTF8.GetBytes(updatedParams.ToJson()));
+                        var autoHashStr = Convert.ToHexString(autoHash)[..16].ToLowerInvariant();
+
+                        var autoSetId = await autoParamRepo.InsertAsync(new StrategyParameterSet
+                        {
+                            StrategyVersion = updatedParams.StrategyVersion,
+                            ParameterHash = autoHashStr,
+                            Parameters = updatedParams,
+                            Status = ParameterSetStatus.Active,
+                            CreatedBy = "startup-ml-auto-activate",
+                            Notes = $"Auto-switched MlMode {currentParams.MlMode} → ACTIVE (healthy model {mlInference.ActiveModelVersion} loaded at startup)"
+                        });
+                        await autoParamRepo.ActivateAsync(autoSetId, null, "startup-ml-auto-activate",
+                            $"ML auto-activated (model {mlInference.ActiveModelVersion})");
+                        await autoPp.RefreshAsync();
+                        Log.Information(
+                            "Startup: auto-switched MlMode {Previous} → ACTIVE (model {Version} healthy)",
+                            currentParams.MlMode, mlInference.ActiveModelVersion);
+                    }
+                    else
+                    {
+                        Log.Information("Startup: MlMode already ACTIVE — no switch required");
+                    }
+                }
+                catch (Exception autoEx)
+                {
+                    Log.Warning(autoEx, "Startup: ML auto-activation failed (non-fatal) — current MlMode retained");
+                }
+            }
+            else if (mlInference.IsHeuristicFallback)
+            {
+                Log.Information(
+                    "Heuristic ML fallback active — not auto-switching to ACTIVE. " +
+                    "Train and register a real ONNX model before enabling ACTIVE mode.");
+            }
+            else
+            {
+                Log.Information("No active ML model — running in rule-based mode");
             }
         }
-        else if (mlInference.IsHeuristicFallback)
+        catch (Exception ex)
         {
-            Log.Information(
-                "Heuristic ML fallback active — not auto-switching to ACTIVE. " +
-                "Train and register a real ONNX model before enabling ACTIVE mode.");
+            Log.Warning(ex, "ML model loading failed (non-fatal) — running in rule-based mode");
         }
-        else
-        {
-            Log.Information("No active ML model — running in rule-based mode");
-        }
-    }
-    catch (Exception ex)
-    {
-        Log.Warning(ex, "ML model loading failed (non-fatal) — running in rule-based mode");
     }
 
     // U-04: Auto-resolve old gaps on startup so historical gaps don't block live processing
@@ -2618,6 +2658,7 @@ try
 catch (Exception ex)
 {
     Log.Fatal(ex, "Application terminated unexpectedly");
+    throw;
 }
 finally
 {

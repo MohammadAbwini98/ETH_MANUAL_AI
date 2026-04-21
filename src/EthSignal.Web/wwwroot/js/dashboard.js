@@ -596,12 +596,11 @@ async function refreshSignal() {
     if (!payload) return;
 
     const s = payload.signal;
-    const d = payload.decision;
+    const linkedDecision = payload.decision;
+    const latestDecision = payload.latestDecision;
+    const d = linkedDecision || (!s ? latestDecision : null);
     const mlPred = payload.mlPrediction;
-    const signalTs = s?.signalTimeUtc ? new Date(s.signalTimeUtc).getTime() : null;
-    const decisionTs = d?.decisionTime ? new Date(d.decisionTime).getTime() : null;
-    const decisionIsNewerThanSignal = decisionTs != null && (signalTs == null || decisionTs > signalTs);
-    const decisionOverridesSignal = decisionIsNewerThanSignal && d?.outcomeCategory && d.outcomeCategory !== 'SIGNAL_GENERATED';
+    const hasDirectionalSignal = !!s && s.direction !== 'NO_DATA' && s.direction !== 'NO_TRADE';
 
     // Show decision outcome and reason on the main card
     if ($('sig-outcome')) $('sig-outcome').textContent = d?.outcomeCategory || '--';
@@ -610,7 +609,7 @@ async function refreshSignal() {
     if ($('sig-effective-threshold')) $('sig-effective-threshold').textContent = d?.effectiveThreshold ?? '--';
     if ($('sig-blended-score')) $('sig-blended-score').textContent = d?.blendedConfidence ?? '--';
 
-    if (!s || s.direction === 'NO_DATA' || s.direction === 'NO_TRADE' || decisionOverridesSignal) {
+    if (!hasDirectionalSignal) {
         // If latest decision shows a specific outcome, prefer that label
         let label = 'NO DATA';
         if (d?.outcomeCategory === 'STRATEGY_NO_TRADE') label = 'NO TRADE';
@@ -621,7 +620,7 @@ async function refreshSignal() {
         $('sig-direction').className = 'stat-val neutral';
         $('sig-badge').textContent = label;
         $('sig-badge').className = 'badge badge-neutral';
-        $('sig-tf').textContent = d?.timeframe || '';
+        $('sig-tf').textContent = d?.timeframe || s?.timeframe || '';
         for (const id of ['sig-entry', 'sig-tp', 'sig-sl', 'sig-risk', 'sig-score']) $(id).textContent = '--';
         $('sig-time').textContent = d?.decisionTime ? toAmmanShort(d.decisionTime) : (s?.signalTimeUtc ? toAmmanShort(s.signalTimeUtc) : '--');
     } else {
@@ -689,11 +688,13 @@ let sortDir = 'desc';
 let blockedHistoryData = [];
 let blockedCurrentPage = 1;
 const BLOCKED_PAGE_SIZE = 20;
+let blockedHistoryTotal = 0;
 let blockedSortCol = 'time';
 let blockedSortDir = 'desc';
 let generatedHistoryData = [];
 let generatedCurrentPage = 1;
 const GENERATED_PAGE_SIZE = 20;
+let generatedHistoryTotal = 0;
 let generatedSortCol = 'time';
 let generatedSortDir = 'desc';
 let executedTradesData = [];
@@ -701,18 +702,21 @@ let executedTradesCurrentPage = 1;
 const EXECUTED_TRADES_PAGE_SIZE = 25;
 let executedTradesTotal = 0;
 let tradeQueueData = null;
+let historyTotal = 0;
 
 async function loadHistory() {
-    const data = await fetchJson(`/api/signals/history?limit=500&page=1`);
+    const data = await fetchJson(`/api/signals/history?limit=${PAGE_SIZE}&page=${currentPage}`);
     if (!data) return;
     historyData = data.signals || [];
+    historyTotal = data.total || 0;
     renderHistory();
 }
 
 async function loadBlockedHistory() {
-    const data = await fetchJson('/api/blocked-signals/history?limit=2000&page=1');
+    const data = await fetchJson(`/api/blocked-signals/history?limit=${BLOCKED_PAGE_SIZE}&page=${blockedCurrentPage}`);
     if (!data) return;
     blockedHistoryData = data.signals || [];
+    blockedHistoryTotal = data.total || 0;
     const stats = data.stats || {};
     if ($('blocked-total')) $('blocked-total').textContent = stats.totalSignals ?? data.total ?? '--';
     if ($('blocked-wins')) $('blocked-wins').textContent = stats.wins ?? '--';
@@ -724,9 +728,10 @@ async function loadBlockedHistory() {
 }
 
 async function loadGeneratedHistory() {
-    const data = await fetchJson('/api/generated-signals/history?limit=2000&page=1');
+    const data = await fetchJson(`/api/generated-signals/history?limit=${GENERATED_PAGE_SIZE}&page=${generatedCurrentPage}`);
     if (!data) return;
     generatedHistoryData = data.signals || [];
+    generatedHistoryTotal = data.total || 0;
     const stats = data.stats || {};
     if ($('generated-total')) $('generated-total').textContent = stats.totalSignals ?? data.total ?? '--';
     if ($('generated-wins')) $('generated-wins').textContent = stats.wins ?? '--';
@@ -739,7 +744,7 @@ async function loadGeneratedHistory() {
 
 function onFilterChange() {
     currentPage = 1;
-    renderHistory();
+    loadHistory().catch(() => { });
 }
 
 function getExpiryMs(tf) { return TF_MS[tf] || TF_MS['5m']; }
@@ -765,6 +770,8 @@ function outcomeClass(label) {
         case 'LOSS': return 'badge-loss';
         case 'FAILED': return 'badge-loss';
         case 'CLOSED': return 'badge-neutral';
+        case 'OPEN': return 'badge-pending';
+        case 'CLOSE REQUESTED': return 'badge-pending';
         case 'EXPIRED': return 'badge-expired';
         case 'AMBIGUOUS': return 'badge-ambiguous';
         default: return 'badge-pending';
@@ -780,11 +787,12 @@ function historyExecutionLabel(status, pendingLabel) {
         case 'REJECTED':
         case 'VALIDATIONFAILED':
         case 'CLOSEFAILED': return 'FAILED';
+        case 'OPEN': return 'OPEN';
+        case 'CLOSEREQUESTED': return 'CLOSE REQUESTED';
         case 'QUEUED':
         case 'PENDING':
         case 'SUBMITTED':
-        case 'OPEN':
-        case 'CLOSEREQUESTED': return pendingLabel;
+            return pendingLabel;
         default: return null;
     }
 }
@@ -872,10 +880,9 @@ function sortHistory(col) {
 function renderHistory() {
     const filtered = applyClientFilters(historyData);
     const sorted = applySorting(filtered);
-    const totalFiltered = sorted.length;
-    const totalPages = Math.max(1, Math.ceil(totalFiltered / PAGE_SIZE));
+    const totalPages = Math.max(1, Math.ceil(historyTotal / PAGE_SIZE));
     if (currentPage > totalPages) currentPage = totalPages;
-    const pageItems = sorted.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
+    const pageItems = sorted;
     const tbody = $('signal-history');
     tbody.innerHTML = '';
     const now = Date.now();
@@ -918,14 +925,14 @@ function renderHistory() {
     }
 
     // Pagination
-    $('page-info').textContent = `Page ${currentPage} of ${totalPages} (${totalFiltered} signals)`;
+    $('page-info').textContent = `Page ${currentPage} of ${totalPages} (${historyTotal} signals total)`;
     $('prev-page').disabled = currentPage <= 1;
     $('next-page').disabled = currentPage >= totalPages;
 }
 
 function changePage(delta) {
     currentPage = Math.max(1, currentPage + delta);
-    renderHistory();
+    loadHistory().catch(() => { });
 }
 
 function getBlockedOutcomeLabel(item) {
@@ -936,7 +943,7 @@ function getBlockedOutcomeLabel(item) {
 
 function onBlockedFilterChange() {
     blockedCurrentPage = 1;
-    renderBlockedHistory();
+    loadBlockedHistory().catch(() => { });
 }
 
 function applyBlockedFilters(items) {
@@ -994,10 +1001,9 @@ function sortBlockedHistory(col) {
 function renderBlockedHistory() {
     const filtered = applyBlockedFilters(blockedHistoryData);
     const sorted = applyBlockedSorting(filtered);
-    const totalFiltered = sorted.length;
-    const totalPages = Math.max(1, Math.ceil(totalFiltered / BLOCKED_PAGE_SIZE));
+    const totalPages = Math.max(1, Math.ceil(blockedHistoryTotal / BLOCKED_PAGE_SIZE));
     if (blockedCurrentPage > totalPages) blockedCurrentPage = totalPages;
-    const pageItems = sorted.slice((blockedCurrentPage - 1) * BLOCKED_PAGE_SIZE, blockedCurrentPage * BLOCKED_PAGE_SIZE);
+    const pageItems = sorted;
     const tbody = $('blocked-signal-history');
     if (!tbody) return;
     tbody.innerHTML = '';
@@ -1041,14 +1047,14 @@ function renderBlockedHistory() {
         tbody.appendChild(tr);
     }
 
-    $('blocked-page-info').textContent = `Page ${blockedCurrentPage} of ${totalPages} (${totalFiltered} blocked signals)`;
+    $('blocked-page-info').textContent = `Page ${blockedCurrentPage} of ${totalPages} (${blockedHistoryTotal} blocked signals total)`;
     $('blocked-prev-page').disabled = blockedCurrentPage <= 1;
     $('blocked-next-page').disabled = blockedCurrentPage >= totalPages;
 }
 
 function changeBlockedPage(delta) {
     blockedCurrentPage = Math.max(1, blockedCurrentPage + delta);
-    renderBlockedHistory();
+    loadBlockedHistory().catch(() => { });
 }
 
 function getGeneratedOutcomeLabel(item) {
@@ -1059,7 +1065,7 @@ function getGeneratedOutcomeLabel(item) {
 
 function onGeneratedFilterChange() {
     generatedCurrentPage = 1;
-    renderGeneratedHistory();
+    loadGeneratedHistory().catch(() => { });
 }
 
 function applyGeneratedFilters(items) {
@@ -1117,10 +1123,9 @@ function sortGeneratedHistory(col) {
 function renderGeneratedHistory() {
     const filtered = applyGeneratedFilters(generatedHistoryData);
     const sorted = applyGeneratedSorting(filtered);
-    const totalFiltered = sorted.length;
-    const totalPages = Math.max(1, Math.ceil(totalFiltered / GENERATED_PAGE_SIZE));
+    const totalPages = Math.max(1, Math.ceil(generatedHistoryTotal / GENERATED_PAGE_SIZE));
     if (generatedCurrentPage > totalPages) generatedCurrentPage = totalPages;
-    const pageItems = sorted.slice((generatedCurrentPage - 1) * GENERATED_PAGE_SIZE, generatedCurrentPage * GENERATED_PAGE_SIZE);
+    const pageItems = sorted;
     const tbody = $('generated-signal-history');
     if (!tbody) return;
     tbody.innerHTML = '';
@@ -1165,14 +1170,14 @@ function renderGeneratedHistory() {
         tbody.appendChild(tr);
     }
 
-    $('generated-page-info').textContent = `Page ${generatedCurrentPage} of ${totalPages} (${totalFiltered} generated signals)`;
+    $('generated-page-info').textContent = `Page ${generatedCurrentPage} of ${totalPages} (${generatedHistoryTotal} generated signals total)`;
     $('generated-prev-page').disabled = generatedCurrentPage <= 1;
     $('generated-next-page').disabled = generatedCurrentPage >= totalPages;
 }
 
 function changeGeneratedPage(delta) {
     generatedCurrentPage = Math.max(1, generatedCurrentPage + delta);
-    renderGeneratedHistory();
+    loadGeneratedHistory().catch(() => { });
 }
 
 function executionStatusBadgeClass(status) {
@@ -1253,9 +1258,9 @@ async function refreshTradingSummary() {
         const accountName = account?.accountName || health?.accountName || '--';
         const accountId = account?.accountId || health?.accountId || '--';
         const isDemo = account?.isDemo === true
-            && accountName === 'DEMOAI'
             && health?.demoOnly === true
-            && health?.activeAccountIsDemo !== false;
+            && health?.activeAccountIsDemo === true
+            && health?.activeAccountMatchesRequiredDemo !== false;
         demoEl.textContent = isDemo ? `${accountName} (${accountId}) · DEMO` : `${accountName} (${accountId}) · BLOCKED`;
         demoEl.style.color = isDemo ? 'var(--green)' : 'var(--red)';
         demoEl.style.fontWeight = '700';
@@ -1299,8 +1304,10 @@ function renderTradeQueue() {
     tradingSummaryText('trade-queue-active', snapshot.activeTradeCount != null && snapshot.maxConcurrentOpenTrades != null
         ? `${snapshot.activeTradeCount}/${snapshot.maxConcurrentOpenTrades}`
         : '--');
+    tradingSummaryText('trade-queue-broker-open', snapshot.brokerOpenTradeCount ?? '--');
+    tradingSummaryText('trade-queue-pending', snapshot.pendingSubmissionCount ?? '--');
     tradingSummaryText('trade-queue-burst', snapshot.queueConcurrentRequestLimit ?? '--');
-    tradingSummaryText('trade-queue-cooldown', snapshot.queueCooldownMilliseconds != null ? `${snapshot.queueCooldownMilliseconds}ms` : '--');
+    tradingSummaryText('trade-queue-available', snapshot.availableDispatchSlots ?? '--');
     tradingSummaryText('trade-queue-queued', snapshot.queuedCount ?? '--');
     tradingSummaryText('trade-queue-processing', snapshot.processingCount ?? '--');
 
@@ -1419,6 +1426,32 @@ async function forceCloseExecutedTrade(id) {
         await Promise.all([loadExecutedTrades(), refreshTradingSummary(), loadTradeQueue()]);
     } catch (e) {
         alert(`Force close failed: ${e.message}`);
+    }
+}
+
+async function resetExecutedTradesSection() {
+    if (!confirm('Reset Executed Signals / Trades? This clears executed trades, queue entries, attempts, events, account snapshots, and close actions only.')) {
+        return;
+    }
+
+    try {
+        const response = await fetch('/api/executed-trades/reset', {
+            method: 'POST'
+        });
+        const payload = await response.json().catch(() => null);
+        if (!response.ok) {
+            alert(payload?.message || payload?.error || `Reset failed (${response.status})`);
+            return;
+        }
+
+        executedTradesData = [];
+        executedTradesTotal = 0;
+        tradeQueueData = null;
+        renderExecutedTrades();
+        renderTradeQueue();
+        await Promise.all([loadExecutedTrades(), refreshTradingSummary(), loadTradeQueue()]);
+    } catch (e) {
+        alert(`Reset failed: ${e.message}`);
     }
 }
 

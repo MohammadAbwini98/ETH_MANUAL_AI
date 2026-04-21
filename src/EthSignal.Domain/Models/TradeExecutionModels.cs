@@ -89,6 +89,8 @@ public sealed record TradeExecutionResult
     public decimal? ExecutedSize { get; init; }
     public string? FailureReason { get; init; }
     public string? ErrorDetails { get; init; }
+    public bool RetryRequested { get; init; }
+    public bool RetryWithForceMarketExecution { get; init; }
     public string Message { get; init; } = "";
 }
 

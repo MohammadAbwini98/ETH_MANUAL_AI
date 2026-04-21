@@ -14,6 +14,9 @@ public interface IDecisionAuditRepository
     /// <summary>Get the latest decision for a symbol.</summary>
     Task<SignalDecision?> GetLatestDecisionAsync(string symbol, CancellationToken ct = default);
 
+    /// <summary>Get the decision correlated to a specific evaluation.</summary>
+    Task<SignalDecision?> GetDecisionByEvaluationIdAsync(Guid evaluationId, CancellationToken ct = default);
+
     /// <summary>Get decisions in a time range for export/dashboard.</summary>
     Task<IReadOnlyList<SignalDecision>> GetDecisionsAsync(string symbol, DateTimeOffset from, DateTimeOffset to, int limit = 1000, CancellationToken ct = default);
 

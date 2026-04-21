@@ -1373,6 +1373,7 @@
                                 <option value="">All</option>
                                 <option value="WIN">WIN</option>
                                 <option value="LOSS">LOSS</option>
+                                <option value="OPEN">OPEN</option>
                                 <option value="PENDING">PENDING</option>
                                 <option value="EXPIRED">EXPIRED</option>
                             </select>
@@ -1474,6 +1475,7 @@
                                 <option value="">All</option>
                                 <option value="WIN">WIN</option>
                                 <option value="LOSS">LOSS</option>
+                                <option value="OPEN">OPEN</option>
                                 <option value="PENDING">PENDING</option>
                                 <option value="EXPIRED">EXPIRED</option>
                             </select>
@@ -1527,7 +1529,10 @@
                 <div class="card">
                     <div class="card-header d-flex justify-content-between align-items-center">
                         <span>Executed Signals / Trades</span>
-                        <small style="color:var(--text-sub)">Capital.com demo execution records linked back to their originating signal category</small>
+                        <div class="d-flex align-items-center gap-2 flex-wrap">
+                            <small style="color:var(--text-sub)">Capital.com demo execution records linked back to their originating signal category</small>
+                            <button class="btn btn-sm btn-outline-danger" onclick="resetExecutedTradesSection()">Reset Section</button>
+                        </div>
                     </div>
                     <div class="card-body py-2" style="border-bottom:1px solid var(--border);font-size:.8rem">
                         <div class="row text-center g-2">
@@ -1640,8 +1645,10 @@
                             <div class="d-flex gap-2 align-items-center flex-wrap" style="font-size:.74rem;color:var(--text-sub)">
                                 <span>Server: <span id="trade-queue-server-time">--</span></span>
                                 <span>Active Trades: <span id="trade-queue-active">--</span></span>
-                                <span>Burst: <span id="trade-queue-burst">--</span></span>
-                                <span>Cooldown: <span id="trade-queue-cooldown">--</span></span>
+                                <span>Broker Open: <span id="trade-queue-broker-open">--</span></span>
+                                <span>Pending/Subm: <span id="trade-queue-pending">--</span></span>
+                                <span>Concurrent: <span id="trade-queue-burst">--</span></span>
+                                <span>Avail Slots: <span id="trade-queue-available">--</span></span>
                                 <span>Queued: <span id="trade-queue-queued">--</span></span>
                                 <span>Processing: <span id="trade-queue-processing">--</span></span>
                             </div>
@@ -1671,7 +1678,7 @@
         </div>
     </div>
 
-    <script src="js/dashboard.js?v=19"></script>
+    <script src="js/dashboard.js?v=20"></script>
 </body>
 
 </html>

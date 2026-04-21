@@ -1012,11 +1012,11 @@ public sealed class LiveTickProcessor
                 // Deduplicate: block exact same bar+TF repeat
                 if (openSignals.Any(s => s.Timeframe == tf.Name && s.SignalTimeUtc == signal.SignalTimeUtc))
                 {
-                    var dedupDecision = decision with
-                    {
-                        LifecycleState = SignalLifecycleState.RISK_BLOCKED,
-                        FinalBlockReason = "Duplicate signal: same bar+TF already open"
-                    };
+                    var dedupDecision = SignalDecisionTransition.ToOperationalBlock(
+                        decision,
+                        SignalLifecycleState.RISK_BLOCKED,
+                        "Duplicate signal: same bar+TF already open",
+                        [RejectReasonCode.RISK_MANAGER_BLOCKED]);
                     await _decisionAuditRepo.InsertDecisionAsync(dedupDecision, ct);
                     await FinalizeMlArtifactsAsync(mlArtifacts, MlEvaluationLinkStatus.OperationallyBlocked, ct);
                     return;
@@ -1027,11 +1027,11 @@ public sealed class LiveTickProcessor
                 var conflicting = openSignals.FirstOrDefault(s => s.Timeframe == tf.Name && s.Direction == oppositeDir);
                 if (conflicting != null)
                 {
-                    var conflictDecision = decision with
-                    {
-                        LifecycleState = SignalLifecycleState.RISK_BLOCKED,
-                        FinalBlockReason = $"Conflicting open {conflicting.Direction} signal from {conflicting.SignalTimeUtc:HH:mm}"
-                    };
+                    var conflictDecision = SignalDecisionTransition.ToOperationalBlock(
+                        decision,
+                        SignalLifecycleState.RISK_BLOCKED,
+                        $"Conflicting open {conflicting.Direction} signal from {conflicting.SignalTimeUtc:HH:mm}",
+                        [RejectReasonCode.CONFLICTING_SIGNALS]);
                     await _decisionAuditRepo.InsertDecisionAsync(conflictDecision, ct);
                     _logger.LogInformation(
                         "[{Tf}] Signal {NewDir} blocked — conflicting open {OldDir} signal from {OpenTime} still active",
@@ -1050,14 +1050,12 @@ public sealed class LiveTickProcessor
                 var sessionBlock = RiskManager.CheckSessionLimits(riskPolicy, openSignals.Count, todayOutcomes);
                 if (sessionBlock != null)
                 {
-                    var sessionDecision = decision with
-                    {
-                        LifecycleState = SignalLifecycleState.SESSION_BLOCKED,
-                        FinalBlockReason = sessionBlock,
-                        OutcomeCategory = OutcomeCategory.OPERATIONAL_BLOCKED,
-                        ReasonCodes = decision.ReasonCodes.Concat(new[] { RejectReasonCode.SESSION_LIMIT_REACHED }).Distinct().ToList(),
-                        ReasonDetails = decision.ReasonDetails.Concat(new[] { $"Session limit: {sessionBlock}" }).ToList()
-                    };
+                    var sessionDecision = SignalDecisionTransition.ToOperationalBlock(
+                        decision,
+                        SignalLifecycleState.SESSION_BLOCKED,
+                        sessionBlock,
+                        [RejectReasonCode.SESSION_LIMIT_REACHED],
+                        [$"Session limit: {sessionBlock}"]);
                     await _decisionAuditRepo.InsertDecisionAsync(sessionDecision, ct);
                     _logger.LogInformation("[{Tf}] Signal {Dir} blocked by session limits: {Reason}",
                         tf.Name, signal.Direction, sessionBlock);
@@ -1158,18 +1156,12 @@ public sealed class LiveTickProcessor
                 }
                 else
                 {
-                    var riskBlockedDecision = decision with
-                    {
-                        DecisionType = SignalDirection.NO_TRADE,
-                        OutcomeCategory = OutcomeCategory.OPERATIONAL_BLOCKED,
-                        LifecycleState = SignalLifecycleState.RISK_BLOCKED,
-                        FinalBlockReason = exitResult.RejectReason ?? "Exit engine rejected",
-                        ReasonCodes = decision.ReasonCodes.Concat(new[] { RejectReasonCode.RISK_MANAGER_BLOCKED }).Distinct().ToList(),
-                        ReasonDetails = decision.ReasonDetails.Concat(new[]
-                        {
-                            $"Exit engine blocked signal: {exitResult.RejectReason ?? "Unknown"}"
-                        }).ToList()
-                    };
+                    var riskBlockedDecision = SignalDecisionTransition.ToOperationalBlock(
+                        decision,
+                        SignalLifecycleState.RISK_BLOCKED,
+                        exitResult.RejectReason ?? "Exit engine rejected",
+                        [RejectReasonCode.RISK_MANAGER_BLOCKED],
+                        [$"Exit engine blocked signal: {exitResult.RejectReason ?? "Unknown"}"]);
 
                     await _decisionAuditRepo.InsertDecisionAsync(riskBlockedDecision, ct);
                     _lastDecision = riskBlockedDecision;
@@ -1406,11 +1398,11 @@ public sealed class LiveTickProcessor
                 p, openSignals, Timeframe.M1.Name, signal.Direction);
             if (capacityCode.HasValue)
             {
-                var capacityDecision = decision with
-                {
-                    LifecycleState = SignalLifecycleState.RISK_BLOCKED,
-                    FinalBlockReason = capacityReason
-                };
+                var capacityDecision = SignalDecisionTransition.ToOperationalBlock(
+                    decision,
+                    SignalLifecycleState.RISK_BLOCKED,
+                    capacityReason,
+                    [RejectReasonCode.RISK_MANAGER_BLOCKED]);
                 await _decisionAuditRepo.InsertDecisionAsync(capacityDecision, ct);
                 await FinalizeMlArtifactsAsync(scalpMlArtifacts, MlEvaluationLinkStatus.OperationallyBlocked, ct);
                 return;
@@ -1431,11 +1423,12 @@ public sealed class LiveTickProcessor
             var sessionBlock = RiskManager.CheckSessionLimits(riskPolicy, openSignals.Count, todayOutcomes, isScalp: true);
             if (sessionBlock != null)
             {
-                var sessionDecision = decision! with
-                {
-                    LifecycleState = SignalLifecycleState.SESSION_BLOCKED,
-                    FinalBlockReason = sessionBlock
-                };
+                var sessionDecision = SignalDecisionTransition.ToOperationalBlock(
+                    decision!,
+                    SignalLifecycleState.SESSION_BLOCKED,
+                    sessionBlock,
+                    [RejectReasonCode.SESSION_LIMIT_REACHED],
+                    [$"Session limit: {sessionBlock}"]);
                 await _decisionAuditRepo.InsertDecisionAsync(sessionDecision, ct);
                 _logger.LogInformation("[1m] Scalp signal {Dir} blocked by session limits: {Reason}",
                     signal.Direction, sessionBlock);
@@ -1530,11 +1523,12 @@ public sealed class LiveTickProcessor
             {
                 _logger.LogInformation("[1m] Scalp signal {Dir} rejected by exit engine: {Reason}",
                     signal.Direction, scalpExitResult.RejectReason ?? "N/A");
-                var riskDecision = decision! with
-                {
-                    LifecycleState = SignalLifecycleState.RISK_BLOCKED,
-                    FinalBlockReason = scalpExitResult.RejectReason ?? "Exit engine rejected"
-                };
+                var riskDecision = SignalDecisionTransition.ToOperationalBlock(
+                    decision!,
+                    SignalLifecycleState.RISK_BLOCKED,
+                    scalpExitResult.RejectReason ?? "Exit engine rejected",
+                    [RejectReasonCode.RISK_MANAGER_BLOCKED],
+                    [$"Exit engine blocked signal: {scalpExitResult.RejectReason ?? "Unknown"}"]);
                 await _decisionAuditRepo.InsertDecisionAsync(riskDecision, ct);
                 await FinalizeMlArtifactsAsync(scalpMlArtifacts, MlEvaluationLinkStatus.OperationallyBlocked, ct);
             }
@@ -1719,11 +1713,11 @@ public sealed class LiveTickProcessor
             var riskPolicy = p.ToRiskPolicy();
             if (openSignals.Count >= riskPolicy.MaxOpenPositions)
             {
-                var capDecision = decision with
-                {
-                    LifecycleState = SignalLifecycleState.RISK_BLOCKED,
-                    FinalBlockReason = $"Max open positions ({riskPolicy.MaxOpenPositions}) reached"
-                };
+                var capDecision = SignalDecisionTransition.ToOperationalBlock(
+                    decision,
+                    SignalLifecycleState.RISK_BLOCKED,
+                    $"Max open positions ({riskPolicy.MaxOpenPositions}) reached",
+                    [RejectReasonCode.RISK_MANAGER_BLOCKED]);
                 await _decisionAuditRepo.InsertDecisionAsync(capDecision, ct);
                 await FinalizeMlArtifactsAsync(mlArtifacts, MlEvaluationLinkStatus.OperationallyBlocked, ct);
                 return;
@@ -1738,11 +1732,12 @@ public sealed class LiveTickProcessor
             var sessionBlock = RiskManager.CheckSessionLimits(riskPolicy, openSignals.Count, todayOutcomes);
             if (sessionBlock != null)
             {
-                var sesDecision = decision with
-                {
-                    LifecycleState = SignalLifecycleState.SESSION_BLOCKED,
-                    FinalBlockReason = sessionBlock
-                };
+                var sesDecision = SignalDecisionTransition.ToOperationalBlock(
+                    decision,
+                    SignalLifecycleState.SESSION_BLOCKED,
+                    sessionBlock,
+                    [RejectReasonCode.SESSION_LIMIT_REACHED],
+                    [$"Session limit: {sessionBlock}"]);
                 await _decisionAuditRepo.InsertDecisionAsync(sesDecision, ct);
                 _logger.LogInformation("[{Tf}] 1m-eval signal {Dir} blocked by session limits: {Reason}",
                     tf.Name, signal.Direction, sessionBlock);
@@ -1831,11 +1826,12 @@ public sealed class LiveTickProcessor
             }
             else
             {
-                var riskDecision = decision with
-                {
-                    LifecycleState = SignalLifecycleState.RISK_BLOCKED,
-                    FinalBlockReason = rcExitResult.RejectReason ?? "Exit engine rejected"
-                };
+                var riskDecision = SignalDecisionTransition.ToOperationalBlock(
+                    decision,
+                    SignalLifecycleState.RISK_BLOCKED,
+                    rcExitResult.RejectReason ?? "Exit engine rejected",
+                    [RejectReasonCode.RISK_MANAGER_BLOCKED],
+                    [$"Exit engine blocked signal: {rcExitResult.RejectReason ?? "Unknown"}"]);
                 await _decisionAuditRepo.InsertDecisionAsync(riskDecision, ct);
                 _logger.LogInformation("[{Tf}] 1m-eval signal {Dir} rejected by exit engine: {Reason}",
                     tf.Name, signal.Direction, rcExitResult.RejectReason ?? "N/A");

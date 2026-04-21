@@ -119,7 +119,9 @@ public sealed class GeneratedSignalHistoryService : IGeneratedSignalHistoryServi
                 effective_runtime_parameters_json
             FROM ""ETH"".signal_decision_audit
             WHERE symbol = @symbol
-              AND decision_type IN ('BUY', 'SELL')
+              AND outcome_category = 'SIGNAL_GENERATED'
+              AND lifecycle_state = 'PERSISTED'
+              AND COALESCE(candidate_direction, decision_type) IN ('BUY', 'SELL')
               AND (@fromUtc::timestamptz IS NULL OR decision_time_utc >= @fromUtc)
             ORDER BY decision_time_utc DESC
             LIMIT @limit OFFSET @offset;", conn);
@@ -173,7 +175,9 @@ public sealed class GeneratedSignalHistoryService : IGeneratedSignalHistoryServi
             SELECT COUNT(*)::INT
             FROM ""ETH"".signal_decision_audit
             WHERE symbol = @symbol
-              AND decision_type IN ('BUY', 'SELL')
+              AND outcome_category = 'SIGNAL_GENERATED'
+              AND lifecycle_state = 'PERSISTED'
+              AND COALESCE(candidate_direction, decision_type) IN ('BUY', 'SELL')
               AND (@fromUtc::timestamptz IS NULL OR decision_time_utc >= @fromUtc);", conn);
         cmd.Parameters.AddWithValue("symbol", symbol);
         cmd.Parameters.Add(new NpgsqlParameter("fromUtc", NpgsqlDbType.TimestampTz)
@@ -214,7 +218,9 @@ public sealed class GeneratedSignalHistoryService : IGeneratedSignalHistoryServi
             FROM ""ETH"".signal_decision_audit
             WHERE symbol = @symbol
               AND id = @signalId
-              AND decision_type IN ('BUY', 'SELL')
+              AND outcome_category = 'SIGNAL_GENERATED'
+              AND lifecycle_state = 'PERSISTED'
+              AND COALESCE(candidate_direction, decision_type) IN ('BUY', 'SELL')
             LIMIT 1;", conn);
         cmd.Parameters.AddWithValue("symbol", symbol);
         cmd.Parameters.AddWithValue("signalId", signalId);

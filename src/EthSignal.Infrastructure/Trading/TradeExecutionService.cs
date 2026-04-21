@@ -37,6 +37,20 @@ public sealed class TradeExecutionService : ITradeExecutionService
         }
         catch (Exception ex)
         {
+            if (IsRetryablePolicyException(ex))
+            {
+                _logger.LogWarning(
+                    ex,
+                    "[TradeExecution] Policy evaluation deferred for signal {SignalId} ({SourceType}); queue retry requested",
+                    candidate.SignalId,
+                    candidate.SourceType);
+                _runtimeState.RecordBrokerError(ex.Message);
+                return CreateRetryResult(
+                    "PolicyEvaluationDeferred",
+                    ex.Message,
+                    "Execution policy could not be evaluated yet; the request will be retried.");
+            }
+
             _logger.LogError(ex, "[TradeExecution] Policy evaluation failed for signal {SignalId} ({SourceType})", candidate.SignalId, candidate.SourceType);
             _runtimeState.RecordBrokerError(ex.Message);
 
@@ -55,7 +69,7 @@ public sealed class TradeExecutionService : ITradeExecutionService
                 SlPrice = candidate.SlPrice,
                 RequestedSize = request.RequestedSize ?? 0m,
                 ExecutedSize = 0m,
-                Status = ExecutedTradeStatus.Failed,
+                Status = ExecutedTradeStatus.ValidationFailed,
                 AccountCurrency = "",
                 FailureReason = "PolicyEvaluationFailed",
                 ErrorDetails = ex.Message,
@@ -86,7 +100,7 @@ public sealed class TradeExecutionService : ITradeExecutionService
             {
                 Success = false,
                 ExecutedTradeId = tradeId,
-                Status = ExecutedTradeStatus.Failed,
+                Status = ExecutedTradeStatus.ValidationFailed,
                 FailureReason = "PolicyEvaluationFailed",
                 ErrorDetails = ex.Message,
                 Message = ex.Message
@@ -95,6 +109,34 @@ public sealed class TradeExecutionService : ITradeExecutionService
 
         if (!policyDecision.Allowed || policyDecision.Plan == null)
         {
+            if (ShouldFallbackToMarketExecution(request, policyDecision))
+            {
+                _logger.LogInformation(
+                    "[TradeExecution] Re-queueing signal {SignalId} ({SourceType}) for forced market execution because drift exceeded the entry band",
+                    candidate.SignalId,
+                    candidate.SourceType);
+                _runtimeState.RecordBrokerError(policyDecision.Message);
+                return CreateRetryResult(
+                    policyDecision.FailureReason,
+                    policyDecision.Message,
+                    "Entry drift exceeded the saved band; retrying with forced market execution.",
+                    retryWithForceMarketExecution: true);
+            }
+
+            if (IsRetryablePolicyFailure(policyDecision.FailureReason))
+            {
+                _logger.LogInformation(
+                    "[TradeExecution] Re-queueing signal {SignalId} ({SourceType}) because validation failed with retryable reason {FailureReason}",
+                    candidate.SignalId,
+                    candidate.SourceType,
+                    policyDecision.FailureReason);
+                _runtimeState.RecordBrokerError(policyDecision.Message);
+                return CreateRetryResult(
+                    policyDecision.FailureReason,
+                    policyDecision.Message,
+                    policyDecision.Message);
+            }
+
             var failedTrade = new ExecutedTrade
             {
                 SignalId = candidate.SignalId,
@@ -229,7 +271,42 @@ public sealed class TradeExecutionService : ITradeExecutionService
             };
             await _repository.UpdateExecutedTradeAsync(submittedTrade, ct);
 
-            var confirmation = await _capitalClient.ConfirmDealAsync(openResult.DealReference, ct);
+            CapitalDealConfirmation confirmation;
+            try
+            {
+                confirmation = await _capitalClient.ConfirmDealAsync(openResult.DealReference, ct);
+            }
+            catch (Exception ex) when (ShouldDeferToReconciliation(ex))
+            {
+                await _repository.InsertExecutionEventAsync(
+                    executedTradeId,
+                    candidate.SignalId,
+                    candidate.SourceType,
+                    "execution_pending_confirmation",
+                    "Broker accepted the request but confirmation is not available yet; lifecycle reconciliation will continue tracking it.",
+                    JsonSerializer.Serialize(new
+                    {
+                        openResult.DealReference,
+                        error = ex.Message
+                    }),
+                    ct);
+                _logger.LogWarning(
+                    ex,
+                    "[TradeExecution] Confirmation deferred for {SourceType} signal {SignalId}; keeping trade {TradeId} submitted for reconciliation",
+                    candidate.SourceType,
+                    candidate.SignalId,
+                    executedTradeId);
+
+                return new TradeExecutionResult
+                {
+                    Success = true,
+                    ExecutedTradeId = executedTradeId,
+                    Status = submittedTrade.Status,
+                    DealReference = openResult.DealReference,
+                    Message = $"Trade submitted to Capital.com demo account '{executionAccount.AccountName}' and is awaiting broker confirmation."
+                };
+            }
+
             await _repository.InsertExecutionAttemptAsync(
                 executedTradeId,
                 candidate.SignalId,
@@ -403,6 +480,46 @@ public sealed class TradeExecutionService : ITradeExecutionService
                 Message = ex.Message
             };
         }
+    }
+
+    private static TradeExecutionResult CreateRetryResult(
+        string? failureReason,
+        string? errorDetails,
+        string message,
+        bool retryWithForceMarketExecution = false)
+        => new()
+        {
+            Success = false,
+            Status = ExecutedTradeStatus.Queued,
+            FailureReason = failureReason,
+            ErrorDetails = errorDetails,
+            RetryRequested = true,
+            RetryWithForceMarketExecution = retryWithForceMarketExecution,
+            Message = message
+        };
+
+    private static bool ShouldFallbackToMarketExecution(TradeExecutionRequest request, TradeExecutionPolicyDecision policyDecision)
+        => !request.ForceMarketExecution
+           && string.Equals(policyDecision.FailureReason, "EntryDriftExceeded", StringComparison.Ordinal);
+
+    private static bool IsRetryablePolicyFailure(string? failureReason)
+        => string.Equals(failureReason, "MaxConcurrentOpenTrades", StringComparison.Ordinal);
+
+    private static bool IsRetryablePolicyException(Exception ex)
+    {
+        var message = ex.Message;
+        return message.Contains("429", StringComparison.OrdinalIgnoreCase)
+               || message.Contains("too-many.requests", StringComparison.OrdinalIgnoreCase)
+               || message.Contains("rate limit", StringComparison.OrdinalIgnoreCase)
+               || message.Contains("timeout", StringComparison.OrdinalIgnoreCase)
+               || message.Contains("temporarily unavailable", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool ShouldDeferToReconciliation(Exception ex)
+    {
+        var message = ex.Message;
+        return message.Contains("did not become available in time", StringComparison.OrdinalIgnoreCase)
+               || message.Contains("(404)", StringComparison.OrdinalIgnoreCase);
     }
 
     public async Task<ForceCloseResult> ForceCloseAsync(long executedTradeId, ForceCloseRequest request, CancellationToken ct = default)

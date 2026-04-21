@@ -129,6 +129,30 @@ public sealed class DecisionAuditRepository : IDecisionAuditRepository
         return ReadDecision(r);
     }
 
+    public async Task<SignalDecision?> GetDecisionByEvaluationIdAsync(Guid evaluationId, CancellationToken ct = default)
+    {
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(ct);
+
+        await using var cmd = new NpgsqlCommand(@"
+            SELECT id, symbol, decision_time_utc, bar_time_utc, timeframe,
+                   decision_type, outcome_category, regime, regime_bar_time_utc,
+                   parameter_set_id, confidence_score, reason_codes_json,
+                   reason_details_json, indicators_json, source_mode,
+                   market_condition_class, adapted_parameters_json,
+                   lifecycle_state, final_block_reason, origin,
+                   evaluation_id, effective_runtime_parameters_json, candidate_direction
+            FROM ""ETH"".signal_decision_audit
+            WHERE evaluation_id = @evaluationId
+            ORDER BY decision_time_utc DESC
+            LIMIT 1;", conn);
+        cmd.Parameters.AddWithValue("evaluationId", evaluationId);
+
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        if (!await r.ReadAsync(ct)) return null;
+        return ReadDecision(r);
+    }
+
     public async Task<IReadOnlyList<SignalDecision>> GetDecisionsAsync(string symbol, DateTimeOffset from,
         DateTimeOffset to, int limit = 1000, CancellationToken ct = default)
     {

@@ -45,7 +45,7 @@ public sealed class TradeExecutionPolicyTests
         var tradeRepo = new Mock<IExecutedTradeRepository>();
         tradeRepo.Setup(r => r.GetBySourceSignalAsync(It.IsAny<Guid>(), It.IsAny<SignalExecutionSourceType>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync((ExecutedTrade?)null);
-        tradeRepo.Setup(r => r.GetActiveExecutedTradeCountAsync(It.IsAny<ExecutedTradeQuery>(), It.IsAny<CancellationToken>()))
+        tradeRepo.Setup(r => r.GetPendingOrSubmittedTradeCountAsync(It.IsAny<ExecutedTradeQuery>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(0);
 
         var capitalClient = new Mock<ICapitalTradingClient>();
@@ -101,7 +101,7 @@ public sealed class TradeExecutionPolicyTests
         result.Plan.Should().NotBeNull();
         result.Plan!.AccountSnapshot.AccountName.Should().Be("DEMOAI");
         result.Plan.AccountSnapshot.IsDemo.Should().BeTrue();
-        tradeRepo.Verify(r => r.GetActiveExecutedTradeCountAsync(
+        tradeRepo.Verify(r => r.GetPendingOrSubmittedTradeCountAsync(
             It.Is<ExecutedTradeQuery>(q => q.AccountId == "demo-1" && q.AccountName == "DEMOAI" && q.IsDemo == true),
             It.IsAny<CancellationToken>()), Times.Once);
     }
@@ -251,6 +251,151 @@ public sealed class TradeExecutionPolicyTests
         result.Plan.MarketEntryPrice.Should().Be(2500.8m);
     }
 
+    [Fact]
+    public async Task EvaluateAsync_WhenGeneratedEntryModeIsMarketNow_BypassesDriftGuard()
+    {
+        var capitalClient = CreateCapitalClient(
+            bid: 2504m,
+            offer: 2505m,
+            minDistance: 1m,
+            minDealSize: 0.01m,
+            minSizeIncrement: 0.01m);
+        var tradeRepo = CreateTradeRepo();
+        var snapshotService = CreateSnapshotService();
+        var sut = new TradeExecutionPolicy(
+            BuildConfig(new Dictionary<string, string?>
+            {
+                ["CapitalTrading:GeneratedEntryMode"] = "MarketNow"
+            }),
+            capitalClient.Object,
+            tradeRepo.Object,
+            snapshotService.Object);
+
+        var result = await sut.EvaluateAsync(new TradeExecutionRequest
+        {
+            Candidate = CreateCandidate() with
+            {
+                SourceType = SignalExecutionSourceType.Generated,
+                RecommendedEntryPrice = 2500m
+            },
+            RequestedBy = "test"
+        }, CancellationToken.None);
+
+        result.Allowed.Should().BeTrue();
+        result.Plan.Should().NotBeNull();
+        result.Plan!.ValidationNote.Should().Contain("market-now policy");
+    }
+
+    [Fact]
+    public async Task EvaluateAsync_WhenRecommendedSourceHasSameDrift_StillRejects()
+    {
+        var capitalClient = CreateCapitalClient(
+            bid: 2504m,
+            offer: 2505m,
+            minDistance: 1m,
+            minDealSize: 0.01m,
+            minSizeIncrement: 0.01m);
+        var tradeRepo = CreateTradeRepo();
+        var snapshotService = CreateSnapshotService();
+        var sut = new TradeExecutionPolicy(
+            BuildConfig(new Dictionary<string, string?>
+            {
+                ["CapitalTrading:GeneratedEntryMode"] = "MarketNow"
+            }),
+            capitalClient.Object,
+            tradeRepo.Object,
+            snapshotService.Object);
+
+        var result = await sut.EvaluateAsync(new TradeExecutionRequest
+        {
+            Candidate = CreateCandidate() with
+            {
+                SourceType = SignalExecutionSourceType.Recommended,
+                RecommendedEntryPrice = 2500m
+            },
+            RequestedBy = "test"
+        }, CancellationToken.None);
+
+        result.Allowed.Should().BeFalse();
+        result.FailureReason.Should().Be("EntryDriftExceeded");
+    }
+
+    [Fact]
+    public async Task EvaluateAsync_WhenGeneratedUsesRelaxedUsdMargin_AppliesGeneratedTolerance()
+    {
+        var capitalClient = CreateCapitalClient(
+            bid: 2502.4m,
+            offer: 2503.0m,
+            minDistance: 1m,
+            minDealSize: 0.01m,
+            minSizeIncrement: 0.01m);
+        var tradeRepo = CreateTradeRepo();
+        var snapshotService = CreateSnapshotService();
+        var sut = new TradeExecutionPolicy(
+            BuildConfig(new Dictionary<string, string?>
+            {
+                ["CapitalTrading:GeneratedEntryMode"] = "NearRecommendedEntry",
+                ["CapitalTrading:GeneratedEntryPriceMarginUsd"] = "5.0",
+                ["CapitalTrading:GeneratedEntryDriftTolerancePct"] = "0.01"
+            }),
+            capitalClient.Object,
+            tradeRepo.Object,
+            snapshotService.Object);
+
+        var result = await sut.EvaluateAsync(new TradeExecutionRequest
+        {
+            Candidate = CreateCandidate() with
+            {
+                SourceType = SignalExecutionSourceType.Generated,
+                RecommendedEntryPrice = 2500m
+            },
+            RequestedBy = "test"
+        }, CancellationToken.None);
+
+        result.Allowed.Should().BeTrue();
+        result.Plan.Should().NotBeNull();
+        result.Plan!.ValidationNote.Should().Contain("+/-5.00 USD");
+    }
+
+    [Fact]
+    public async Task EvaluateAsync_WhenBrokerOpenAndPendingReachMaxOpenTrades_RejectsExecution()
+    {
+        var capitalClient = CreateCapitalClient();
+        var tradeRepo = CreateTradeRepo();
+        tradeRepo.Setup(r => r.GetPendingOrSubmittedTradeCountAsync(It.IsAny<ExecutedTradeQuery>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(1);
+
+        var snapshotService = new Mock<IAccountSnapshotService>();
+        snapshotService.Setup(s => s.GetLatestAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new AccountSnapshot
+            {
+                AccountId = "demo-1",
+                AccountName = "DEMOAI",
+                Currency = "USD",
+                Balance = 10000m,
+                Equity = 10000m,
+                Available = 9000m,
+                Margin = 0m,
+                Funds = 10000m,
+                OpenPositions = 2,
+                IsDemo = true,
+                HedgingMode = false,
+                CapturedAtUtc = DateTimeOffset.UtcNow
+            });
+
+        var sut = new TradeExecutionPolicy(BuildConfig(), capitalClient.Object, tradeRepo.Object, snapshotService.Object);
+
+        var result = await sut.EvaluateAsync(new TradeExecutionRequest
+        {
+            Candidate = CreateCandidate(),
+            RequestedBy = "test"
+        }, CancellationToken.None);
+
+        result.Allowed.Should().BeFalse();
+        result.FailureReason.Should().Be("MaxConcurrentOpenTrades");
+        result.Message.Should().Contain("(3/3)");
+    }
+
     [Theory]
     [InlineData(SignalExecutionSourceType.Recommended)]
     [InlineData(SignalExecutionSourceType.Generated)]
@@ -287,20 +432,32 @@ public sealed class TradeExecutionPolicyTests
         return new TradeExecutionPolicy(BuildConfig(), capitalClient.Object, tradeRepo.Object, snapshotService.Object);
     }
 
-    private static IConfiguration BuildConfig() => new ConfigurationBuilder()
-        .AddInMemoryCollection(new Dictionary<string, string?>
+    private static IConfiguration BuildConfig(Dictionary<string, string?>? overrides = null)
+    {
+        var settings = new Dictionary<string, string?>
         {
             ["CapitalTrading:Enabled"] = "true",
             ["CapitalTrading:AutoExecuteEnabled"] = "true",
             ["CapitalTrading:DemoOnly"] = "true",
             ["CapitalTrading:PreferredDemoAccountName"] = "DEMOAI",
             ["CapitalTrading:AllowedSourceTypes"] = "Recommended,Generated,Blocked",
+            ["CapitalTrading:EntryMode"] = "NearRecommendedEntry",
             ["CapitalTrading:EntryPriceMarginUsd"] = "1.0",
             ["CapitalTrading:DefaultTradeSize"] = "0.05",
             ["CapitalTrading:InstrumentEpicMap:ETHUSD"] = "ETHUSD",
             ["CapitalApi:Epic"] = "ETHUSD"
-        })
-        .Build();
+        };
+
+        if (overrides != null)
+        {
+            foreach (var pair in overrides)
+                settings[pair.Key] = pair.Value;
+        }
+
+        return new ConfigurationBuilder()
+            .AddInMemoryCollection(settings)
+            .Build();
+    }
 
     private static TradeExecutionCandidate CreateCandidate() => new()
     {
@@ -357,7 +514,7 @@ public sealed class TradeExecutionPolicyTests
         var tradeRepo = new Mock<IExecutedTradeRepository>();
         tradeRepo.Setup(r => r.GetBySourceSignalAsync(It.IsAny<Guid>(), It.IsAny<SignalExecutionSourceType>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync((ExecutedTrade?)null);
-        tradeRepo.Setup(r => r.GetActiveExecutedTradeCountAsync(It.IsAny<ExecutedTradeQuery>(), It.IsAny<CancellationToken>()))
+        tradeRepo.Setup(r => r.GetPendingOrSubmittedTradeCountAsync(It.IsAny<ExecutedTradeQuery>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(0);
         return tradeRepo;
     }

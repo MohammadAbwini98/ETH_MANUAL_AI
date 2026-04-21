@@ -11,8 +11,10 @@ public sealed record TradeExecutionPolicySettings
     public int StaleWindowMinutes { get; init; } = 30;
     public decimal EntryDriftTolerancePct { get; init; } = 0.005m;
     public decimal EntryPriceMarginUsd { get; init; } = 1m;
+    public TradeEntryMode GeneratedEntryMode { get; init; } = TradeEntryMode.NearRecommendedEntry;
+    public decimal GeneratedEntryDriftTolerancePct { get; init; } = 0.005m;
+    public decimal GeneratedEntryPriceMarginUsd { get; init; } = 1m;
     public int QueueConcurrentRequestLimit { get; init; } = 3;
-    public int QueueCooldownMilliseconds { get; init; } = 500;
     public int MaxConcurrentOpenTrades { get; init; } = 3;
     public TradeEntryMode EntryMode { get; init; } = TradeEntryMode.NearRecommendedEntry;
     public ISet<SignalExecutionSourceType> AllowedSourceTypes { get; init; } =
@@ -51,9 +53,11 @@ public sealed record BrokerHealthSnapshot
     public bool DemoOnly { get; init; }
     public bool SessionReady { get; init; }
     public bool ExecutionEnabled { get; init; }
+    public string? RequiredDemoAccountName { get; init; }
     public string? AccountName { get; init; }
     public string? AccountId { get; init; }
     public bool? ActiveAccountIsDemo { get; init; }
+    public bool? ActiveAccountMatchesRequiredDemo { get; init; }
     public DateTimeOffset? LastSyncUtc { get; init; }
     public DateTimeOffset? LatestAccountResolutionUtc { get; init; }
     public string? AccountSelectionSource { get; init; }
@@ -103,9 +107,11 @@ public sealed record TradeExecutionQueueSnapshot
 {
     public required DateTimeOffset ServerTimeUtc { get; init; }
     public int ActiveTradeCount { get; init; }
+    public int BrokerOpenTradeCount { get; init; }
+    public int PendingSubmissionCount { get; init; }
     public int MaxConcurrentOpenTrades { get; init; }
     public int QueueConcurrentRequestLimit { get; init; }
-    public int QueueCooldownMilliseconds { get; init; }
+    public int AvailableDispatchSlots { get; init; }
     public int QueuedCount { get; init; }
     public int ProcessingCount { get; init; }
     public int CompletedCount { get; init; }
@@ -118,6 +124,24 @@ public interface ITradeExecutionQueueService
     Task<TradeExecutionQueueResult> EnqueueAsync(TradeExecutionRequest request, CancellationToken ct = default);
     Task<int> DrainAsync(CancellationToken ct = default);
     Task<TradeExecutionQueueSnapshot> GetSnapshotAsync(int limit = 50, CancellationToken ct = default);
+    Task WaitForWorkAsync(CancellationToken ct = default);
+    void NotifyWorkAvailable();
+}
+
+public interface IExecutedTradeResetService
+{
+    Task<ExecutedTradeResetResult> ResetAsync(CancellationToken ct = default);
+}
+
+public sealed record ExecutedTradeResetResult
+{
+    public required DateTimeOffset ResetAtUtc { get; init; }
+    public int QueueEntriesCleared { get; init; }
+    public int ExecutedTradesCleared { get; init; }
+    public int ExecutionAttemptsCleared { get; init; }
+    public int ExecutionEventsCleared { get; init; }
+    public int AccountSnapshotsCleared { get; init; }
+    public int CloseActionsCleared { get; init; }
 }
 
 public interface ITradeExecutionPolicy

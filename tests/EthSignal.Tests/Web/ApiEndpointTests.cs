@@ -221,9 +221,11 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
 
         var json = await response.Content.ReadAsStringAsync();
         using var doc = JsonDocument.Parse(json);
-        doc.RootElement.GetProperty("activeTradeCount").GetInt32().Should().Be(1);
+        doc.RootElement.GetProperty("activeTradeCount").GetInt32().Should().Be(2);
+        doc.RootElement.GetProperty("brokerOpenTradeCount").GetInt32().Should().Be(1);
+        doc.RootElement.GetProperty("pendingSubmissionCount").GetInt32().Should().Be(1);
         doc.RootElement.GetProperty("queueConcurrentRequestLimit").GetInt32().Should().Be(3);
-        doc.RootElement.GetProperty("queueCooldownMilliseconds").GetInt32().Should().Be(500);
+        doc.RootElement.GetProperty("availableDispatchSlots").GetInt32().Should().Be(1);
         doc.RootElement.TryGetProperty("serverTimeUtc", out _).Should().BeTrue();
         var entries = doc.RootElement.GetProperty("entries");
         entries.GetArrayLength().Should().Be(1);
@@ -231,6 +233,21 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
         entries[0].GetProperty("signalId").GetString().Should().Be("55555555-5555-5555-5555-555555555555");
         entries[0].TryGetProperty("createdAtUtc", out _).Should().BeTrue();
         entries[0].TryGetProperty("updatedAtUtc", out _).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Executed_Trades_Reset_Returns_Targeted_Reset_Result()
+    {
+        var response = await _client.PostAsync("/api/executed-trades/reset", content: null);
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        doc.RootElement.GetProperty("queueEntriesCleared").GetInt32().Should().Be(2);
+        doc.RootElement.GetProperty("executedTradesCleared").GetInt32().Should().Be(3);
+        doc.RootElement.GetProperty("executionAttemptsCleared").GetInt32().Should().Be(4);
+        doc.RootElement.GetProperty("executionEventsCleared").GetInt32().Should().Be(5);
+        doc.RootElement.GetProperty("accountSnapshotsCleared").GetInt32().Should().Be(1);
+        doc.RootElement.GetProperty("closeActionsCleared").GetInt32().Should().Be(1);
     }
 
     [Fact]
@@ -446,11 +463,120 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
         signal.GetProperty("direction").GetString().Should().Be("SELL");
     }
 
+    [Fact]
+    public async Task Dashboard_Latest_Returns_Linked_Decision_Including_Timeframe()
+    {
+        var signalEvaluationId = Guid.Parse("77777777-7777-7777-7777-777777777777");
+        var linkedDecisionId = Guid.Parse("88888888-8888-8888-8888-888888888888");
+        var unrelatedEvaluationId = Guid.Parse("99999999-9999-9999-9999-999999999999");
+
+        var latestSignal = new SignalRecommendation
+        {
+            SignalId = Guid.NewGuid(),
+            EvaluationId = signalEvaluationId,
+            Symbol = "ETHUSD",
+            Timeframe = "5m",
+            SignalTimeUtc = new DateTimeOffset(2026, 4, 10, 10, 0, 0, TimeSpan.Zero),
+            Direction = SignalDirection.BUY,
+            EntryPrice = 2205m,
+            TpPrice = 2212m,
+            SlPrice = 2201m,
+            RiskPercent = 0.5m,
+            RiskUsd = 10m,
+            ConfidenceScore = 74,
+            Regime = Regime.BULLISH,
+            StrategyVersion = "v3.0",
+            Reasons = ["Primary timeframe signal"],
+            Status = SignalStatus.OPEN
+        };
+
+        var linkedDecision = new SignalDecision
+        {
+            DecisionId = linkedDecisionId,
+            EvaluationId = signalEvaluationId,
+            Symbol = "ETHUSD",
+            Timeframe = "5m",
+            DecisionTimeUtc = new DateTimeOffset(2026, 4, 10, 10, 0, 5, TimeSpan.Zero),
+            BarTimeUtc = new DateTimeOffset(2026, 4, 10, 9, 55, 0, TimeSpan.Zero),
+            DecisionType = SignalDirection.BUY,
+            OutcomeCategory = OutcomeCategory.SIGNAL_GENERATED,
+            LifecycleState = SignalLifecycleState.PERSISTED,
+            Origin = DecisionOrigin.CLOSED_BAR,
+            UsedRegime = Regime.BULLISH,
+            ReasonCodes = [RejectReasonCode.SCORE_BELOW_THRESHOLD],
+            ReasonDetails = ["linked decision"],
+            ConfidenceScore = 74,
+            IndicatorSnapshot = new Dictionary<string, decimal>(),
+            SourceMode = SourceMode.LIVE
+        };
+
+        var unrelatedLatestDecision = linkedDecision with
+        {
+            DecisionId = Guid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+            EvaluationId = unrelatedEvaluationId,
+            Timeframe = "1m",
+            DecisionTimeUtc = new DateTimeOffset(2026, 4, 10, 10, 1, 0, TimeSpan.Zero),
+            OutcomeCategory = OutcomeCategory.OPERATIONAL_BLOCKED,
+            ReasonDetails = ["unrelated later decision"]
+        };
+
+        var client = _factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureServices(services =>
+            {
+                services.RemoveAll<ISignalRepository>();
+                services.RemoveAll<IDecisionAuditRepository>();
+
+                var signalRepo = new Mock<ISignalRepository>();
+                signalRepo.Setup(r => r.GetLatestSignalAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(latestSignal);
+                signalRepo.Setup(r => r.GetLatestPrimaryTimeframeSignalAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(latestSignal);
+                signalRepo.Setup(r => r.GetSignalHistoryAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(new List<SignalRecommendation>());
+                signalRepo.Setup(r => r.GetSignalHistoryWithOutcomesAsync(It.IsAny<string>(), It.IsAny<int>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(new List<SignalWithOutcome>());
+                signalRepo.Setup(r => r.GetSignalCountAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(0);
+                signalRepo.Setup(r => r.GetOutcomesAsync(It.IsAny<string>(), It.IsAny<DateTimeOffset>(), It.IsAny<DateTimeOffset>(), It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(new List<SignalOutcome>());
+
+                var decisionRepo = new Mock<IDecisionAuditRepository>();
+                decisionRepo.Setup(r => r.GetDecisionByEvaluationIdAsync(signalEvaluationId, It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(linkedDecision);
+                decisionRepo.Setup(r => r.GetLatestDecisionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(unrelatedLatestDecision);
+                decisionRepo.Setup(r => r.GetDecisionsAsync(It.IsAny<string>(), It.IsAny<DateTimeOffset>(), It.IsAny<DateTimeOffset>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(new List<SignalDecision>());
+                decisionRepo.Setup(r => r.GetSummaryAsync(It.IsAny<string>(), It.IsAny<DateTimeOffset>(), It.IsAny<DateTimeOffset>(), It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(new DecisionSummary());
+
+                services.AddSingleton(signalRepo.Object);
+                services.AddSingleton(decisionRepo.Object);
+            });
+        }).CreateClient();
+
+        var response = await client.GetAsync("/api/dashboard/latest");
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        var decision = doc.RootElement.GetProperty("decision");
+        decision.GetProperty("decisionId").GetGuid().Should().Be(linkedDecisionId);
+        decision.GetProperty("evaluationId").GetGuid().Should().Be(signalEvaluationId);
+        decision.GetProperty("timeframe").GetString().Should().Be("5m");
+
+        var latestDecision = doc.RootElement.GetProperty("latestDecision");
+        latestDecision.GetProperty("evaluationId").GetGuid().Should().Be(unrelatedEvaluationId);
+        latestDecision.GetProperty("timeframe").GetString().Should().Be("1m");
+    }
+
     // ─── Test fixture with mocked services ────────────────
     public class TestApp : WebApplicationFactory<Program>
     {
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
+            builder.UseEnvironment("Testing");
+
             // Provide required config values so startup validation passes
             builder.UseSetting("CAPITAL_BASE_URL", "https://demo-api-capital.backend-capital.com");
             builder.UseSetting("CAPITAL_API_KEY", "test-key");
@@ -484,16 +610,19 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
                 services.RemoveAll<ITradeExecutionService>();
                 services.RemoveAll<ITradeExecutionQueueService>();
                 services.RemoveAll<ITradeExecutionPolicy>();
+                services.RemoveAll<IExecutedTradeResetService>();
                 services.RemoveAll<IAccountSnapshotService>();
                 services.RemoveAll<TradeExecutionRuntimeState>();
                 services.RemoveAll<BackfillService>();
                 services.RemoveAll<LiveTickProcessor>();
                 services.RemoveAll<CandleSyncState>();
+                services.RemoveAll<IParameterRepository>();
+                services.RemoveAll<IParameterProvider>();
 
                 var capitalClient = CreateMockCapitalClient();
                 services.AddSingleton(capitalClient);
                 services.AddSingleton<ICapitalTradingClient>(capitalClient);
-                services.AddSingleton(Mock.Of<IDbMigrator>());
+                services.AddSingleton<IDbMigrator>(new NoOpDbMigrator());
                 services.AddSingleton(CreateMockCandleRepo());
                 services.AddSingleton(CreateMockCandleSyncRepo());
                 services.AddSingleton(CreateMockAuditRepo());
@@ -510,13 +639,21 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
                 services.AddSingleton(CreateMockTradeExecutionService());
                 services.AddSingleton(CreateMockTradeExecutionQueueService());
                 services.AddSingleton(CreateMockTradeExecutionPolicy());
+                services.AddSingleton(CreateMockExecutedTradeResetService());
                 services.AddSingleton(CreateMockAccountSnapshotService());
+                services.AddSingleton(CreateMockParameterRepository());
+                services.AddSingleton(CreateMockParameterProvider());
                 var runtimeState = new TradeExecutionRuntimeState();
                 runtimeState.RecordSync(true, "Mock note");
                 services.AddSingleton(runtimeState);
                 services.AddSingleton(CreateSeededCandleSyncState());
                 services.AddSingleton<IStartupFilter, TestRemoteIpStartupFilter>();
             });
+        }
+
+        private sealed class NoOpDbMigrator : IDbMigrator
+        {
+            public Task MigrateAsync(CancellationToken ct = default) => Task.CompletedTask;
         }
 
         private sealed class TestRemoteIpStartupFilter : IStartupFilter
@@ -615,6 +752,49 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
                 .ReturnsAsync((CapitalPositionSnapshot?)null);
             mock.Setup(c => c.GetActivityHistoryAsync(It.IsAny<CapitalActivityQuery>(), It.IsAny<CancellationToken>()))
                 .ReturnsAsync(Array.Empty<CapitalActivityRecord>());
+            return mock.Object;
+        }
+
+        private static IParameterRepository CreateMockParameterRepository()
+        {
+            var defaults = StrategyParameters.Default;
+            var active = new StrategyParameterSet
+            {
+                Id = 1,
+                StrategyVersion = defaults.StrategyVersion,
+                ParameterHash = "test-default",
+                Parameters = defaults,
+                Status = ParameterSetStatus.Active,
+                CreatedBy = "tests",
+                Notes = "Test active parameter set"
+            };
+
+            var mock = new Mock<IParameterRepository>();
+            mock.Setup(r => r.GetActiveAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(active);
+            mock.Setup(r => r.GetByIdAsync(It.IsAny<long>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(active);
+            mock.Setup(r => r.InsertAsync(It.IsAny<StrategyParameterSet>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(2);
+            mock.Setup(r => r.ActivateAsync(It.IsAny<long>(), It.IsAny<long?>(), It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            mock.Setup(r => r.UpdateStatusAsync(It.IsAny<long>(), It.IsAny<ParameterSetStatus>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            mock.Setup(r => r.GetCandidatesAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync([active]);
+            return mock.Object;
+        }
+
+        private static IParameterProvider CreateMockParameterProvider()
+        {
+            var defaults = StrategyParameters.Default;
+            var cached = defaults;
+
+            var mock = new Mock<IParameterProvider>();
+            mock.Setup(p => p.GetActive()).Returns(() => cached);
+            mock.Setup(p => p.RefreshAsync(It.IsAny<CancellationToken>())).ReturnsAsync(true);
+            mock.Setup(p => p.ForceOverrideMlMode(It.IsAny<MlMode>()))
+                .Callback<MlMode>(mode => cached = cached with { MlMode = mode });
             return mock.Object;
         }
 
@@ -779,10 +959,12 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
                 .ReturnsAsync(new TradeExecutionQueueSnapshot
                 {
                     ServerTimeUtc = new DateTimeOffset(2026, 4, 10, 11, 15, 0, TimeSpan.Zero),
-                    ActiveTradeCount = 1,
+                    ActiveTradeCount = 2,
+                    BrokerOpenTradeCount = 1,
+                    PendingSubmissionCount = 1,
                     MaxConcurrentOpenTrades = 3,
                     QueueConcurrentRequestLimit = 3,
-                    QueueCooldownMilliseconds = 500,
+                    AvailableDispatchSlots = 1,
                     QueuedCount = 1,
                     ProcessingCount = 0,
                     CompletedCount = 9,
@@ -805,6 +987,26 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
                             WaitSeconds = 300
                         }
                     ]
+                });
+            mock.Setup(s => s.WaitForWorkAsync(It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            mock.Setup(s => s.NotifyWorkAvailable());
+            return mock.Object;
+        }
+
+        private static IExecutedTradeResetService CreateMockExecutedTradeResetService()
+        {
+            var mock = new Mock<IExecutedTradeResetService>();
+            mock.Setup(s => s.ResetAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new ExecutedTradeResetResult
+                {
+                    ResetAtUtc = new DateTimeOffset(2026, 4, 10, 11, 20, 0, TimeSpan.Zero),
+                    QueueEntriesCleared = 2,
+                    ExecutedTradesCleared = 3,
+                    ExecutionAttemptsCleared = 4,
+                    ExecutionEventsCleared = 5,
+                    AccountSnapshotsCleared = 1,
+                    CloseActionsCleared = 1
                 });
             return mock.Object;
         }
@@ -905,6 +1107,7 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
             var latestPrimary = new SignalRecommendation
             {
                 SignalId = Guid.NewGuid(),
+                EvaluationId = Guid.Parse("12121212-1212-1212-1212-121212121212"),
                 Symbol = "ETHUSD",
                 Timeframe = "5m",
                 SignalTimeUtc = new DateTimeOffset(2026, 4, 10, 10, 0, 0, TimeSpan.Zero),
@@ -934,6 +1137,7 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
                         Signal = new SignalRecommendation
                         {
                             SignalId = Guid.Parse("11111111-1111-1111-1111-111111111111"),
+                            EvaluationId = Guid.Parse("13131313-1313-1313-1313-131313131313"),
                             Symbol = "ETHUSD",
                             Timeframe = "5m",
                             SignalTimeUtc = new DateTimeOffset(2026, 4, 10, 10, 0, 0, TimeSpan.Zero),
@@ -971,6 +1175,8 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
         {
             var mock = new Mock<IDecisionAuditRepository>();
             mock.Setup(r => r.GetLatestDecisionAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync((SignalDecision?)null);
+            mock.Setup(r => r.GetDecisionByEvaluationIdAsync(It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
                 .ReturnsAsync((SignalDecision?)null);
             mock.Setup(r => r.GetDecisionsAsync(It.IsAny<string>(), It.IsAny<DateTimeOffset>(), It.IsAny<DateTimeOffset>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
                 .ReturnsAsync(new List<SignalDecision>());

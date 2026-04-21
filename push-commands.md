@@ -4,7 +4,7 @@ Use these commands for the current repository state on branch `main`:
 
 ```bash
 git -C /Users/mohammadabwini/Desktop/ETH_MANUAL add -A
-git -C /Users/mohammadabwini/Desktop/ETH_MANUAL commit -m "Reconcile executed trades and trading dashboard updates"
+git -C /Users/mohammadabwini/Desktop/ETH_MANUAL commit -m "queue issues - executor issues"
 git -C /Users/mohammadabwini/Desktop/ETH_MANUAL push origin main
 ```
 

@@ -27,6 +27,9 @@ public sealed class TradeExecutionPolicy : ITradeExecutionPolicy
 
     public TradeExecutionPolicySettings GetSettings()
     {
+        var entryMode = Enum.TryParse<TradeEntryMode>(_config["CapitalTrading:EntryMode"], true, out var mode)
+            ? mode
+            : TradeEntryMode.NearRecommendedEntry;
         var allowed = (_config["CapitalTrading:AllowedSourceTypes"] ?? "Recommended,Generated,Blocked")
             .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Select(v => Enum.TryParse<SignalExecutionSourceType>(v, true, out var parsed) ? parsed : (SignalExecutionSourceType?)null)
@@ -49,12 +52,18 @@ public sealed class TradeExecutionPolicy : ITradeExecutionPolicy
             StaleWindowMinutes = GetInt("CapitalTrading:StaleWindowMinutes", 30),
             EntryDriftTolerancePct = GetDecimal("CapitalTrading:EntryDriftTolerancePct", 0.005m),
             EntryPriceMarginUsd = GetDecimal("CapitalTrading:EntryPriceMarginUsd", 1m),
+            GeneratedEntryMode = Enum.TryParse<TradeEntryMode>(_config["CapitalTrading:GeneratedEntryMode"], true, out var generatedMode)
+                ? generatedMode
+                : entryMode,
+            GeneratedEntryDriftTolerancePct = GetDecimal(
+                "CapitalTrading:GeneratedEntryDriftTolerancePct",
+                GetDecimal("CapitalTrading:EntryDriftTolerancePct", 0.005m)),
+            GeneratedEntryPriceMarginUsd = GetDecimal(
+                "CapitalTrading:GeneratedEntryPriceMarginUsd",
+                GetDecimal("CapitalTrading:EntryPriceMarginUsd", 1m)),
             QueueConcurrentRequestLimit = GetInt("CapitalTrading:QueueConcurrentRequestLimit", 3),
-            QueueCooldownMilliseconds = GetInt("CapitalTrading:QueueCooldownMilliseconds", 500),
             MaxConcurrentOpenTrades = GetInt("CapitalTrading:MaxConcurrentOpenTrades", 3),
-            EntryMode = Enum.TryParse<TradeEntryMode>(_config["CapitalTrading:EntryMode"], true, out var mode)
-                ? mode
-                : TradeEntryMode.NearRecommendedEntry,
+            EntryMode = entryMode,
             AllowedSourceTypes = allowed
         };
     }
@@ -106,14 +115,19 @@ public sealed class TradeExecutionPolicy : ITradeExecutionPolicy
                 "UnexpectedDemoAccount");
         }
 
-        var activeTrades = await _tradeRepo.GetActiveExecutedTradeCountAsync(new ExecutedTradeQuery
+        var pendingOrSubmittedTrades = await _tradeRepo.GetPendingOrSubmittedTradeCountAsync(new ExecutedTradeQuery
         {
             AccountId = account.AccountId,
             AccountName = account.AccountName,
             IsDemo = settings.DemoOnly ? true : null
         }, ct);
-        if (activeTrades >= settings.MaxConcurrentOpenTrades)
-            return Reject($"Max concurrent open trades reached ({activeTrades}/{settings.MaxConcurrentOpenTrades}).", "MaxConcurrentOpenTrades");
+        var activeOpenSlots = account.OpenPositions + pendingOrSubmittedTrades;
+        if (activeOpenSlots >= settings.MaxConcurrentOpenTrades)
+        {
+            return Reject(
+                $"Max concurrent open trades reached ({activeOpenSlots}/{settings.MaxConcurrentOpenTrades}).",
+                "MaxConcurrentOpenTrades");
+        }
 
         var configuredDefaultSize = GetDecimal("CapitalTrading:DefaultTradeSize", 0.05m);
         var requestedSize = request.RequestedSize.GetValueOrDefault(configuredDefaultSize);
@@ -132,16 +146,18 @@ public sealed class TradeExecutionPolicy : ITradeExecutionPolicy
             : decimal.MaxValue;
         var driftUsd = Math.Abs(marketEntry - candidate.RecommendedEntryPrice);
 
-        var entryMode = request.ForceMarketExecution ? TradeEntryMode.MarketNow : settings.EntryMode;
-        if (entryMode != TradeEntryMode.MarketNow
-            && (driftPct > settings.EntryDriftTolerancePct || driftUsd > settings.EntryPriceMarginUsd))
+        var entrySettings = ResolveEntryValidationSettings(settings, candidate.SourceType, request.ForceMarketExecution);
+        if (entrySettings.EntryMode != TradeEntryMode.MarketNow
+            && (driftPct > entrySettings.EntryDriftTolerancePct || driftUsd > entrySettings.EntryPriceMarginUsd))
             return Reject(
-                $"Price drift {driftPct:P2} / {driftUsd:F2} USD exceeds tolerance {settings.EntryDriftTolerancePct:P2} and +/-{settings.EntryPriceMarginUsd:F2} USD.",
+                $"Price drift {driftPct:P2} / {driftUsd:F2} USD exceeds tolerance {entrySettings.EntryDriftTolerancePct:P2} and +/-{entrySettings.EntryPriceMarginUsd:F2} USD.",
                 "EntryDriftExceeded");
 
         var stopLevel = candidate.SlPrice;
         var profitLevel = candidate.TpPrice;
-        var note = $"Using persisted signal TP/SL as source of truth. Entry execution band is +/-{settings.EntryPriceMarginUsd:F2} USD around the signal entry.";
+        var note = entrySettings.EntryMode == TradeEntryMode.MarketNow
+            ? $"Using current market entry for {candidate.SourceType} execution; drift guard bypassed by {(request.ForceMarketExecution ? "forced market execution" : "source-specific market-now policy")}."
+            : $"Using persisted signal TP/SL as source of truth. Entry execution band is +/-{entrySettings.EntryPriceMarginUsd:F2} USD around the signal entry.";
 
         if (!LevelsAreDirectional(candidate.Direction, marketEntry, profitLevel, stopLevel))
         {
@@ -213,6 +229,30 @@ public sealed class TradeExecutionPolicy : ITradeExecutionPolicy
             ?? _config["CapitalApi:Epic"]
             ?? symbol;
 
+    private static EntryValidationSettings ResolveEntryValidationSettings(
+        TradeExecutionPolicySettings settings,
+        SignalExecutionSourceType sourceType,
+        bool forceMarketExecution)
+    {
+        if (forceMarketExecution)
+        {
+            return new EntryValidationSettings(
+                TradeEntryMode.MarketNow,
+                settings.EntryDriftTolerancePct,
+                settings.EntryPriceMarginUsd);
+        }
+
+        return sourceType == SignalExecutionSourceType.Generated
+            ? new EntryValidationSettings(
+                settings.GeneratedEntryMode,
+                settings.GeneratedEntryDriftTolerancePct,
+                settings.GeneratedEntryPriceMarginUsd)
+            : new EntryValidationSettings(
+                settings.EntryMode,
+                settings.EntryDriftTolerancePct,
+                settings.EntryPriceMarginUsd);
+    }
+
     private bool GetBool(string key, bool fallback)
         => bool.TryParse(_config[key], out var value) ? value : fallback;
 
@@ -224,6 +264,11 @@ public sealed class TradeExecutionPolicy : ITradeExecutionPolicy
 
     private static bool IsExcludedExecutionTimeframe(string? timeframe)
         => string.Equals(timeframe?.Trim(), "1m", StringComparison.OrdinalIgnoreCase);
+
+    private readonly record struct EntryValidationSettings(
+        TradeEntryMode EntryMode,
+        decimal EntryDriftTolerancePct,
+        decimal EntryPriceMarginUsd);
 
     private static TradeExecutionPolicyDecision Reject(string message, string failureReason) => new()
     {

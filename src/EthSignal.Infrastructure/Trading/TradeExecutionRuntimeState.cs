@@ -69,4 +69,15 @@ public sealed class TradeExecutionRuntimeState
             LastSyncUtc = DateTimeOffset.UtcNow;
         }
     }
+
+    public void ClearExecutionTelemetry()
+    {
+        lock (_lock)
+        {
+            LatestBrokerError = null;
+            LatestOrderNote = null;
+            LatestExecutionAccountId = null;
+            LatestExecutionAccountName = null;
+        }
+    }
 }

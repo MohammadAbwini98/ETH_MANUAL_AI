@@ -644,6 +644,26 @@ public sealed class DbMigrator : IDbMigrator
             ADD COLUMN IF NOT EXISTS candidate_direction TEXT;", ct);
 
         await Exec(conn, @"
+            ALTER TABLE ""ETH"".signal_decision_audit
+            ADD COLUMN IF NOT EXISTS lifecycle_state TEXT;", ct);
+
+        await Exec(conn, @"
+            ALTER TABLE ""ETH"".signal_decision_audit
+            ADD COLUMN IF NOT EXISTS final_block_reason TEXT;", ct);
+
+        await Exec(conn, @"
+            ALTER TABLE ""ETH"".signal_decision_audit
+            ADD COLUMN IF NOT EXISTS origin TEXT;", ct);
+
+        await Exec(conn, @"
+            ALTER TABLE ""ETH"".signal_decision_audit
+            ADD COLUMN IF NOT EXISTS evaluation_id UUID;", ct);
+
+        await Exec(conn, @"
+            ALTER TABLE ""ETH"".signal_decision_audit
+            ADD COLUMN IF NOT EXISTS effective_runtime_parameters_json JSONB;", ct);
+
+        await Exec(conn, @"
             UPDATE ""ETH"".signal_decision_audit
             SET candidate_direction = decision_type
             WHERE candidate_direction IS NULL

@@ -286,6 +286,18 @@ public sealed class ExecutedTradeRepository : IExecutedTradeRepository
         return (int)(await cmd.ExecuteScalarAsync(ct))!;
     }
 
+    public async Task<int> GetPendingOrSubmittedTradeCountAsync(ExecutedTradeQuery query, CancellationToken ct = default)
+    {
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(ct);
+        var sql = new StringBuilder(@"SELECT COUNT(*)::INT FROM ""ETH"".executed_trades WHERE status IN ('Pending', 'Submitted')");
+        await using var cmd = new NpgsqlCommand();
+        cmd.Connection = conn;
+        AppendFilters(sql, cmd, query);
+        cmd.CommandText = sql.ToString();
+        return (int)(await cmd.ExecuteScalarAsync(ct))!;
+    }
+
     public async Task InsertExecutionAttemptAsync(long? executedTradeId, Guid signalId, SignalExecutionSourceType sourceType, string attemptType, bool success, string? summary, string? errorDetails, string? brokerPayload, CancellationToken ct = default)
     {
         await using var conn = new NpgsqlConnection(_connectionString);

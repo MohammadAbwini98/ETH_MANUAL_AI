@@ -6,16 +6,19 @@ public sealed class ExecutedTradeMonitorService : BackgroundService
 {
     private readonly IConfiguration _config;
     private readonly TradeLifecycleReconciliationService _reconciliationService;
+    private readonly ITradeExecutionQueueService _queueService;
     private readonly ILogger<ExecutedTradeMonitorService> _logger;
     private readonly TimeSpan _pollInterval;
 
     public ExecutedTradeMonitorService(
         IConfiguration config,
         TradeLifecycleReconciliationService reconciliationService,
+        ITradeExecutionQueueService queueService,
         ILogger<ExecutedTradeMonitorService> logger)
     {
         _config = config;
         _reconciliationService = reconciliationService;
+        _queueService = queueService;
         _logger = logger;
         var pollSeconds = Math.Clamp(_config.GetValue("CapitalTrading:LifecyclePollIntervalSeconds", 5), 1, 60);
         _pollInterval = TimeSpan.FromSeconds(pollSeconds);
@@ -28,7 +31,10 @@ public sealed class ExecutedTradeMonitorService : BackgroundService
             try
             {
                 if (_config.GetValue("CapitalTrading:Enabled", false))
+                {
                     await _reconciliationService.RunOnceAsync(stoppingToken);
+                    _queueService.NotifyWorkAvailable();
+                }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {

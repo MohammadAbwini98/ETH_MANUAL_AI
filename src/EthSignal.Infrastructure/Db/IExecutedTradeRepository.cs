@@ -17,6 +17,7 @@ public interface IExecutedTradeRepository
     Task<int> GetOpenExecutedTradeCountAsync(CancellationToken ct = default);
     Task<int> GetOpenExecutedTradeCountAsync(ExecutedTradeQuery query, CancellationToken ct = default);
     Task<int> GetActiveExecutedTradeCountAsync(ExecutedTradeQuery query, CancellationToken ct = default);
+    Task<int> GetPendingOrSubmittedTradeCountAsync(ExecutedTradeQuery query, CancellationToken ct = default);
     Task InsertExecutionAttemptAsync(long? executedTradeId, Guid signalId, SignalExecutionSourceType sourceType, string attemptType, bool success, string? summary, string? errorDetails, string? brokerPayload, CancellationToken ct = default);
     Task InsertExecutionEventAsync(long? executedTradeId, Guid signalId, SignalExecutionSourceType sourceType, string eventType, string message, string? detailsJson, CancellationToken ct = default);
     Task<long> InsertAccountSnapshotAsync(AccountSnapshot snapshot, CancellationToken ct = default);

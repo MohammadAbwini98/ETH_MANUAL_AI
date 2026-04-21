@@ -77,18 +77,28 @@ public sealed class TradeExecutionQueueRepository : ITradeExecutionQueueReposito
         return Read(reader);
     }
 
-    public async Task<QueuedTradeExecution?> GetNextQueuedAsync(CancellationToken ct = default)
+    public async Task<QueuedTradeExecution?> TryClaimNextQueuedAsync(DateTimeOffset claimedAtUtc, CancellationToken ct = default)
     {
         await using var conn = new NpgsqlConnection(_connectionString);
         await conn.OpenAsync(ct);
         await using var cmd = new NpgsqlCommand(@"
-            SELECT queue_entry_id, signal_id, evaluation_id, source_type, requested_by, requested_size, force_market_execution,
-                   candidate_json::text, status, executed_trade_id, failure_reason, error_details,
-                   created_at_utc, updated_at_utc, processed_at_utc
-            FROM ""ETH"".trade_execution_queue
-            WHERE status = 'Queued'
-            ORDER BY created_at_utc ASC, queue_entry_id ASC
-            LIMIT 1;", conn);
+            WITH next_entry AS (
+                SELECT queue_entry_id
+                FROM ""ETH"".trade_execution_queue
+                WHERE status = 'Queued'
+                ORDER BY created_at_utc ASC, queue_entry_id ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+            )
+            UPDATE ""ETH"".trade_execution_queue q
+            SET status = 'Processing',
+                updated_at_utc = @claimed_at_utc
+            FROM next_entry
+            WHERE q.queue_entry_id = next_entry.queue_entry_id
+            RETURNING q.queue_entry_id, q.signal_id, q.evaluation_id, q.source_type, q.requested_by, q.requested_size, q.force_market_execution,
+                      q.candidate_json::text, q.status, q.executed_trade_id, q.failure_reason, q.error_details,
+                      q.created_at_utc, q.updated_at_utc, q.processed_at_utc;", conn);
+        cmd.Parameters.AddWithValue("claimed_at_utc", claimedAtUtc);
         await using var reader = await cmd.ExecuteReaderAsync(ct);
         if (!await reader.ReadAsync(ct))
             return null;
@@ -147,6 +157,25 @@ public sealed class TradeExecutionQueueRepository : ITradeExecutionQueueReposito
             reader.GetInt32(1),
             reader.GetInt32(2),
             reader.GetInt32(3));
+    }
+
+    public async Task<int> RequeueStaleProcessingAsync(DateTimeOffset staleBeforeUtc, CancellationToken ct = default)
+    {
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(ct);
+        await using var cmd = new NpgsqlCommand(@"
+            UPDATE ""ETH"".trade_execution_queue
+            SET status = 'Queued',
+                failure_reason = COALESCE(failure_reason, 'StaleProcessingRecovered'),
+                error_details = CASE
+                    WHEN error_details IS NULL OR error_details = '' THEN 'Recovered stale processing entry for re-dispatch.'
+                    ELSE error_details
+                END,
+                updated_at_utc = NOW()
+            WHERE status = 'Processing'
+              AND updated_at_utc < @stale_before_utc;", conn);
+        cmd.Parameters.AddWithValue("stale_before_utc", staleBeforeUtc);
+        return await cmd.ExecuteNonQueryAsync(ct);
     }
 
     private static void Bind(NpgsqlCommand cmd, QueuedTradeExecution entry)
