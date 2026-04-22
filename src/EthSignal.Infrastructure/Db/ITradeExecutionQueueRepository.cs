@@ -11,5 +11,6 @@ public interface ITradeExecutionQueueRepository
     Task<bool> HasQueuedAsync(CancellationToken ct = default);
     Task<IReadOnlyList<QueuedTradeExecution>> GetActiveEntriesAsync(int limit = 50, CancellationToken ct = default);
     Task<(int QueuedCount, int ProcessingCount, int CompletedCount, int FailedCount)> GetStatusCountsAsync(CancellationToken ct = default);
+    Task<int> ExpireStaleQueuedAsync(DateTimeOffset staleBeforeUtc, CancellationToken ct = default);
     Task<int> RequeueStaleProcessingAsync(DateTimeOffset staleBeforeUtc, CancellationToken ct = default);
 }

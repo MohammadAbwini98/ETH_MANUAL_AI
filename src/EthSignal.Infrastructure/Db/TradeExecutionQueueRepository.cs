@@ -159,6 +159,27 @@ public sealed class TradeExecutionQueueRepository : ITradeExecutionQueueReposito
             reader.GetInt32(3));
     }
 
+    public async Task<int> ExpireStaleQueuedAsync(DateTimeOffset staleBeforeUtc, CancellationToken ct = default)
+    {
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(ct);
+        await using var cmd = new NpgsqlCommand(@"
+            UPDATE ""ETH"".trade_execution_queue
+            SET status = 'Completed',
+                failure_reason = COALESCE(failure_reason, 'SignalStale'),
+                error_details = CASE
+                    WHEN error_details IS NULL OR error_details = '' THEN 'Signal became stale while waiting in execution queue.'
+                    ELSE error_details
+                END,
+                updated_at_utc = NOW(),
+                processed_at_utc = NOW()
+            WHERE status = 'Queued'
+              AND candidate_json ? 'signalTimeUtc'
+              AND NULLIF(candidate_json ->> 'signalTimeUtc', '')::timestamptz < @stale_before_utc;", conn);
+        cmd.Parameters.AddWithValue("stale_before_utc", staleBeforeUtc);
+        return await cmd.ExecuteNonQueryAsync(ct);
+    }
+
     public async Task<int> RequeueStaleProcessingAsync(DateTimeOffset staleBeforeUtc, CancellationToken ct = default)
     {
         await using var conn = new NpgsqlConnection(_connectionString);

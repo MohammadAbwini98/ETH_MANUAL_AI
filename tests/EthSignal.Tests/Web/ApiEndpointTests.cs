@@ -41,8 +41,8 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
     [InlineData("/api/regime/current")]
     [InlineData("/api/signals/latest")]
     [InlineData("/api/signals/history?limit=10")]
-    [InlineData("/api/blocked-signals/history?limit=10")]
-    [InlineData("/api/generated-signals/history?limit=10")]
+    [InlineData("/api/signals/history?limit=10&source=Blocked")]
+    [InlineData("/api/signals/history?limit=10&source=Generated")]
     [InlineData("/api/trading/queue?limit=10")]
     [InlineData("/api/performance/summary")]
     [InlineData("/api/performance/daily")]
@@ -100,7 +100,7 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
     [Fact]
     public async Task Signal_History_Includes_Execution_State_When_Trade_Exists()
     {
-        var response = await _client.GetAsync("/api/signals/history?limit=5");
+        var response = await _client.GetAsync("/api/signals/history?limit=5&source=Recommended");
         response.StatusCode.Should().Be(HttpStatusCode.OK);
 
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
@@ -111,35 +111,33 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
     }
 
     [Fact]
-    public async Task Blocked_Signal_History_Returns_Stats_And_Array()
+    public async Task Signal_History_Source_Filter_Returns_Only_Requested_Category()
     {
-        var response = await _client.GetAsync("/api/blocked-signals/history?limit=5");
+        var response = await _client.GetAsync("/api/signals/history?limit=5&source=Blocked");
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        var signals = doc.RootElement.GetProperty("signals");
+        signals.GetArrayLength().Should().BeGreaterThan(0);
+        signals[0].GetProperty("signal").GetProperty("source").GetString().Should().Be("Blocked");
+    }
+
+    [Fact]
+    public async Task Signal_History_Generated_Filter_Returns_Array()
+    {
+        var response = await _client.GetAsync("/api/signals/history?limit=5&source=Generated");
         response.StatusCode.Should().Be(HttpStatusCode.OK);
 
         var json = await response.Content.ReadAsStringAsync();
         using var doc = JsonDocument.Parse(json);
         doc.RootElement.TryGetProperty("signals", out _).Should().BeTrue();
-        doc.RootElement.TryGetProperty("stats", out _).Should().BeTrue();
         doc.RootElement.TryGetProperty("total", out _).Should().BeTrue();
     }
 
     [Fact]
-    public async Task Generated_Signal_History_Returns_Stats_And_Array()
+    public async Task Signal_History_Generated_Filter_Includes_Execution_State_When_Trade_Exists()
     {
-        var response = await _client.GetAsync("/api/generated-signals/history?limit=5");
-        response.StatusCode.Should().Be(HttpStatusCode.OK);
-
-        var json = await response.Content.ReadAsStringAsync();
-        using var doc = JsonDocument.Parse(json);
-        doc.RootElement.TryGetProperty("signals", out _).Should().BeTrue();
-        doc.RootElement.TryGetProperty("stats", out _).Should().BeTrue();
-        doc.RootElement.TryGetProperty("total", out _).Should().BeTrue();
-    }
-
-    [Fact]
-    public async Task Generated_Signal_History_Includes_Execution_State_When_Trade_Exists()
-    {
-        var response = await _client.GetAsync("/api/generated-signals/history?limit=5");
+        var response = await _client.GetAsync("/api/signals/history?limit=5&source=Generated");
         response.StatusCode.Should().Be(HttpStatusCode.OK);
 
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
@@ -577,8 +575,12 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
         var json = await response.Content.ReadAsStringAsync();
         using var doc = JsonDocument.Parse(json);
         var signal = doc.RootElement.GetProperty("signal");
-        signal.GetProperty("timeframe").GetString().Should().Be("1m");
-        signal.GetProperty("direction").GetString().Should().Be("SELL");
+        signal.GetProperty("timeframe").GetString().Should().Be("5m");
+        signal.GetProperty("direction").GetString().Should().Be("BUY");
+
+        var overall = doc.RootElement.GetProperty("latestSignalOverall");
+        overall.GetProperty("timeframe").GetString().Should().Be("1m");
+        overall.GetProperty("direction").GetString().Should().Be("SELL");
     }
 
     [Fact]
@@ -773,6 +775,7 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
                 services.RemoveAll<IPortalOverridesRepository>();
                 services.RemoveAll<IBlockedSignalHistoryService>();
                 services.RemoveAll<IGeneratedSignalHistoryService>();
+                services.RemoveAll<ISignalHistoryService>();
                 services.RemoveAll<IExecutedTradeRepository>();
                 services.RemoveAll<ITradeExecutionService>();
                 services.RemoveAll<ITradeExecutionQueueService>();
@@ -803,6 +806,7 @@ public class ApiEndpointTests : IClassFixture<ApiEndpointTests.TestApp>
                 services.AddSingleton(CreateMockBlockedSignalHistoryService());
                 services.AddSingleton(CreateMockGeneratedSignalHistoryService());
                 services.AddSingleton(CreateMockExecutedTradeRepository());
+                services.AddSingleton<ISignalHistoryService, SignalHistoryService>();
                 services.AddSingleton(CreateMockTradeExecutionService());
                 services.AddSingleton(CreateMockTradeExecutionQueueService());
                 services.AddSingleton(CreateMockTradeExecutionPolicy());

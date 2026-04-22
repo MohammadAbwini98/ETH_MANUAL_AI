@@ -74,6 +74,14 @@ public sealed class ParameterProvider : IParameterProvider
                 }
 
                 var parameters = ApplyPortalOverrides(active.Parameters, overrides);
+                var normalizedParameters = parameters.EnsureProductionSafeDefaults();
+                if (!string.Equals(normalizedParameters.ToJson(), parameters.ToJson(), StringComparison.Ordinal))
+                {
+                    parameters = normalizedParameters;
+                    _logger.LogWarning(
+                        "Active parameter set id={Id} required runtime normalization (legacy defaults repaired)",
+                        active.Id);
+                }
                 lock (_lock)
                 {
                     _cached = parameters;

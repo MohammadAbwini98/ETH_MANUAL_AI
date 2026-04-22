@@ -158,4 +158,34 @@ public sealed class ExitEngineTests
         result.TakeProfit.Should().Be(2030m);
         result.RiskRewardRatio.Should().Be(1.5m);
     }
+
+    [Fact]
+    public void BuildPolicy_Clamps_Minimum_Reward_To_Risk_To_Timeframe_Target()
+    {
+        var parameters = StrategyParameters.Default with
+        {
+            MinRiskRewardAfterRounding = 1.5m,
+            TimeframeProfiles = TimeframeStrategyProfileSet.Recommended
+        };
+
+        var policy = ExitEngine.BuildPolicy(parameters, "5m");
+
+        policy.DefaultRewardToRisk.Should().Be(1.4m);
+        policy.MinRewardToRisk.Should().Be(1.4m);
+    }
+
+    [Fact]
+    public void BuildScalpPolicy_Does_Not_Require_More_Than_The_Scalp_Target()
+    {
+        var parameters = StrategyParameters.Default with
+        {
+            MinRiskRewardAfterRounding = 1.8m,
+            ScalpTargetRMultiple = 1.35m
+        };
+
+        var policy = ExitEngine.BuildScalpPolicy(parameters);
+
+        policy.DefaultRewardToRisk.Should().Be(1.35m);
+        policy.MinRewardToRisk.Should().Be(1.35m);
+    }
 }

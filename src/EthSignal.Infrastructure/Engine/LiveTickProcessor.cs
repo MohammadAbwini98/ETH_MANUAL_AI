@@ -587,7 +587,7 @@ public sealed class LiveTickProcessor
         // We preload 300 bars for each timeframe the ML pipeline evaluates on.
         // At 5m that covers 25 h, giving the session-structure and volatility
         // features full prior-day visibility.
-        var timeframes = new[] { Timeframe.M1, Timeframe.M5, Timeframe.M15, Timeframe.M30, Timeframe.H1 };
+        var timeframes = new[] { Timeframe.M1, Timeframe.M5, Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4 };
         const int BarsToLoad = 300;
 
         foreach (var tf in timeframes)
@@ -860,13 +860,10 @@ public sealed class LiveTickProcessor
                 // Track snapshots for ML feature extraction
                 if (snapshot != null)
                     TrackSnapshotForMl(tf.Name, snapshot);
-
-                // Generate signal on every signal-TF close
-                if (snapshot != null && _currentRegimeResult != null)
-                    await TryGenerateSignal(symbol, closedCandle, closed, tf, ct);
             }
 
-            // Classify and cache regime on every signal timeframe close
+            // Refresh the just-closed timeframe regime before evaluating signals so
+            // the current bar is not judged against stale bias from the prior bar.
             if (Timeframe.Signal.Contains(tf) && tf != Timeframe.M1)
             {
                 var ind = IndicatorEngine.ComputeAll(symbol, tf.Name, closed, p);
@@ -886,6 +883,14 @@ public sealed class LiveTickProcessor
                             regime.Regime, regime.RegimeScore);
                     }
                 }
+            }
+
+            if (Timeframe.Signal.Contains(tf))
+            {
+                // Generate signal on every signal-TF close using the refreshed
+                // regime cache for this bar.
+                if (snapshot != null && _currentRegimeResult != null)
+                    await TryGenerateSignal(symbol, closedCandle, closed, tf, ct);
             }
         }
         catch (Exception ex)
@@ -1038,6 +1043,20 @@ public sealed class LiveTickProcessor
                     _logger.LogInformation(
                         "[{Tf}] Signal {NewDir} blocked — conflicting open {OldDir} signal from {OpenTime} still active",
                         tf.Name, signal.Direction, conflicting.Direction, conflicting.SignalTimeUtc.ToString("HH:mm"));
+                    await FinalizeMlArtifactsAsync(mlArtifacts, MlEvaluationLinkStatus.OperationallyBlocked, ct);
+                    return;
+                }
+
+                var (capacityCode, capacityReason) = RiskManager.CheckScopedCapacity(
+                    p, openSignals, tf.Name, signal.Direction);
+                if (capacityCode.HasValue)
+                {
+                    var capacityDecision = SignalDecisionTransition.ToOperationalBlock(
+                        decision,
+                        SignalLifecycleState.RISK_BLOCKED,
+                        capacityReason,
+                        [capacityCode.Value]);
+                    await _decisionAuditRepo.InsertDecisionAsync(capacityDecision, ct);
                     await FinalizeMlArtifactsAsync(mlArtifacts, MlEvaluationLinkStatus.OperationallyBlocked, ct);
                     return;
                 }
@@ -1237,10 +1256,10 @@ public sealed class LiveTickProcessor
                 await TryEvaluateScalpSignal(symbol, closed1mCandle, p, ct);
             }
 
-            // ─── Running-candle evaluation on HTF (5m/15m/30m/1h) ──
-            // Include 1h so a directional 1h bias can produce signals every minute
-            // instead of waiting for the once-per-hour 1h candle close.
-            foreach (var tf in new[] { Timeframe.M5, Timeframe.M15, Timeframe.M30, Timeframe.H1 })
+            // ─── Running-candle evaluation on HTF (5m/15m/30m/1h/4h) ──
+            // Include the long buckets so higher-timeframe setups are evaluated
+            // continuously instead of only on the final bar close.
+            foreach (var tf in new[] { Timeframe.M5, Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4 })
             {
                 await TryEvaluateRunningCandle(symbol, closed1mCandle, tf, runtimeParams.ResolveForTimeframe(tf.Name), ct);
             }
@@ -1408,7 +1427,7 @@ public sealed class LiveTickProcessor
                     decision,
                     SignalLifecycleState.RISK_BLOCKED,
                     capacityReason,
-                    [RejectReasonCode.RISK_MANAGER_BLOCKED]);
+                    [capacityCode.Value]);
                 await _decisionAuditRepo.InsertDecisionAsync(capacityDecision, ct);
                 await FinalizeMlArtifactsAsync(scalpMlArtifacts, MlEvaluationLinkStatus.OperationallyBlocked, ct);
                 return;
@@ -1504,7 +1523,9 @@ public sealed class LiveTickProcessor
                     Tp3Price = scalpExitResult.Tp3,
                     RiskRewardRatio = scalpExitResult.RiskRewardRatio,
                     ExitModel = scalpExitResult.ExitModel,
-                    ExitExplanation = scalpExitResult.Explanation
+                    ExitExplanation = scalpExitResult.Explanation,
+                    MarketConditionClass = scalpConditionClass?.ToKey(),
+                    EvaluationId = scalpMlArtifacts?.EvaluationId ?? decision!.EvaluationId
                 };
                 await _signalRepo.InsertSignalAsync(fullSignal, ct);
 
@@ -1718,20 +1739,22 @@ public sealed class LiveTickProcessor
                 return;
             }
 
-            // Check session-level risk limits
-            var riskPolicy = p.ToRiskPolicy();
-            if (openSignals.Count >= riskPolicy.MaxOpenPositions)
+            var (capacityCode, capacityReason) = RiskManager.CheckScopedCapacity(
+                p, openSignals, tf.Name, signal.Direction);
+            if (capacityCode.HasValue)
             {
-                var capDecision = SignalDecisionTransition.ToOperationalBlock(
+                var capacityDecision = SignalDecisionTransition.ToOperationalBlock(
                     decision,
                     SignalLifecycleState.RISK_BLOCKED,
-                    $"Max open positions ({riskPolicy.MaxOpenPositions}) reached",
-                    [RejectReasonCode.RISK_MANAGER_BLOCKED]);
-                await _decisionAuditRepo.InsertDecisionAsync(capDecision, ct);
+                    capacityReason,
+                    [capacityCode.Value]);
+                await _decisionAuditRepo.InsertDecisionAsync(capacityDecision, ct);
                 await FinalizeMlArtifactsAsync(mlArtifacts, MlEvaluationLinkStatus.OperationallyBlocked, ct);
                 return;
             }
 
+            // Check session-level risk limits
+            var riskPolicy = p.ToRiskPolicy();
             var todayStart = DateTimeOffset.UtcNow.Date;
             var todayEnd = todayStart.AddDays(1);
             var todayOutcomes = await _signalRepo.GetOutcomesAsync(symbol,
@@ -1819,7 +1842,9 @@ public sealed class LiveTickProcessor
                     Tp3Price = rcExitResult.Tp3,
                     RiskRewardRatio = rcExitResult.RiskRewardRatio,
                     ExitModel = rcExitResult.ExitModel,
-                    ExitExplanation = rcExitResult.Explanation
+                    ExitExplanation = rcExitResult.Explanation,
+                    MarketConditionClass = currentConditionClass?.ToKey(),
+                    EvaluationId = mlArtifacts?.EvaluationId ?? decision.EvaluationId
                 };
                 await _signalRepo.InsertSignalAsync(fullSignal, ct);
 

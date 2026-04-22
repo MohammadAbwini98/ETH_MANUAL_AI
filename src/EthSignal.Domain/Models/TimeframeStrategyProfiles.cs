@@ -44,6 +44,42 @@ public sealed record TimeframeStrategyProfile
     public decimal? ScalpTargetRMultiple { get; init; }
     public int? ScalpCooldownBars { get; init; }
 
+    public bool IsEmpty =>
+        AdaptiveParametersEnabled is null
+        && AdaptiveRetrospectiveEnabled is null
+        && AdaptiveRetrospectiveMinOutcomes is null
+        && AdaptiveRetrospectiveWindowSize is null
+        && ConfidenceBuyThreshold is null
+        && ConfidenceSellThreshold is null
+        && ConflictingScoreGap is null
+        && MaxRecoveredRegimeAgeBars is null
+        && PullbackZonePct is null
+        && MinAtrThreshold is null
+        && StopAtrMultiplier is null
+        && TargetRMultiple is null
+        && LiveEntrySlippageBufferPct is null
+        && MinStopDistancePct is null
+        && ExitMaxStopDistancePct is null
+        && ExitIntradayMinAtrTpMultiplier is null
+        && ExitIntradayMaxAtrTpMultiplier is null
+        && ExitHigherTfMinAtrTpMultiplier is null
+        && ExitHigherTfMaxAtrTpMultiplier is null
+        && FastTimeframeEntryAtrMultiplier is null
+        && MidTimeframeEntryAtrMultiplier is null
+        && LongTimeframeEntryAtrMultiplier is null
+        && EntryAtrBufferCapPct is null
+        && HighConfidenceEntryBufferMultiplier is null
+        && LowConfidenceEntryBufferMultiplier is null
+        && ExitStructureBufferAtrMultiplier is null
+        && AdaptiveOverlayIntensity is null
+        && MlMinWinProbability is null
+        && NeutralRegimePolicy is null
+        && ScalpConfidenceThreshold is null
+        && ScalpMinAtr is null
+        && ScalpStopAtrMultiplier is null
+        && ScalpTargetRMultiple is null
+        && ScalpCooldownBars is null;
+
     public TimeframeStrategyProfile Merge(TimeframeStrategyProfile fallback) => new()
     {
         AdaptiveParametersEnabled = AdaptiveParametersEnabled ?? fallback.AdaptiveParametersEnabled,
@@ -173,6 +209,7 @@ public sealed record TimeframeStrategyProfileSet
             MinAtrThreshold = 0.7m,
             StopAtrMultiplier = 1.9m,
             TargetRMultiple = 1.4m,
+            NeutralRegimePolicy = NeutralRegimePolicy.AllowReducedRiskEntriesInNeutral,
             LiveEntrySlippageBufferPct = 0.0021m,
             MinStopDistancePct = 0.0025m,
             ExitIntradayMinAtrTpMultiplier = 1.2m,
@@ -185,7 +222,8 @@ public sealed record TimeframeStrategyProfileSet
             PullbackZonePct = 0.0041m,
             MinAtrThreshold = 0.85m,
             StopAtrMultiplier = 2.0m,
-            TargetRMultiple = 1.55m
+            TargetRMultiple = 1.55m,
+            NeutralRegimePolicy = NeutralRegimePolicy.AllowReducedRiskEntriesInNeutral
         },
         M30 = new TimeframeStrategyProfile
         {
@@ -195,6 +233,7 @@ public sealed record TimeframeStrategyProfileSet
             MinAtrThreshold = 0.95m,
             StopAtrMultiplier = 2.1m,
             TargetRMultiple = 1.65m,
+            NeutralRegimePolicy = NeutralRegimePolicy.AllowReducedRiskEntriesInNeutral,
             ExitIntradayMinAtrTpMultiplier = 1.6m,
             ExitIntradayMaxAtrTpMultiplier = 3.2m
         },
@@ -206,6 +245,7 @@ public sealed record TimeframeStrategyProfileSet
             MinAtrThreshold = 1.1m,
             StopAtrMultiplier = 2.3m,
             TargetRMultiple = 1.8m,
+            NeutralRegimePolicy = NeutralRegimePolicy.AllowReducedRiskEntriesInNeutral,
             LiveEntrySlippageBufferPct = 0.0013m,
             ExitHigherTfMinAtrTpMultiplier = 2.2m,
             ExitHigherTfMaxAtrTpMultiplier = 4.0m
@@ -218,6 +258,7 @@ public sealed record TimeframeStrategyProfileSet
             MinAtrThreshold = 1.2m,
             StopAtrMultiplier = 2.45m,
             TargetRMultiple = 1.95m,
+            NeutralRegimePolicy = NeutralRegimePolicy.AllowReducedRiskEntriesInNeutral,
             LiveEntrySlippageBufferPct = 0.0011m,
             MinStopDistancePct = 0.003m,
             ExitHigherTfMinAtrTpMultiplier = 2.4m,
@@ -277,6 +318,17 @@ public sealed record TimeframeStrategyProfileSet
             AdaptiveOverlayIntensity = 0.75m
         }
     };
+
+    public bool IsEffectivelyEmpty()
+        => M1.IsEmpty
+           && M5.IsEmpty
+           && M15.IsEmpty
+           && M30.IsEmpty
+           && H1.IsEmpty
+           && H4.IsEmpty
+           && Fast.IsEmpty
+           && Mid.IsEmpty
+           && Long.IsEmpty;
 
     public TimeframeStrategyProfile GetProfile(TimeframeProfileBucket bucket) => bucket switch
     {

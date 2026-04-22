@@ -9,6 +9,8 @@ namespace EthSignal.Domain.Models;
 /// </summary>
 public sealed record StrategyParameters
 {
+    public const decimal RecommendedDailyLossCapPercent = 5.0m;
+
     // ─── Identity ────────────────────────────────────────
     public string StrategyVersion { get; init; } = "v3.1";
 
@@ -100,7 +102,7 @@ public sealed record StrategyParameters
     public decimal AccountBalanceUsd { get; init; } = 50m;
     public decimal RiskPerTradePercent { get; init; } = 0.5m;
     public decimal HardMaxRiskPercent { get; init; } = 1.0m;
-    public decimal DailyLossCapPercent { get; init; } = decimal.MaxValue;
+    public decimal DailyLossCapPercent { get; init; } = RecommendedDailyLossCapPercent;
     public int MaxConsecutiveLossesPerDay { get; init; } = int.MaxValue;
     public int MaxOpenPositions { get; init; } = int.MaxValue;
     public decimal StopAtrMultiplier { get; init; } = 2.0m;
@@ -318,6 +320,23 @@ public sealed record StrategyParameters
         ScalpDailyMaxDrawdownPercent = ScalpDailyMaxDrawdownPercent
     };
 
+    /// <summary>
+    /// Normalize legacy runtime defaults that previously allowed structurally bad
+    /// active sets to survive in production.
+    /// </summary>
+    public StrategyParameters EnsureProductionSafeDefaults()
+    {
+        var normalized = this;
+
+        if (normalized.DailyLossCapPercent == decimal.MaxValue)
+            normalized = normalized with { DailyLossCapPercent = RecommendedDailyLossCapPercent };
+
+        if (normalized.TimeframeProfiles.IsEffectivelyEmpty())
+            normalized = normalized with { TimeframeProfiles = TimeframeStrategyProfileSet.Recommended };
+
+        return normalized;
+    }
+
     /// <summary>Validate constraints. Returns null if valid, error message if invalid.</summary>
     public string? Validate()
     {
@@ -390,6 +409,11 @@ public sealed record StrategyParameters
         var profile = TimeframeProfiles.GetProfile(timeframe);
         return profile.ApplyTo(this);
     }
+
+    public StrategyParameters EnsureRecommendedTimeframeProfiles()
+        => TimeframeProfiles.IsEffectivelyEmpty()
+            ? this with { TimeframeProfiles = TimeframeStrategyProfileSet.Recommended }
+            : this;
 
     /// <summary>Deterministic JSON for hashing.</summary>
     public string ToJson() => JsonSerializer.Serialize(this, new JsonSerializerOptions

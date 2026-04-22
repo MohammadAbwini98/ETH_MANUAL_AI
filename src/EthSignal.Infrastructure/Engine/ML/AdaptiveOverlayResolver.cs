@@ -214,11 +214,11 @@ public static class AdaptiveOverlayResolver
     {
         VolatilityTier.LOW => new ParameterOverlay
         {
-            ConfidenceBuyThresholdDelta = 5,
-            ConfidenceSellThresholdDelta = 5,
-            PullbackZonePctOverride = 0.003m,
+            ConfidenceBuyThresholdDelta = 2,
+            ConfidenceSellThresholdDelta = 2,
+            PullbackZonePctOverride = 0.0036m,
             MinAtrThresholdMultiplier = 0.5m,
-            BodyRatioMinOverride = 0.4m,
+            BodyRatioMinOverride = 0.28m,
             ScalpMinAtrMultiplier = 0.5m,
             OverlaySource = "proactive-volatility"
         },
@@ -247,10 +247,10 @@ public static class AdaptiveOverlayResolver
     {
         TrendStrength.WEAK => new ParameterOverlay
         {
-            ConfidenceBuyThresholdDelta = 2,
-            ConfidenceSellThresholdDelta = 2,
-            NeutralRegimePolicyOverride = NeutralRegimePolicy.BlockAllEntriesInNeutral,
-            MlWeakContextBumpDelta = 0.02m,
+            ConfidenceBuyThresholdDelta = 1,
+            ConfidenceSellThresholdDelta = 1,
+            NeutralRegimePolicyOverride = NeutralRegimePolicy.AllowReducedRiskEntriesInNeutral,
+            MlWeakContextBumpDelta = 0.01m,
             OverlaySource = "proactive-trend"
         },
         TrendStrength.STRONG => new ParameterOverlay
@@ -268,8 +268,8 @@ public static class AdaptiveOverlayResolver
     {
         TradingSession.ASIA => new ParameterOverlay
         {
-            ConfidenceBuyThresholdDelta = 3,
-            ConfidenceSellThresholdDelta = 3,
+            ConfidenceBuyThresholdDelta = 1,
+            ConfidenceSellThresholdDelta = 1,
             ScalpCooldownBarsDelta = 3,
             MlMinWinProbabilityDelta = 0.03m,
             VolumeMultiplierMinOverride = 0.5m,
@@ -294,9 +294,7 @@ public static class AdaptiveOverlayResolver
         },
         SpreadQuality.WIDE => new ParameterOverlay
         {
-            MinAtrThresholdMultiplier = 1.3m,
-            ConfidenceBuyThresholdDelta = 3,
-            ConfidenceSellThresholdDelta = 3,
+            MinAtrThresholdMultiplier = 1.15m,
             OverlaySource = "proactive-spread"
         },
         _ => null // NORMAL: no overlay
@@ -308,10 +306,10 @@ public static class AdaptiveOverlayResolver
         // Raise the volume gate (require stronger volume confirmation) and tighten confidence.
         VolumeTier.DRY => new ParameterOverlay
         {
-            ConfidenceBuyThresholdDelta = 3,
-            ConfidenceSellThresholdDelta = 3,
-            VolumeMultiplierMinOverride = 0.9m,
-            BodyRatioMinOverride = 0.35m,
+            ConfidenceBuyThresholdDelta = 1,
+            ConfidenceSellThresholdDelta = 1,
+            VolumeMultiplierMinOverride = 0.85m,
+            BodyRatioMinOverride = 0.32m,
             OverlaySource = "proactive-volume"
         },
         VolumeTier.ACTIVE => new ParameterOverlay

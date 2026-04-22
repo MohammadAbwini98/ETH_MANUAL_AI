@@ -82,7 +82,7 @@ public sealed class TradeExecutionPolicy : ITradeExecutionPolicy
         if (!settings.AllowedSourceTypes.Contains(candidate.SourceType))
             return Reject($"Source type {candidate.SourceType} is not allowed by execution policy.", "SourceTypeNotAllowed");
 
-        if (IsExcludedExecutionTimeframe(candidate.Timeframe))
+        if (!IsBrokerExecutionTimeframeAllowed(candidate.Timeframe))
             return Reject($"Timeframe {candidate.Timeframe} is excluded from broker execution.", "TimeframeNotAllowed");
 
         if (candidate.Direction is not (SignalDirection.BUY or SignalDirection.SELL))
@@ -262,8 +262,8 @@ public sealed class TradeExecutionPolicy : ITradeExecutionPolicy
     private decimal GetDecimal(string key, decimal fallback)
         => decimal.TryParse(_config[key], out var value) ? value : fallback;
 
-    private static bool IsExcludedExecutionTimeframe(string? timeframe)
-        => string.Equals(timeframe?.Trim(), "1m", StringComparison.OrdinalIgnoreCase);
+    public static bool IsBrokerExecutionTimeframeAllowed(string? timeframe)
+        => !string.Equals(timeframe?.Trim(), "1m", StringComparison.OrdinalIgnoreCase);
 
     private readonly record struct EntryValidationSettings(
         TradeEntryMode EntryMode,

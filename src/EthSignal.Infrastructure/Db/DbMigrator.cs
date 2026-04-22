@@ -664,6 +664,14 @@ public sealed class DbMigrator : IDbMigrator
             ADD COLUMN IF NOT EXISTS effective_runtime_parameters_json JSONB;", ct);
 
         await Exec(conn, @"
+            ALTER TABLE ""ETH"".signal_decision_audit
+            ADD COLUMN IF NOT EXISTS blended_confidence INT;", ct);
+
+        await Exec(conn, @"
+            ALTER TABLE ""ETH"".signal_decision_audit
+            ADD COLUMN IF NOT EXISTS effective_threshold INT;", ct);
+
+        await Exec(conn, @"
             UPDATE ""ETH"".signal_decision_audit
             SET candidate_direction = decision_type
             WHERE candidate_direction IS NULL
@@ -929,6 +937,43 @@ public sealed class DbMigrator : IDbMigrator
         await Exec(conn, @"
             ALTER TABLE ""ETH"".signal_decision_audit
             ADD COLUMN IF NOT EXISTS adapted_parameters_json JSONB;", ct);
+
+        await Exec(conn, @"
+            CREATE INDEX IF NOT EXISTS idx_signals_evaluation_id
+            ON ""ETH"".signals (evaluation_id);", ct);
+
+        await Exec(conn, @"
+            WITH decision_match AS (
+                SELECT DISTINCT ON (d.symbol, d.timeframe, d.bar_time_utc, d.decision_type)
+                    d.symbol,
+                    d.timeframe,
+                    d.bar_time_utc,
+                    d.decision_type,
+                    d.evaluation_id,
+                    d.market_condition_class
+                FROM ""ETH"".signal_decision_audit d
+                WHERE d.evaluation_id IS NOT NULL
+                  AND d.decision_type IN ('BUY', 'SELL')
+                ORDER BY d.symbol, d.timeframe, d.bar_time_utc, d.decision_type, d.decision_time_utc DESC
+            )
+            UPDATE ""ETH"".signals s
+            SET evaluation_id = COALESCE(s.evaluation_id, d.evaluation_id),
+                market_condition_class = COALESCE(s.market_condition_class, d.market_condition_class)
+            FROM decision_match d
+            WHERE s.symbol = d.symbol
+              AND s.timeframe = d.timeframe
+              AND s.direction = d.decision_type
+              AND s.signal_time_utc = d.bar_time_utc
+                + CASE d.timeframe
+                    WHEN '1m' THEN INTERVAL '1 minute'
+                    WHEN '5m' THEN INTERVAL '5 minutes'
+                    WHEN '15m' THEN INTERVAL '15 minutes'
+                    WHEN '30m' THEN INTERVAL '30 minutes'
+                    WHEN '1h' THEN INTERVAL '1 hour'
+                    WHEN '4h' THEN INTERVAL '4 hours'
+                    ELSE INTERVAL '0'
+                  END
+              AND (s.evaluation_id IS NULL OR s.market_condition_class IS NULL);", ct);
 
         // ─── Issue #3: Restart-safe adaptive state ───────────
         await Exec(conn, @"

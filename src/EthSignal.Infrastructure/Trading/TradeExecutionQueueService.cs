@@ -41,11 +41,12 @@ public sealed class TradeExecutionQueueService : ITradeExecutionQueueService
 
     public async Task<TradeExecutionQueueResult> EnqueueAsync(TradeExecutionRequest request, CancellationToken ct = default)
     {
-        if (IsExcludedExecutionTimeframe(request.Candidate.Timeframe))
+        if (!TradeExecutionPolicy.IsBrokerExecutionTimeframeAllowed(request.Candidate.Timeframe))
         {
             return new TradeExecutionQueueResult
             {
                 Accepted = false,
+                CreatedNewEntry = false,
                 Status = "Rejected",
                 FailureReason = "TimeframeNotAllowed",
                 Message = $"Timeframe {request.Candidate.Timeframe} is excluded from broker execution."
@@ -58,6 +59,7 @@ public sealed class TradeExecutionQueueService : ITradeExecutionQueueService
             return new TradeExecutionQueueResult
             {
                 Accepted = false,
+                CreatedNewEntry = false,
                 ExecutedTradeId = existingTrade.ExecutedTradeId,
                 Status = existingTrade.Status.ToString(),
                 FailureReason = "DuplicateExecution",
@@ -72,6 +74,7 @@ public sealed class TradeExecutionQueueService : ITradeExecutionQueueService
             return new TradeExecutionQueueResult
             {
                 Accepted = true,
+                CreatedNewEntry = false,
                 QueueEntryId = existingQueue.QueueEntryId,
                 ExecutedTradeId = existingQueue.ExecutedTradeId,
                 Status = existingQueue.Status.ToString(),
@@ -109,6 +112,7 @@ public sealed class TradeExecutionQueueService : ITradeExecutionQueueService
         return new TradeExecutionQueueResult
         {
             Accepted = true,
+            CreatedNewEntry = true,
             QueueEntryId = queueEntryId,
             Status = TradeExecutionQueueStatus.Queued.ToString(),
             Message = $"Signal {request.Candidate.SignalId} was queued for execution."
@@ -132,6 +136,16 @@ public sealed class TradeExecutionQueueService : ITradeExecutionQueueService
                 _logger.LogWarning(
                     "[TradeExecutionQueue] Recovered {RecoveredCount} stale processing queue entries back to Queued",
                     recovered);
+            }
+
+            var staleBeforeUtc = DateTimeOffset.UtcNow - TimeSpan.FromMinutes(settings.StaleWindowMinutes);
+            var expired = await _queueRepository.ExpireStaleQueuedAsync(staleBeforeUtc, ct);
+            if (expired > 0)
+            {
+                _logger.LogInformation(
+                    "[TradeExecutionQueue] Expired {ExpiredCount} stale queued execution request(s) older than the {StaleWindowMinutes}m stale window",
+                    expired,
+                    settings.StaleWindowMinutes);
             }
 
             var context = await GetDispatchContextAsync(settings, ct);
@@ -446,9 +460,6 @@ public sealed class TradeExecutionQueueService : ITradeExecutionQueueService
 
     private static bool IsRetryableTerminalStatus(ExecutedTradeStatus status)
         => status is ExecutedTradeStatus.Failed or ExecutedTradeStatus.Rejected or ExecutedTradeStatus.ValidationFailed or ExecutedTradeStatus.CloseFailed;
-
-    private static bool IsExcludedExecutionTimeframe(string? timeframe)
-        => string.Equals(timeframe?.Trim(), "1m", StringComparison.OrdinalIgnoreCase);
 
     private async Task DeferRetryAsync(QueuedTradeExecution entry, TradeExecutionResult result, CancellationToken ct)
     {

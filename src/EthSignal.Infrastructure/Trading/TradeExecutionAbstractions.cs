@@ -76,6 +76,7 @@ public interface ITradeExecutionService
 public sealed record TradeExecutionQueueResult
 {
     public bool Accepted { get; init; }
+    public bool CreatedNewEntry { get; init; }
     public long? QueueEntryId { get; init; }
     public long? ExecutedTradeId { get; init; }
     public required string Status { get; init; }
