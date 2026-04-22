@@ -133,9 +133,38 @@ public sealed class TradeAutoExecutionService : BackgroundService
                 .Select(s => _mapper.FromBlocked(s.Signal)));
         }
 
+        if (candidates.Count == 0)
+            return;
+
+        var queueSnapshot = await _queueService.GetSnapshotAsync(1, ct);
+        var queueInsertBudget = Math.Max(0, queueSnapshot.AvailableDispatchSlots - queueSnapshot.QueuedCount);
+        if (queueInsertBudget <= 0)
+        {
+            _logger.LogInformation(
+                "[TradeAutoExecution] Skipping auto-queueing because execution queue has no dispatch budget (AvailableSlots={AvailableSlots}, Queued={QueuedCount}, BrokerOpen={BrokerOpenTradeCount}, MaxOpenTrades={MaxConcurrentOpenTrades})",
+                queueSnapshot.AvailableDispatchSlots,
+                queueSnapshot.QueuedCount,
+                queueSnapshot.BrokerOpenTradeCount,
+                queueSnapshot.MaxConcurrentOpenTrades);
+            return;
+        }
+
         foreach (var candidate in candidates
                      .OrderBy(c => c.SignalTimeUtc))
         {
+            if (queueInsertBudget <= 0)
+                break;
+
+            if (!TradeExecutionPolicy.IsBrokerExecutionTimeframeAllowed(candidate.Timeframe))
+            {
+                _logger.LogInformation(
+                    "[TradeAutoExecution] Skipping {SourceType} signal {SignalId} because timeframe {Timeframe} is not broker-executable",
+                    candidate.SourceType,
+                    candidate.SignalId,
+                    candidate.Timeframe);
+                continue;
+            }
+
             if (DateTimeOffset.UtcNow - candidate.SignalTimeUtc > TimeSpan.FromMinutes(settings.StaleWindowMinutes))
             {
                 _logger.LogInformation(
@@ -159,16 +188,29 @@ public sealed class TradeAutoExecutionService : BackgroundService
                 continue;
             }
 
-            _logger.LogInformation(
-                "[TradeAutoExecution] {SourceType} signal {SignalId} entered execution queue",
-                candidate.SourceType,
-                candidate.SignalId);
-
             var result = await _queueService.EnqueueAsync(new TradeExecutionRequest
             {
                 Candidate = candidate,
                 RequestedBy = "auto-executor"
             }, ct);
+
+            if (result.Accepted && result.CreatedNewEntry)
+            {
+                queueInsertBudget--;
+                _logger.LogInformation(
+                    "[TradeAutoExecution] {SourceType} signal {SignalId} entered execution queue as entry {QueueEntryId}",
+                    candidate.SourceType,
+                    candidate.SignalId,
+                    result.QueueEntryId);
+            }
+            else if (result.Accepted)
+            {
+                _logger.LogInformation(
+                    "[TradeAutoExecution] {SourceType} signal {SignalId} is already queued as entry {QueueEntryId}",
+                    candidate.SourceType,
+                    candidate.SignalId,
+                    result.QueueEntryId);
+            }
 
             _logger.LogInformation(
                 "[TradeAutoExecution] Source={Source} SignalId={SignalId} Status={Status} Success={Success}",

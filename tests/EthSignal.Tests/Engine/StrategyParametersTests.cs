@@ -11,6 +11,7 @@ public class StrategyParametersTests
     {
         StrategyParameters.Default.MlMode.Should().Be(MlMode.SHADOW);
         StrategyParameters.Default.MlAutoActivateOnStartup.Should().BeFalse();
+        StrategyParameters.Default.DailyLossCapPercent.Should().Be(StrategyParameters.RecommendedDailyLossCapPercent);
     }
 
     [Fact]
@@ -92,5 +93,60 @@ public class StrategyParametersTests
 
         policy.IntradayMinAtrTpMultiplier.Should().Be(StrategyParameters.Default.ResolveForTimeframe("1h").ExitHigherTfMinAtrTpMultiplier);
         policy.IntradayMaxAtrTpMultiplier.Should().Be(StrategyParameters.Default.ResolveForTimeframe("1h").ExitHigherTfMaxAtrTpMultiplier);
+    }
+
+    [Fact]
+    public void EnsureRecommendedTimeframeProfiles_Hydrates_Recommended_Set_When_Profiles_Are_Empty()
+    {
+        var normalized = StrategyParameters.Default
+            .EnsureRecommendedTimeframeProfiles();
+
+        normalized.TimeframeProfiles.IsEffectivelyEmpty().Should().BeFalse();
+        normalized.ResolveForTimeframe("5m").ConfidenceBuyThreshold
+            .Should().Be(TimeframeStrategyProfileSet.Recommended.M5.ConfidenceBuyThreshold);
+    }
+
+    [Fact]
+    public void EnsureProductionSafeDefaults_Normalizes_Legacy_Daily_Loss_Cap_And_Hydrates_Timeframe_Profiles()
+    {
+        var normalized = (StrategyParameters.Default with
+        {
+            DailyLossCapPercent = decimal.MaxValue,
+            TimeframeProfiles = TimeframeStrategyProfileSet.Default
+        }).EnsureProductionSafeDefaults();
+
+        normalized.DailyLossCapPercent.Should().Be(StrategyParameters.RecommendedDailyLossCapPercent);
+        normalized.TimeframeProfiles.IsEffectivelyEmpty().Should().BeFalse();
+        normalized.ResolveForTimeframe("1h").NeutralRegimePolicy
+            .Should().Be(NeutralRegimePolicy.AllowReducedRiskEntriesInNeutral);
+        normalized.ResolveForTimeframe("1h").TargetRMultiple
+            .Should().Be(TimeframeStrategyProfileSet.Recommended.H1.TargetRMultiple);
+    }
+
+    [Fact]
+    public void AdaptiveClamp_Preserves_Base_DailyLossCap()
+    {
+        var baseParameters = StrategyParameters.Default with { DailyLossCapPercent = 4.5m };
+        var clamped = ParameterBands.Clamp(baseParameters with { ConfidenceBuyThreshold = 999 }, baseParameters);
+
+        clamped.DailyLossCapPercent.Should().Be(4.5m);
+    }
+
+    [Fact]
+    public void Recommended_Timeframe_Profiles_Allow_Reduced_Risk_Entries_In_Neutral_For_Higher_Timeframes()
+    {
+        var parameters = StrategyParameters.Default with
+        {
+            TimeframeProfiles = TimeframeStrategyProfileSet.Recommended
+        };
+
+        parameters.ResolveForTimeframe("5m").NeutralRegimePolicy
+            .Should().Be(NeutralRegimePolicy.AllowReducedRiskEntriesInNeutral);
+        parameters.ResolveForTimeframe("15m").NeutralRegimePolicy
+            .Should().Be(NeutralRegimePolicy.AllowReducedRiskEntriesInNeutral);
+        parameters.ResolveForTimeframe("1h").NeutralRegimePolicy
+            .Should().Be(NeutralRegimePolicy.AllowReducedRiskEntriesInNeutral);
+        parameters.ResolveForTimeframe("4h").NeutralRegimePolicy
+            .Should().Be(NeutralRegimePolicy.AllowReducedRiskEntriesInNeutral);
     }
 }

@@ -79,7 +79,7 @@ public static class ParameterBands
             AccountBalanceUsd = baseParams.AccountBalanceUsd,
             RiskPerTradePercent = baseParams.RiskPerTradePercent,
             HardMaxRiskPercent = baseParams.HardMaxRiskPercent,
-            DailyLossCapPercent = decimal.MaxValue,
+            DailyLossCapPercent = baseParams.DailyLossCapPercent,
             MaxConsecutiveLossesPerDay = baseParams.MaxConsecutiveLossesPerDay,
             MaxOpenPositions = baseParams.MaxOpenPositions,
             StopAtrMultiplier = baseParams.StopAtrMultiplier,

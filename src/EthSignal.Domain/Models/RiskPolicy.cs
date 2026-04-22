@@ -11,8 +11,8 @@ public sealed record RiskPolicy
     public decimal AccountBalanceUsd { get; init; } = 50m;
     public decimal RiskPercentPerTrade { get; init; } = 0.5m;
     public decimal HardMaxRiskPercent { get; init; } = 1.0m;
-    // Aligned with StrategyParameters.DailyLossCapPercent (was 2.0m, corrected to 5.0m)
-    public decimal DailyMaxDrawdownPercent { get; init; } = decimal.MaxValue;
+    // Aligned with StrategyParameters.DailyLossCapPercent.
+    public decimal DailyMaxDrawdownPercent { get; init; } = StrategyParameters.RecommendedDailyLossCapPercent;
     // Aligned with StrategyParameters.MaxConsecutiveLossesPerDay (unlimited by default)
     public int MaxConsecutiveLossesPerDay { get; init; } = int.MaxValue;
     // Aligned with StrategyParameters.MaxOpenPositions (unlimited)

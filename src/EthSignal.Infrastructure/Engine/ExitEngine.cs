@@ -119,6 +119,11 @@ public static class ExitEngine
             return Reject($"RiskPercent({policy.RiskPercentPerTrade}%) > HardMax({policy.HardMaxRiskPercent}%)");
 
         var explanation = new List<string>();
+        bool isScalp = ctx.Timeframe == "1m";
+        decimal minAtrTpMult = isScalp ? policy.ScalpMinAtrTpMultiplier : policy.IntradayMinAtrTpMultiplier;
+        decimal maxAtrTpMult = isScalp ? policy.ScalpMaxAtrTpMultiplier : policy.IntradayMaxAtrTpMultiplier;
+        decimal atrTpMin = minAtrTpMult * ctx.Atr;
+        decimal atrTpMax = maxAtrTpMult * ctx.Atr;
 
         // ═══════════════════════════════════════════════════════
         // 1. STOP LOSS — Layered calculation
@@ -159,6 +164,24 @@ public static class ExitEngine
         decimal rawStopDistance = Math.Max(atrStop, bestStructureStop);
         if (rawStopDistance <= 0) rawStopDistance = atrStop;
 
+        // On slower timeframes, a distant structure invalidation can produce a stop so
+        // wide that even the maximum ATR-realistic TP band can never satisfy minimum
+        // R:R. In that case, fall back to the ATR-viable stop instead of hard-blocking
+        // the setup purely because the nearest swing structure is too far away.
+        if (!isScalp && bestStructureStop > 0 && policy.MinRewardToRisk > 0)
+        {
+            decimal maxViableStopFromAtrBand = atrTpMax / policy.MinRewardToRisk;
+            if (maxViableStopFromAtrBand > 0
+                && bestStructureStop > maxViableStopFromAtrBand
+                && atrStop > 0
+                && atrStop <= maxViableStopFromAtrBand)
+            {
+                rawStopDistance = atrStop;
+                explanation.Add(
+                    $"Structure stop {bestStructureStop:F4} exceeds ATR-viable stop {maxViableStopFromAtrBand:F4}; using ATR stop for {ctx.Timeframe}");
+            }
+        }
+
         // Layer 4: Spread/slippage buffer
         decimal executionBuffer = ctx.EntryPrice * policy.SpreadSlippageBufferPct;
         decimal stopWithBuffer = rawStopDistance + executionBuffer;
@@ -195,12 +218,7 @@ public static class ExitEngine
         // ═══════════════════════════════════════════════════════
 
         // Layer 1: ATR-based TP projection
-        bool isScalp = ctx.Timeframe == "1m";
-        decimal minAtrTpMult = isScalp ? policy.ScalpMinAtrTpMultiplier : policy.IntradayMinAtrTpMultiplier;
-        decimal maxAtrTpMult = isScalp ? policy.ScalpMaxAtrTpMultiplier : policy.IntradayMaxAtrTpMultiplier;
         decimal atrTpDistance = policy.DefaultRewardToRisk * finalStopDistance;
-        decimal atrTpMin = minAtrTpMult * ctx.Atr;
-        decimal atrTpMax = maxAtrTpMult * ctx.Atr;
         explanation.Add($"ATR TP range: [{atrTpMin:F4}–{atrTpMax:F4}]");
 
         // Start with the R:R target, but keep it inside the ATR-realistic band.
@@ -383,36 +401,40 @@ public static class ExitEngine
     }
 
     /// <summary>Build an ExitPolicy from StrategyParameters.</summary>
-    public static ExitPolicy BuildPolicy(StrategyParameters p) => new()
+    public static ExitPolicy BuildPolicy(StrategyParameters p)
     {
-        AtrMultiplier = p.StopAtrMultiplier,
-        SpreadSlippageBufferPct = p.LiveEntrySlippageBufferPct,
-        MinStopDistancePct = p.MinStopDistancePct,
-        MaxStopDistancePct = p.ExitMaxStopDistancePct,
-        MinRewardToRisk = p.MinRiskRewardAfterRounding,
-        DefaultRewardToRisk = p.TargetRMultiple,
-        Tp1RMultiple = p.ExitTp1RMultiple,
-        Tp2RMultiple = p.ExitTp2RMultiple,
-        Tp3RMultiple = p.ExitTp3RMultiple,
-        TrendingTpMultiplier = p.ExitTrendingTpMultiplier,
-        TrendingSlMultiplier = p.ExitTrendingSlMultiplier,
-        RangingTpMultiplier = p.ExitRangingTpMultiplier,
-        RangingSlMultiplier = p.ExitRangingSlMultiplier,
-        HighConfidenceTpBoost = p.ExitHighConfidenceTpBoost,
-        LowConfidenceTpReduce = p.ExitLowConfidenceTpReduce,
-        HighConfidenceThreshold = p.ExitHighConfidenceThreshold,
-        LowConfidenceThreshold = p.ExitLowConfidenceThreshold,
-        ScalpMinAtrTpMultiplier = p.ExitScalpMinAtrTpMultiplier,
-        ScalpMaxAtrTpMultiplier = p.ExitScalpMaxAtrTpMultiplier,
-        IntradayMinAtrTpMultiplier = p.ExitIntradayMinAtrTpMultiplier,
-        IntradayMaxAtrTpMultiplier = p.ExitIntradayMaxAtrTpMultiplier,
-        StructureBufferAtrMultiplier = p.ExitStructureBufferAtrMultiplier,
-        AccountBalanceUsd = p.AccountBalanceUsd,
-        RiskPercentPerTrade = p.RiskPerTradePercent,
-        HardMaxRiskPercent = p.HardMaxRiskPercent,
-        MinAtrThreshold = p.MinAtrThreshold,
-        MaxSpreadPct = p.MaxSpreadPct
-    };
+        var effectiveMinRewardToRisk = ResolveMinRewardToRisk(p.MinRiskRewardAfterRounding, p.TargetRMultiple);
+        return new ExitPolicy
+        {
+            AtrMultiplier = p.StopAtrMultiplier,
+            SpreadSlippageBufferPct = p.LiveEntrySlippageBufferPct,
+            MinStopDistancePct = p.MinStopDistancePct,
+            MaxStopDistancePct = p.ExitMaxStopDistancePct,
+            MinRewardToRisk = effectiveMinRewardToRisk,
+            DefaultRewardToRisk = p.TargetRMultiple,
+            Tp1RMultiple = p.ExitTp1RMultiple,
+            Tp2RMultiple = p.ExitTp2RMultiple,
+            Tp3RMultiple = p.ExitTp3RMultiple,
+            TrendingTpMultiplier = p.ExitTrendingTpMultiplier,
+            TrendingSlMultiplier = p.ExitTrendingSlMultiplier,
+            RangingTpMultiplier = p.ExitRangingTpMultiplier,
+            RangingSlMultiplier = p.ExitRangingSlMultiplier,
+            HighConfidenceTpBoost = p.ExitHighConfidenceTpBoost,
+            LowConfidenceTpReduce = p.ExitLowConfidenceTpReduce,
+            HighConfidenceThreshold = p.ExitHighConfidenceThreshold,
+            LowConfidenceThreshold = p.ExitLowConfidenceThreshold,
+            ScalpMinAtrTpMultiplier = p.ExitScalpMinAtrTpMultiplier,
+            ScalpMaxAtrTpMultiplier = p.ExitScalpMaxAtrTpMultiplier,
+            IntradayMinAtrTpMultiplier = p.ExitIntradayMinAtrTpMultiplier,
+            IntradayMaxAtrTpMultiplier = p.ExitIntradayMaxAtrTpMultiplier,
+            StructureBufferAtrMultiplier = p.ExitStructureBufferAtrMultiplier,
+            AccountBalanceUsd = p.AccountBalanceUsd,
+            RiskPercentPerTrade = p.RiskPerTradePercent,
+            HardMaxRiskPercent = p.HardMaxRiskPercent,
+            MinAtrThreshold = p.MinAtrThreshold,
+            MaxSpreadPct = p.MaxSpreadPct
+        };
+    }
 
     public static ExitPolicy BuildPolicy(StrategyParameters p, string timeframe)
     {
@@ -424,6 +446,9 @@ public static class ExitEngine
         var intradayMaxAtrTpMultiplier = bucket == TimeframeProfileBucket.Long
             ? resolved.ExitHigherTfMaxAtrTpMultiplier
             : resolved.ExitIntradayMaxAtrTpMultiplier;
+        var effectiveMinRewardToRisk = ResolveMinRewardToRisk(
+            resolved.MinRiskRewardAfterRounding,
+            resolved.TargetRMultiple);
 
         return new ExitPolicy
         {
@@ -431,7 +456,7 @@ public static class ExitEngine
             SpreadSlippageBufferPct = resolved.LiveEntrySlippageBufferPct,
             MinStopDistancePct = resolved.MinStopDistancePct,
             MaxStopDistancePct = resolved.ExitMaxStopDistancePct,
-            MinRewardToRisk = resolved.MinRiskRewardAfterRounding,
+            MinRewardToRisk = effectiveMinRewardToRisk,
             DefaultRewardToRisk = resolved.TargetRMultiple,
             Tp1RMultiple = resolved.ExitTp1RMultiple,
             Tp2RMultiple = resolved.ExitTp2RMultiple,
@@ -465,6 +490,7 @@ public static class ExitEngine
         return policy with
         {
             AtrMultiplier = resolved.ScalpStopAtrMultiplier,
+            MinRewardToRisk = ResolveMinRewardToRisk(policy.MinRewardToRisk, resolved.ScalpTargetRMultiple),
             DefaultRewardToRisk = resolved.ScalpTargetRMultiple,
             MinAtrThreshold = resolved.ScalpMinAtr,
             // Tighter TPs for scalps
@@ -483,4 +509,12 @@ public static class ExitEngine
         Explanation = reason,
         RejectReason = reason
     };
+
+    private static decimal ResolveMinRewardToRisk(decimal desiredMinRewardToRisk, decimal targetRewardToRisk)
+    {
+        if (targetRewardToRisk <= 0)
+            return desiredMinRewardToRisk;
+
+        return Math.Min(desiredMinRewardToRisk, targetRewardToRisk);
+    }
 }

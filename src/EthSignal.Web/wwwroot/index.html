@@ -1320,6 +1320,12 @@
                             <label style="font-size:.75rem;color:var(--text-sub);white-space:nowrap">To</label>
                             <input type="date" class="filter-input" id="filter-date-to" style="width:130px"
                                 onchange="onFilterChange()">
+                            <select class="filter-input" id="filter-source" style="width:120px" onchange="onFilterChange()">
+                                <option value="">All Source</option>
+                                <option value="Recommended">Recommended</option>
+                                <option value="Generated">Generated</option>
+                                <option value="Blocked">Blocked</option>
+                            </select>
                             <select class="filter-input" id="filter-tf" style="width:70px" onchange="onFilterChange()">
                                 <option value="">All TF</option>
                                 <option value="1m">1m</option>
@@ -1340,6 +1346,9 @@
                                 <option value="WIN">WIN</option>
                                 <option value="LOSS">LOSS</option>
                                 <option value="OPEN">OPEN</option>
+                                <option value="PENDING">PENDING</option>
+                                <option value="FAILED">FAILED</option>
+                                <option value="CLOSED">CLOSED</option>
                                 <option value="EXPIRED">EXPIRED</option>
                             </select>
                         </div>
@@ -1351,6 +1360,8 @@
                                     <tr>
                                         <th>Signal ID</th>
                                         <th data-col="time" onclick="sortHistory('time')">Time (Amman) <span
+                                                class="sort-icon"></span></th>
+                                        <th data-col="source" onclick="sortHistory('source')">Source <span
                                                 class="sort-icon"></span></th>
                                         <th data-col="tf" onclick="sortHistory('tf')">TF <span class="sort-icon"></span>
                                         </th>
@@ -1379,210 +1390,6 @@
                             <button id="prev-page" onclick="changePage(-1)" disabled>&laquo; Prev</button>
                             <span id="page-info">Page 1</span>
                             <button id="next-page" onclick="changePage(1)">Next &raquo;</button>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Row 9: Blocked Signals History (full width) -->
-        <div class="row g-2 mt-1">
-            <div class="col-12">
-                <div class="card">
-                    <div class="card-header d-flex justify-content-between align-items-center">
-                        <span>Blocked Signals History</span>
-                        <small style="color:var(--text-sub)">Hypothetical recommendation levels reconstructed from blocked directional decisions</small>
-                    </div>
-                    <div class="card-body py-2" style="border-bottom:1px solid var(--border);font-size:.8rem">
-                        <div class="row text-center">
-                            <div class="col-2"><span class="stat-label">Total</span><br><span class="stat-val"
-                                    id="blocked-total" style="color:var(--text)">--</span></div>
-                            <div class="col-2"><span class="stat-label">Wins</span><br><span class="stat-val"
-                                    id="blocked-wins" style="color:var(--green)">--</span></div>
-                            <div class="col-2"><span class="stat-label">Losses</span><br><span class="stat-val"
-                                    id="blocked-losses" style="color:var(--red)">--</span></div>
-                            <div class="col-2"><span class="stat-label">Win Rate</span><br><span class="stat-val"
-                                    id="blocked-winrate" style="color:var(--text)">--</span></div>
-                            <div class="col-2"><span class="stat-label">Avg R</span><br><span class="stat-val"
-                                    id="blocked-avgr" style="color:var(--text)">--</span></div>
-                            <div class="col-2"><span class="stat-label">PF</span><br><span class="stat-val"
-                                    id="blocked-pf" style="color:var(--text)">--</span></div>
-                        </div>
-                    </div>
-                    <div class="card-header d-flex justify-content-between align-items-center" style="border-top:none">
-                        <span style="font-size:.78rem;color:var(--text-sub)">Blocked Recommendation Records</span>
-                        <div class="d-flex gap-2 align-items-center">
-                            <label style="font-size:.75rem;color:var(--text-sub);white-space:nowrap">From</label>
-                            <input type="date" class="filter-input" id="blocked-filter-date-from" style="width:130px"
-                                onchange="onBlockedFilterChange()">
-                            <label style="font-size:.75rem;color:var(--text-sub);white-space:nowrap">To</label>
-                            <input type="date" class="filter-input" id="blocked-filter-date-to" style="width:130px"
-                                onchange="onBlockedFilterChange()">
-                            <select class="filter-input" id="blocked-filter-tf" style="width:70px"
-                                onchange="onBlockedFilterChange()">
-                                <option value="">All TF</option>
-                                <option value="1m">1m</option>
-                                <option value="5m">5m</option>
-                                <option value="15m">15m</option>
-                                <option value="30m">30m</option>
-                                <option value="1h">1h</option>
-                                <option value="4h">4h</option>
-                            </select>
-                            <select class="filter-input" id="blocked-filter-dir" style="width:70px"
-                                onchange="onBlockedFilterChange()">
-                                <option value="">All Dir</option>
-                                <option value="BUY">BUY</option>
-                                <option value="SELL">SELL</option>
-                            </select>
-                            <select class="filter-input" id="blocked-filter-outcome" style="width:80px"
-                                onchange="onBlockedFilterChange()">
-                                <option value="">All</option>
-                                <option value="WIN">WIN</option>
-                                <option value="LOSS">LOSS</option>
-                                <option value="OPEN">OPEN</option>
-                                <option value="PENDING">PENDING</option>
-                                <option value="EXPIRED">EXPIRED</option>
-                            </select>
-                        </div>
-                    </div>
-                    <div class="card-body p-0">
-                        <div class="signal-tbl-wrap">
-                            <table class="table table-sm table-dark table-hover mb-0" id="blocked-history-table">
-                                <thead>
-                                    <tr>
-                                        <th>Signal ID</th>
-                                        <th data-col="time" onclick="sortBlockedHistory('time')">Time (Amman) <span
-                                                class="sort-icon"></span></th>
-                                        <th data-col="tf" onclick="sortBlockedHistory('tf')">TF <span
-                                                class="sort-icon"></span></th>
-                                        <th data-col="dir" onclick="sortBlockedHistory('dir')">Dir <span
-                                                class="sort-icon"></span></th>
-                                        <th data-col="entry" onclick="sortBlockedHistory('entry')">Entry <span
-                                                class="sort-icon"></span></th>
-                                        <th data-col="tp" onclick="sortBlockedHistory('tp')">TP <span
-                                                class="sort-icon"></span></th>
-                                        <th data-col="sl" onclick="sortBlockedHistory('sl')">SL <span
-                                                class="sort-icon"></span></th>
-                                        <th data-col="score" onclick="sortBlockedHistory('score')">Score <span
-                                                class="sort-icon"></span></th>
-                                        <th>Block Reason</th>
-                                        <th data-col="outcome" onclick="sortBlockedHistory('outcome')">Result <span
-                                                class="sort-icon"></span></th>
-                                        <th data-col="pnl" onclick="sortBlockedHistory('pnl')">PnL (R) <span
-                                                class="sort-icon"></span></th>
-                                        <th>Expiry</th>
-                                        <th>Execute</th>
-                                    </tr>
-                                </thead>
-                                <tbody id="blocked-signal-history"></tbody>
-                            </table>
-                        </div>
-                        <div class="pagination-controls">
-                            <button id="blocked-prev-page" onclick="changeBlockedPage(-1)" disabled>&laquo; Prev</button>
-                            <span id="blocked-page-info">Page 1</span>
-                            <button id="blocked-next-page" onclick="changeBlockedPage(1)">Next &raquo;</button>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Row 10: Generated Signals History (full width) -->
-        <div class="row g-2 mt-1">
-            <div class="col-12">
-                <div class="card">
-                    <div class="card-header d-flex justify-content-between align-items-center">
-                        <span>Generated Signals History</span>
-                        <small style="color:var(--text-sub)">Last 24h directional decision outcomes, aligned to Decision Summary &gt; Generated</small>
-                    </div>
-                    <div class="card-body py-2" style="border-bottom:1px solid var(--border);font-size:.8rem">
-                        <div class="row text-center">
-                            <div class="col-2"><span class="stat-label">Total</span><br><span class="stat-val"
-                                    id="generated-total" style="color:var(--text)">--</span></div>
-                            <div class="col-2"><span class="stat-label">Wins</span><br><span class="stat-val"
-                                    id="generated-wins" style="color:var(--green)">--</span></div>
-                            <div class="col-2"><span class="stat-label">Losses</span><br><span class="stat-val"
-                                    id="generated-losses" style="color:var(--red)">--</span></div>
-                            <div class="col-2"><span class="stat-label">Win Rate</span><br><span class="stat-val"
-                                    id="generated-winrate" style="color:var(--text)">--</span></div>
-                            <div class="col-2"><span class="stat-label">Avg R</span><br><span class="stat-val"
-                                    id="generated-avgr" style="color:var(--text)">--</span></div>
-                            <div class="col-2"><span class="stat-label">PF</span><br><span class="stat-val"
-                                    id="generated-pf" style="color:var(--text)">--</span></div>
-                        </div>
-                    </div>
-                    <div class="card-header d-flex justify-content-between align-items-center" style="border-top:none">
-                        <span style="font-size:.78rem;color:var(--text-sub)">Generated Recommendation Records (24h)</span>
-                        <div class="d-flex gap-2 align-items-center">
-                            <label style="font-size:.75rem;color:var(--text-sub);white-space:nowrap">From</label>
-                            <input type="date" class="filter-input" id="generated-filter-date-from" style="width:130px"
-                                onchange="onGeneratedFilterChange()">
-                            <label style="font-size:.75rem;color:var(--text-sub);white-space:nowrap">To</label>
-                            <input type="date" class="filter-input" id="generated-filter-date-to" style="width:130px"
-                                onchange="onGeneratedFilterChange()">
-                            <select class="filter-input" id="generated-filter-tf" style="width:70px"
-                                onchange="onGeneratedFilterChange()">
-                                <option value="">All TF</option>
-                                <option value="1m">1m</option>
-                                <option value="5m">5m</option>
-                                <option value="15m">15m</option>
-                                <option value="30m">30m</option>
-                                <option value="1h">1h</option>
-                                <option value="4h">4h</option>
-                            </select>
-                            <select class="filter-input" id="generated-filter-dir" style="width:70px"
-                                onchange="onGeneratedFilterChange()">
-                                <option value="">All Dir</option>
-                                <option value="BUY">BUY</option>
-                                <option value="SELL">SELL</option>
-                            </select>
-                            <select class="filter-input" id="generated-filter-outcome" style="width:80px"
-                                onchange="onGeneratedFilterChange()">
-                                <option value="">All</option>
-                                <option value="WIN">WIN</option>
-                                <option value="LOSS">LOSS</option>
-                                <option value="OPEN">OPEN</option>
-                                <option value="PENDING">PENDING</option>
-                                <option value="EXPIRED">EXPIRED</option>
-                            </select>
-                        </div>
-                    </div>
-                    <div class="card-body p-0">
-                        <div class="signal-tbl-wrap">
-                            <table class="table table-sm table-dark table-hover mb-0" id="generated-history-table">
-                                <thead>
-                                    <tr>
-                                        <th>Signal ID</th>
-                                        <th data-col="time" onclick="sortGeneratedHistory('time')">Time (Amman) <span
-                                                class="sort-icon"></span></th>
-                                        <th data-col="tf" onclick="sortGeneratedHistory('tf')">TF <span
-                                                class="sort-icon"></span></th>
-                                        <th data-col="dir" onclick="sortGeneratedHistory('dir')">Dir <span
-                                                class="sort-icon"></span></th>
-                                        <th data-col="entry" onclick="sortGeneratedHistory('entry')">Entry <span
-                                                class="sort-icon"></span></th>
-                                        <th data-col="tp" onclick="sortGeneratedHistory('tp')">TP <span
-                                                class="sort-icon"></span></th>
-                                        <th data-col="sl" onclick="sortGeneratedHistory('sl')">SL <span
-                                                class="sort-icon"></span></th>
-                                        <th data-col="score" onclick="sortGeneratedHistory('score')">Score <span
-                                                class="sort-icon"></span></th>
-                                        <th>Exit Model</th>
-                                        <th data-col="outcome" onclick="sortGeneratedHistory('outcome')">Result <span
-                                                class="sort-icon"></span></th>
-                                        <th data-col="pnl" onclick="sortGeneratedHistory('pnl')">PnL (R) <span
-                                                class="sort-icon"></span></th>
-                                        <th>Expiry</th>
-                                        <th>Execute</th>
-                                    </tr>
-                                </thead>
-                                <tbody id="generated-signal-history"></tbody>
-                            </table>
-                        </div>
-                        <div class="pagination-controls">
-                            <button id="generated-prev-page" onclick="changeGeneratedPage(-1)" disabled>&laquo; Prev</button>
-                            <span id="generated-page-info">Page 1</span>
-                            <button id="generated-next-page" onclick="changeGeneratedPage(1)">Next &raquo;</button>
                         </div>
                     </div>
                 </div>

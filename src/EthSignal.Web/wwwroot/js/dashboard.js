@@ -685,18 +685,6 @@ let currentPage = 1;
 const PAGE_SIZE = 30;
 let sortCol = 'time';
 let sortDir = 'desc';
-let blockedHistoryData = [];
-let blockedCurrentPage = 1;
-const BLOCKED_PAGE_SIZE = 20;
-let blockedHistoryTotal = 0;
-let blockedSortCol = 'time';
-let blockedSortDir = 'desc';
-let generatedHistoryData = [];
-let generatedCurrentPage = 1;
-const GENERATED_PAGE_SIZE = 20;
-let generatedHistoryTotal = 0;
-let generatedSortCol = 'time';
-let generatedSortDir = 'desc';
 let executedTradesData = [];
 let executedTradesCurrentPage = 1;
 const EXECUTED_TRADES_PAGE_SIZE = 25;
@@ -705,41 +693,32 @@ let tradeQueueData = null;
 let historyTotal = 0;
 
 async function loadHistory() {
-    const data = await fetchJson(`/api/signals/history?limit=${PAGE_SIZE}&page=${currentPage}`);
+    const params = new URLSearchParams({
+        limit: String(PAGE_SIZE),
+        page: String(currentPage),
+        sort: sortCol,
+        sortDir
+    });
+
+    const source = $('filter-source')?.value;
+    const timeframe = $('filter-tf')?.value;
+    const direction = $('filter-dir')?.value;
+    const outcome = $('filter-outcome')?.value;
+    const dateFrom = $('filter-date-from')?.value;
+    const dateTo = $('filter-date-to')?.value;
+
+    if (source) params.set('source', source);
+    if (timeframe) params.set('timeframe', timeframe);
+    if (direction) params.set('direction', direction);
+    if (outcome) params.set('outcome', outcome);
+    if (dateFrom) params.set('from', dateFrom);
+    if (dateTo) params.set('to', dateTo);
+
+    const data = await fetchJson(`/api/signals/history?${params.toString()}`);
     if (!data) return;
     historyData = data.signals || [];
     historyTotal = data.total || 0;
     renderHistory();
-}
-
-async function loadBlockedHistory() {
-    const data = await fetchJson(`/api/blocked-signals/history?limit=${BLOCKED_PAGE_SIZE}&page=${blockedCurrentPage}`);
-    if (!data) return;
-    blockedHistoryData = data.signals || [];
-    blockedHistoryTotal = data.total || 0;
-    const stats = data.stats || {};
-    if ($('blocked-total')) $('blocked-total').textContent = stats.totalSignals ?? data.total ?? '--';
-    if ($('blocked-wins')) $('blocked-wins').textContent = stats.wins ?? '--';
-    if ($('blocked-losses')) $('blocked-losses').textContent = stats.losses ?? '--';
-    if ($('blocked-winrate')) $('blocked-winrate').textContent = stats.winRate != null ? fmtPct(stats.winRate) : '--';
-    if ($('blocked-avgr')) $('blocked-avgr').textContent = stats.averageR != null ? `${fmt(stats.averageR, 2)}R` : '--';
-    if ($('blocked-pf')) $('blocked-pf').textContent = stats.profitFactor != null ? fmt(stats.profitFactor, 1) : '--';
-    renderBlockedHistory();
-}
-
-async function loadGeneratedHistory() {
-    const data = await fetchJson(`/api/generated-signals/history?limit=${GENERATED_PAGE_SIZE}&page=${generatedCurrentPage}`);
-    if (!data) return;
-    generatedHistoryData = data.signals || [];
-    generatedHistoryTotal = data.total || 0;
-    const stats = data.stats || {};
-    if ($('generated-total')) $('generated-total').textContent = stats.totalSignals ?? data.total ?? '--';
-    if ($('generated-wins')) $('generated-wins').textContent = stats.wins ?? '--';
-    if ($('generated-losses')) $('generated-losses').textContent = stats.losses ?? '--';
-    if ($('generated-winrate')) $('generated-winrate').textContent = stats.winRate != null ? fmtPct(stats.winRate) : '--';
-    if ($('generated-avgr')) $('generated-avgr').textContent = stats.averageR != null ? `${fmt(stats.averageR, 2)}R` : '--';
-    if ($('generated-pf')) $('generated-pf').textContent = stats.profitFactor != null ? fmt(stats.profitFactor, 1) : '--';
-    renderGeneratedHistory();
 }
 
 function onFilterChange() {
@@ -798,11 +777,15 @@ function historyExecutionLabel(status, pendingLabel) {
 }
 
 function getOutcomeLabel(item) {
-    const executionLabel = historyExecutionLabel(item.execution?.status, 'OPEN');
+    const pendingLabel = item.signal?.sourceType === 'Recommended' ? 'OPEN' : 'PENDING';
+    const executionLabel = historyExecutionLabel(item.execution?.status, pendingLabel);
     if (executionLabel) return executionLabel;
     if (item.outcome?.outcomeLabel) return item.outcome.outcomeLabel;
-    if (item.signal?.status === 'OPEN') return 'OPEN';
-    return item.signal?.status || 'OPEN';
+    if (item.signal?.sourceType === 'Recommended') {
+        if (item.signal?.status === 'OPEN') return 'OPEN';
+        return item.signal?.status || 'OPEN';
+    }
+    return 'PENDING';
 }
 
 async function executeCandidate(path, label) {
@@ -814,75 +797,32 @@ async function executeCandidate(path, label) {
             alert(payload?.message || payload?.failureReason || payload?.error || `Execution failed (${response.status})`);
             return;
         }
-        await Promise.all([loadExecutedTrades(), refreshTradingSummary(), loadTradeQueue()]);
+        await Promise.all([loadExecutedTrades(), refreshTradingSummary(), loadTradeQueue(), loadHistory()]);
         alert(payload?.message || 'Execution request submitted.');
     } catch (e) {
         alert(`Execution failed: ${e.message}`);
     }
 }
 
-function applyClientFilters(items) {
-    const tfF = $('filter-tf').value;
-    const dirF = $('filter-dir').value;
-    const outcomeF = $('filter-outcome').value;
-    const dateFrom = $('filter-date-from').value;
-    const dateTo = $('filter-date-to').value;
-    return items.filter(item => {
-        if (tfF && item.signal.timeframe !== tfF) return false;
-        if (dirF && item.signal.direction !== dirF) return false;
-        if (outcomeF) {
-            const lbl = getOutcomeLabel(item);
-            if (outcomeF === 'OPEN' && lbl !== 'OPEN') return false;
-            if (outcomeF !== 'OPEN' && lbl !== outcomeF) return false;
-        }
-        if (dateFrom || dateTo) {
-            const signalDate = new Date(item.signal.signalTimeUtc).toLocaleDateString('en-CA', { timeZone: AMMAN_TZ });
-            if (dateFrom && signalDate < dateFrom) return false;
-            if (dateTo && signalDate > dateTo) return false;
-        }
-        return true;
-    });
-}
-
-function applySorting(items) {
-    const dir = sortDir === 'asc' ? 1 : -1;
-    return [...items].sort((a, b) => {
-        let va, vb;
-        switch (sortCol) {
-            case 'time': va = new Date(a.signal.signalTimeUtc); vb = new Date(b.signal.signalTimeUtc); break;
-            case 'tf': va = a.signal.timeframe; vb = b.signal.timeframe; break;
-            case 'dir': va = a.signal.direction; vb = b.signal.direction; break;
-            case 'entry': va = a.signal.entryPrice; vb = b.signal.entryPrice; break;
-            case 'tp': va = a.signal.tpPrice; vb = b.signal.tpPrice; break;
-            case 'sl': va = a.signal.slPrice; vb = b.signal.slPrice; break;
-            case 'score': va = a.signal.confidenceScore; vb = b.signal.confidenceScore; break;
-            case 'outcome': va = getOutcomeLabel(a); vb = getOutcomeLabel(b); break;
-            case 'pnl': va = a.outcome?.pnlR ?? 0; vb = b.outcome?.pnlR ?? 0; break;
-            default: return 0;
-        }
-        if (va < vb) return -dir;
-        if (va > vb) return dir;
-        return 0;
-    });
-}
-
 function sortHistory(col) {
     if (sortCol === col) sortDir = sortDir === 'asc' ? 'desc' : 'asc';
     else { sortCol = col; sortDir = col === 'time' ? 'desc' : 'asc'; }
-    // Update sort icons
-    document.querySelectorAll('#history-table thead th').forEach(th => {
-        const icon = th.querySelector('.sort-icon');
-        if (icon) icon.textContent = th.dataset.col === col ? (sortDir === 'asc' ? '▲' : '▼') : '';
-    });
-    renderHistory();
+    loadHistory().catch(() => { });
 }
 
 function renderHistory() {
-    const filtered = applyClientFilters(historyData);
-    const sorted = applySorting(filtered);
     const totalPages = Math.max(1, Math.ceil(historyTotal / PAGE_SIZE));
-    if (currentPage > totalPages) currentPage = totalPages;
-    const pageItems = sorted;
+    if (currentPage > totalPages) {
+        currentPage = totalPages;
+        loadHistory().catch(() => { });
+        return;
+    }
+    document.querySelectorAll('#history-table thead th').forEach(th => {
+        const icon = th.querySelector('.sort-icon');
+        if (icon) icon.textContent = th.dataset.col === sortCol ? (sortDir === 'asc' ? '▲' : '▼') : '';
+    });
+
+    const pageItems = historyData;
     const tbody = $('signal-history');
     tbody.innerHTML = '';
     const now = Date.now();
@@ -896,11 +836,11 @@ function renderHistory() {
         const pnl = o?.pnlR != null ? (o.pnlR >= 0 ? '+' : '') + Number(o.pnlR).toFixed(2) + 'R' : '--';
         const pnlCls = o?.pnlR > 0 ? 'buy' : o?.pnlR < 0 ? 'sell' : '';
 
-        // Expiry timer
         let expiryHtml;
-        if (lbl === 'OPEN') {
-            const expiryMs = computeExpiryTime(s.signalTimeUtc, s.timeframe) - now;
-            expiryHtml = `<span class="expiry-timer" data-expiry="${computeExpiryTime(s.signalTimeUtc, s.timeframe)}">${formatCountdown(expiryMs)}</span>`;
+        const expiryAt = s.expiryTimeUtc ? new Date(s.expiryTimeUtc).getTime() : computeExpiryTime(s.signalTimeUtc, s.timeframe);
+        if (lbl === 'OPEN' || lbl === 'PENDING') {
+            const expiryMs = expiryAt - now;
+            expiryHtml = `<span class="expiry-timer" data-expiry="${expiryAt}">${formatCountdown(expiryMs)}</span>`;
         } else if (o?.closedAtUtc) {
             expiryHtml = `<span class="expiry-timer expired">${toAmmanShort(o.closedAtUtc)}</span>`;
         } else {
@@ -911,6 +851,7 @@ function renderHistory() {
         tr.innerHTML = `
             <td style="font-size:.7rem;font-family:monospace;color:var(--text)">${s.signalId ?? '--'}</td>
             <td>${toAmmanShort(s.signalTimeUtc)}</td>
+            <td><span class="badge badge-neutral" style="font-size:.7rem">${s.source || s.sourceType || '--'}</span></td>
             <td><span class="badge badge-neutral" style="font-size:.7rem">${s.timeframe}</span></td>
             <td class="${cls}">${s.direction}</td>
             <td>${fmt(s.entryPrice)}</td>
@@ -920,11 +861,10 @@ function renderHistory() {
             <td><span class="badge ${oCls}" style="font-size:.72rem">${lbl}</span></td>
             <td class="${pnlCls}">${pnl}</td>
             <td>${expiryHtml}</td>
-            <td><button class="btn btn-sm btn-outline-primary" onclick="executeCandidate('/api/executed-trades/execute-signal/${s.signalId}', 'recommended signal')">Execute</button></td>`;
+            <td><button class="btn btn-sm btn-outline-primary" onclick="executeCandidate('/api/executed-trades/execute-history/${encodeURIComponent(s.sourceType || s.source)}/${s.signalId}', '${String(s.source || s.sourceType || 'signal').toLowerCase()} signal')">Execute</button></td>`;
         tbody.appendChild(tr);
     }
 
-    // Pagination
     $('page-info').textContent = `Page ${currentPage} of ${totalPages} (${historyTotal} signals total)`;
     $('prev-page').disabled = currentPage <= 1;
     $('next-page').disabled = currentPage >= totalPages;
@@ -933,251 +873,6 @@ function renderHistory() {
 function changePage(delta) {
     currentPage = Math.max(1, currentPage + delta);
     loadHistory().catch(() => { });
-}
-
-function getBlockedOutcomeLabel(item) {
-    const executionLabel = historyExecutionLabel(item.execution?.status, 'PENDING');
-    if (executionLabel) return executionLabel;
-    return item.outcome?.outcomeLabel || 'PENDING';
-}
-
-function onBlockedFilterChange() {
-    blockedCurrentPage = 1;
-    loadBlockedHistory().catch(() => { });
-}
-
-function applyBlockedFilters(items) {
-    const tfF = $('blocked-filter-tf').value;
-    const dirF = $('blocked-filter-dir').value;
-    const outcomeF = $('blocked-filter-outcome').value;
-    const dateFrom = $('blocked-filter-date-from').value;
-    const dateTo = $('blocked-filter-date-to').value;
-    return items.filter(item => {
-        const s = item.signal;
-        if (tfF && s.timeframe !== tfF) return false;
-        if (dirF && s.direction !== dirF) return false;
-        if (outcomeF && getBlockedOutcomeLabel(item) !== outcomeF) return false;
-        if (dateFrom || dateTo) {
-            const signalDate = new Date(s.signalTimeUtc).toLocaleDateString('en-CA', { timeZone: AMMAN_TZ });
-            if (dateFrom && signalDate < dateFrom) return false;
-            if (dateTo && signalDate > dateTo) return false;
-        }
-        return true;
-    });
-}
-
-function applyBlockedSorting(items) {
-    const dir = blockedSortDir === 'asc' ? 1 : -1;
-    return [...items].sort((a, b) => {
-        let va, vb;
-        switch (blockedSortCol) {
-            case 'time': va = new Date(a.signal.signalTimeUtc); vb = new Date(b.signal.signalTimeUtc); break;
-            case 'tf': va = a.signal.timeframe; vb = b.signal.timeframe; break;
-            case 'dir': va = a.signal.direction; vb = b.signal.direction; break;
-            case 'entry': va = a.signal.entryPrice; vb = b.signal.entryPrice; break;
-            case 'tp': va = a.signal.tpPrice; vb = b.signal.tpPrice; break;
-            case 'sl': va = a.signal.slPrice; vb = b.signal.slPrice; break;
-            case 'score': va = a.signal.confidenceScore; vb = b.signal.confidenceScore; break;
-            case 'outcome': va = getBlockedOutcomeLabel(a); vb = getBlockedOutcomeLabel(b); break;
-            case 'pnl': va = a.outcome?.pnlR ?? 0; vb = b.outcome?.pnlR ?? 0; break;
-            default: return 0;
-        }
-        if (va < vb) return -dir;
-        if (va > vb) return dir;
-        return 0;
-    });
-}
-
-function sortBlockedHistory(col) {
-    if (blockedSortCol === col) blockedSortDir = blockedSortDir === 'asc' ? 'desc' : 'asc';
-    else { blockedSortCol = col; blockedSortDir = col === 'time' ? 'desc' : 'asc'; }
-    document.querySelectorAll('#blocked-history-table thead th').forEach(th => {
-        const icon = th.querySelector('.sort-icon');
-        if (icon) icon.textContent = th.dataset.col === col ? (blockedSortDir === 'asc' ? '▲' : '▼') : '';
-    });
-    renderBlockedHistory();
-}
-
-function renderBlockedHistory() {
-    const filtered = applyBlockedFilters(blockedHistoryData);
-    const sorted = applyBlockedSorting(filtered);
-    const totalPages = Math.max(1, Math.ceil(blockedHistoryTotal / BLOCKED_PAGE_SIZE));
-    if (blockedCurrentPage > totalPages) blockedCurrentPage = totalPages;
-    const pageItems = sorted;
-    const tbody = $('blocked-signal-history');
-    if (!tbody) return;
-    tbody.innerHTML = '';
-    const now = Date.now();
-
-    for (const item of pageItems) {
-        const s = item.signal;
-        const o = item.outcome;
-        const cls = dirClass(s.direction);
-        const lbl = getBlockedOutcomeLabel(item);
-        const oCls = outcomeClass(lbl);
-        const pnl = o?.pnlR != null ? (o.pnlR >= 0 ? '+' : '') + Number(o.pnlR).toFixed(2) + 'R' : '--';
-        const pnlCls = o?.pnlR > 0 ? 'buy' : o?.pnlR < 0 ? 'sell' : '';
-        let expiryHtml;
-        if (lbl === 'PENDING') {
-            const expiryMs = new Date(s.expiryTimeUtc).getTime() - now;
-            expiryHtml = `<span class="expiry-timer" data-expiry="${new Date(s.expiryTimeUtc).getTime()}">${formatCountdown(expiryMs)}</span>`;
-        } else if (o?.closedAtUtc) {
-            expiryHtml = `<span class="expiry-timer expired">${toAmmanShort(o.closedAtUtc)}</span>`;
-        } else {
-            expiryHtml = `<span class="expiry-timer expired">${toAmmanShort(s.expiryTimeUtc)}</span>`;
-        }
-
-        const tr = document.createElement('tr');
-        const reason = escapeHtml(s.blockReason || '--');
-        const fallbackBadge = s.usedFallbackExit ? ' <span class="badge badge-expired" style="font-size:.62rem">FB</span>' : '';
-        tr.innerHTML = `
-            <td style="font-size:.7rem;font-family:monospace;color:var(--text)">${s.signalId ?? '--'}</td>
-            <td>${toAmmanShort(s.signalTimeUtc)}</td>
-            <td><span class="badge badge-neutral" style="font-size:.7rem">${s.timeframe}</span></td>
-            <td class="${cls}">${s.direction}</td>
-            <td>${fmt(s.entryPrice)}</td>
-            <td class="buy">${fmt(s.tpPrice)}</td>
-            <td class="sell">${fmt(s.slPrice)}</td>
-            <td>${s.confidenceScore}</td>
-            <td title="${reason}" style="max-width:260px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${reason}${fallbackBadge}</td>
-            <td><span class="badge ${oCls}" style="font-size:.72rem">${lbl}</span></td>
-            <td class="${pnlCls}">${pnl}</td>
-            <td>${expiryHtml}</td>
-            <td><button class="btn btn-sm btn-outline-primary" onclick="executeCandidate('/api/executed-trades/execute-blocked/${s.signalId}', 'blocked signal')">Execute</button></td>`;
-        tbody.appendChild(tr);
-    }
-
-    $('blocked-page-info').textContent = `Page ${blockedCurrentPage} of ${totalPages} (${blockedHistoryTotal} blocked signals total)`;
-    $('blocked-prev-page').disabled = blockedCurrentPage <= 1;
-    $('blocked-next-page').disabled = blockedCurrentPage >= totalPages;
-}
-
-function changeBlockedPage(delta) {
-    blockedCurrentPage = Math.max(1, blockedCurrentPage + delta);
-    loadBlockedHistory().catch(() => { });
-}
-
-function getGeneratedOutcomeLabel(item) {
-    const executionLabel = historyExecutionLabel(item.execution?.status, 'PENDING');
-    if (executionLabel) return executionLabel;
-    return item.outcome?.outcomeLabel || 'PENDING';
-}
-
-function onGeneratedFilterChange() {
-    generatedCurrentPage = 1;
-    loadGeneratedHistory().catch(() => { });
-}
-
-function applyGeneratedFilters(items) {
-    const tfF = $('generated-filter-tf').value;
-    const dirF = $('generated-filter-dir').value;
-    const outcomeF = $('generated-filter-outcome').value;
-    const dateFrom = $('generated-filter-date-from').value;
-    const dateTo = $('generated-filter-date-to').value;
-    return items.filter(item => {
-        const s = item.signal;
-        if (tfF && s.timeframe !== tfF) return false;
-        if (dirF && s.direction !== dirF) return false;
-        if (outcomeF && getGeneratedOutcomeLabel(item) !== outcomeF) return false;
-        if (dateFrom || dateTo) {
-            const signalDate = new Date(s.signalTimeUtc).toLocaleDateString('en-CA', { timeZone: AMMAN_TZ });
-            if (dateFrom && signalDate < dateFrom) return false;
-            if (dateTo && signalDate > dateTo) return false;
-        }
-        return true;
-    });
-}
-
-function applyGeneratedSorting(items) {
-    const dir = generatedSortDir === 'asc' ? 1 : -1;
-    return [...items].sort((a, b) => {
-        let va, vb;
-        switch (generatedSortCol) {
-            case 'time': va = new Date(a.signal.signalTimeUtc); vb = new Date(b.signal.signalTimeUtc); break;
-            case 'tf': va = a.signal.timeframe; vb = b.signal.timeframe; break;
-            case 'dir': va = a.signal.direction; vb = b.signal.direction; break;
-            case 'entry': va = a.signal.entryPrice; vb = b.signal.entryPrice; break;
-            case 'tp': va = a.signal.tpPrice; vb = b.signal.tpPrice; break;
-            case 'sl': va = a.signal.slPrice; vb = b.signal.slPrice; break;
-            case 'score': va = a.signal.confidenceScore; vb = b.signal.confidenceScore; break;
-            case 'outcome': va = getGeneratedOutcomeLabel(a); vb = getGeneratedOutcomeLabel(b); break;
-            case 'pnl': va = a.outcome?.pnlR ?? 0; vb = b.outcome?.pnlR ?? 0; break;
-            default: return 0;
-        }
-        if (va < vb) return -dir;
-        if (va > vb) return dir;
-        return 0;
-    });
-}
-
-function sortGeneratedHistory(col) {
-    if (generatedSortCol === col) generatedSortDir = generatedSortDir === 'asc' ? 'desc' : 'asc';
-    else { generatedSortCol = col; generatedSortDir = col === 'time' ? 'desc' : 'asc'; }
-    document.querySelectorAll('#generated-history-table thead th').forEach(th => {
-        const icon = th.querySelector('.sort-icon');
-        if (icon) icon.textContent = th.dataset.col === col ? (generatedSortDir === 'asc' ? '▲' : '▼') : '';
-    });
-    renderGeneratedHistory();
-}
-
-function renderGeneratedHistory() {
-    const filtered = applyGeneratedFilters(generatedHistoryData);
-    const sorted = applyGeneratedSorting(filtered);
-    const totalPages = Math.max(1, Math.ceil(generatedHistoryTotal / GENERATED_PAGE_SIZE));
-    if (generatedCurrentPage > totalPages) generatedCurrentPage = totalPages;
-    const pageItems = sorted;
-    const tbody = $('generated-signal-history');
-    if (!tbody) return;
-    tbody.innerHTML = '';
-    const now = Date.now();
-
-    for (const item of pageItems) {
-        const s = item.signal;
-        const o = item.outcome;
-        const cls = dirClass(s.direction);
-        const lbl = getGeneratedOutcomeLabel(item);
-        const oCls = outcomeClass(lbl);
-        const pnl = o?.pnlR != null ? (o.pnlR >= 0 ? '+' : '') + Number(o.pnlR).toFixed(2) + 'R' : '--';
-        const pnlCls = o?.pnlR > 0 ? 'buy' : o?.pnlR < 0 ? 'sell' : '';
-        let expiryHtml;
-        if (lbl === 'PENDING') {
-            const expiryMs = new Date(s.expiryTimeUtc).getTime() - now;
-            expiryHtml = `<span class="expiry-timer" data-expiry="${new Date(s.expiryTimeUtc).getTime()}">${formatCountdown(expiryMs)}</span>`;
-        } else if (o?.closedAtUtc) {
-            expiryHtml = `<span class="expiry-timer expired">${toAmmanShort(o.closedAtUtc)}</span>`;
-        } else {
-            expiryHtml = `<span class="expiry-timer expired">${toAmmanShort(s.expiryTimeUtc)}</span>`;
-        }
-
-        const tr = document.createElement('tr');
-        const exitModel = escapeHtml(s.exitModel || '--');
-        const exitTitle = escapeHtml(s.exitExplanation || s.exitModel || '--');
-        const fallbackBadge = s.usedFallbackExit ? ' <span class="badge badge-expired" style="font-size:.62rem">FB</span>' : '';
-        tr.innerHTML = `
-            <td style="font-size:.7rem;font-family:monospace;color:var(--text)">${s.signalId ?? '--'}</td>
-            <td>${toAmmanShort(s.signalTimeUtc)}</td>
-            <td><span class="badge badge-neutral" style="font-size:.7rem">${s.timeframe}</span></td>
-            <td class="${cls}">${s.direction}</td>
-            <td>${fmt(s.entryPrice)}</td>
-            <td class="buy">${fmt(s.tpPrice)}</td>
-            <td class="sell">${fmt(s.slPrice)}</td>
-            <td>${s.confidenceScore}</td>
-            <td title="${exitTitle}" style="max-width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${exitModel}${fallbackBadge}</td>
-            <td><span class="badge ${oCls}" style="font-size:.72rem">${lbl}</span></td>
-            <td class="${pnlCls}">${pnl}</td>
-            <td>${expiryHtml}</td>
-            <td><button class="btn btn-sm btn-outline-primary" onclick="executeCandidate('/api/executed-trades/execute-generated/${s.signalId}', 'generated signal')">Execute</button></td>`;
-        tbody.appendChild(tr);
-    }
-
-    $('generated-page-info').textContent = `Page ${generatedCurrentPage} of ${totalPages} (${generatedHistoryTotal} generated signals total)`;
-    $('generated-prev-page').disabled = generatedCurrentPage <= 1;
-    $('generated-next-page').disabled = generatedCurrentPage >= totalPages;
-}
-
-function changeGeneratedPage(delta) {
-    generatedCurrentPage = Math.max(1, generatedCurrentPage + delta);
-    loadGeneratedHistory().catch(() => { });
 }
 
 function executionStatusBadgeClass(status) {
@@ -1689,7 +1384,7 @@ async function refreshAll() {
     try {
         await Promise.all([
             refreshQuote(), refreshIndicators(), refreshRegime(),
-            refreshSignal(), refreshPerformance(), loadHistory(), loadBlockedHistory(), loadGeneratedHistory(),
+            refreshSignal(), refreshPerformance(), loadHistory(),
             loadExecutedTrades(), refreshTradingSummary(), loadTradeQueue(),
             refreshMlHealth(), refreshMlPerformance(), refreshMlPredictions(),
             refreshMlDiagnostics(), refreshMlFeatureSnapshot(), refreshDecisionSummary(), refreshTrainerStatus(), refreshHistorySync(),
@@ -1707,7 +1402,7 @@ setInterval(refreshQuote, 200);
 setInterval(() => { refreshIndicators(); refreshRegime(); refreshSignal(); }, 1000);
 setInterval(() => { refreshCharts().catch(() => { }); }, 2000);
 setInterval(() => { refreshHistorySync().catch(() => { }); }, 5000);
-setInterval(() => { refreshPerformance(); loadHistory(); loadBlockedHistory(); loadGeneratedHistory(); loadExecutedTrades(); refreshTradingSummary(); loadTradeQueue(); refreshDecisionSummary(); }, 15000);
+setInterval(() => { refreshPerformance(); loadHistory(); loadExecutedTrades(); refreshTradingSummary(); loadTradeQueue(); refreshDecisionSummary(); }, 15000);
 setInterval(() => { refreshMlHealth(); refreshMlPerformance(); refreshMlPredictions(); refreshMlDiagnostics(); refreshMlFeatureSnapshot(); refreshTrainerStatus(); }, 30000);
 setInterval(() => { refreshAdaptiveStatus(); refreshActiveParameterSet(); }, 15000);
 setInterval(() => { loadMlModelRegistry().catch(() => {}); updateRegimeSpecialistStatus().catch(() => {}); }, 60000);

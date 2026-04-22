@@ -301,6 +301,7 @@ try
             sp.GetRequiredService<ILoggerFactory>().CreateLogger<AdaptiveParameterLogRepository>()));
     builder.Services.AddSingleton<SignalFrequencyManager>();
     builder.Services.AddSingleton<IExecutionCandidateMapper, ExecutionCandidateMapper>();
+    builder.Services.AddSingleton<ISignalHistoryService, SignalHistoryService>();
     builder.Services.AddSingleton<TradeExecutionRuntimeState>();
     builder.Services.AddSingleton<IAccountSnapshotService, AccountSnapshotService>();
     builder.Services.AddSingleton<ITradeExecutionPolicy, TradeExecutionPolicy>();
@@ -679,26 +680,87 @@ try
         ISignalRepository signalRepo,
         IDecisionAuditRepository decisionRepo,
         IMlPredictionRepository mlPredictionRepo,
-        IParameterProvider paramProvider) =>
+        IParameterProvider paramProvider,
+        CancellationToken ct) =>
     {
-        var primaryTimeframe = paramProvider.GetActive().TimeframePrimary;
-        var latestSignal = await signalRepo.GetLatestSignalAsync(symbol);
+        var activeParameters = paramProvider.GetActive();
+        var primaryTimeframe = activeParameters.TimeframePrimary;
+        var latestSignalOverall = await signalRepo.GetLatestSignalAsync(symbol, ct);
+        var latestPrimarySignal = await signalRepo.GetLatestPrimaryTimeframeSignalAsync(symbol, primaryTimeframe, ct);
+        var latestSignal = latestPrimarySignal
+            ?? (TradeExecutionPolicy.IsBrokerExecutionTimeframeAllowed(latestSignalOverall?.Timeframe)
+                ? latestSignalOverall
+                : null);
+
         SignalDecision? linkedDecision = null;
         if (latestSignal?.EvaluationId is Guid evaluationId && evaluationId != Guid.Empty)
-            linkedDecision = await decisionRepo.GetDecisionByEvaluationIdAsync(evaluationId);
+            linkedDecision = await decisionRepo.GetDecisionByEvaluationIdAsync(evaluationId, ct);
 
-        var latestDecision = await decisionRepo.GetLatestDecisionAsync(symbol);
-        var decisionForCard = latestSignal == null ? latestDecision : linkedDecision;
+        var latestDecision = await decisionRepo.GetLatestDecisionAsync(symbol, ct);
+        var recentDecisions = await decisionRepo.GetDecisionsAsync(
+            symbol,
+            DateTimeOffset.UtcNow.AddDays(-7),
+            DateTimeOffset.UtcNow.AddMinutes(1),
+            200,
+            ct);
+        var latestPrimaryDecision = recentDecisions
+            .Where(decision => string.Equals(decision.Timeframe, primaryTimeframe, StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(decision => decision.DecisionTimeUtc)
+            .FirstOrDefault();
+        var decisionForCard = linkedDecision ?? latestPrimaryDecision ?? latestDecision;
+
         MlPrediction? latestPrediction = null;
         if (latestSignal != null)
-            latestPrediction = await mlPredictionRepo.GetBySignalIdAsync(latestSignal.SignalId);
+            latestPrediction = await mlPredictionRepo.GetBySignalIdAsync(latestSignal.SignalId, ct);
 
-        var predictionTimeframe = latestSignal?.Timeframe ?? primaryTimeframe;
-        latestPrediction ??= await mlPredictionRepo.GetLatestAsync(symbol, predictionTimeframe, "actionable");
-        latestPrediction ??= await mlPredictionRepo.GetLatestAsync(symbol, predictionTimeframe, "all");
+        var predictionTimeframe = latestSignal?.Timeframe ?? decisionForCard?.Timeframe ?? primaryTimeframe;
+        latestPrediction ??= await mlPredictionRepo.GetLatestAsync(symbol, predictionTimeframe, "actionable", ct);
+        latestPrediction ??= await mlPredictionRepo.GetLatestAsync(symbol, predictionTimeframe, "all", ct);
 
-        static object? MapDecision(SignalDecision? decision)
-            => decision != null ? new
+        static int? ComputeFallbackBlendedConfidence(SignalDecision decision, MlPrediction? prediction)
+        {
+            if (prediction == null)
+                return null;
+
+            if (!string.IsNullOrWhiteSpace(decision.EffectiveRuntimeParametersJson))
+            {
+                try
+                {
+                    var runtimeParameters = JsonSerializer.Deserialize<StrategyParameters>(decision.EffectiveRuntimeParametersJson!);
+                    var blendWeight = runtimeParameters?.MlConfidenceBlendWeight
+                        ?? StrategyParameters.Default.MlConfidenceBlendWeight;
+                    var blended = (1m - blendWeight) * decision.ConfidenceScore
+                        + blendWeight * (prediction.CalibratedWinProbability * 100m);
+                    return Math.Clamp((int)Math.Round(blended), 0, 100);
+                }
+                catch
+                {
+                    // Ignore malformed historical payloads and leave the fallback unset.
+                }
+            }
+
+            return null;
+        }
+
+        static object? MapDecision(SignalDecision? decision, MlPrediction? prediction, SignalRecommendation? signal)
+        {
+            if (decision == null)
+                return null;
+
+            var predictionMatchesDecision = prediction != null
+                && decision.EvaluationId != Guid.Empty
+                && prediction.EvaluationId == decision.EvaluationId;
+            var predictionMatchesSignal = prediction != null
+                && signal != null
+                && prediction.SignalId == signal.SignalId;
+            var fallbackEffectiveThreshold = predictionMatchesDecision || predictionMatchesSignal
+                ? prediction?.RecommendedThreshold
+                : null;
+            var fallbackBlendedConfidence = predictionMatchesDecision || predictionMatchesSignal
+                ? ComputeFallbackBlendedConfidence(decision, prediction)
+                : null;
+
+            return new
             {
                 decisionId = decision.DecisionId,
                 evaluationId = decision.EvaluationId == Guid.Empty ? (Guid?)null : decision.EvaluationId,
@@ -712,103 +774,92 @@ try
                 reasonCodes = decision.ReasonCodes.Select(r => r.ToString()).ToList(),
                 reasonDetails = decision.ReasonDetails,
                 confidenceScore = decision.ConfidenceScore,
-                blendedConfidence = decision.BlendedConfidence,
-                effectiveThreshold = decision.EffectiveThreshold,
+                blendedConfidence = decision.BlendedConfidence ?? fallbackBlendedConfidence,
+                effectiveThreshold = decision.EffectiveThreshold ?? fallbackEffectiveThreshold,
                 sourceMode = decision.SourceMode.ToString()
-            } : null;
+            };
+        }
 
         return Results.Ok(new
         {
             signal = latestSignal,
-            decision = MapDecision(decisionForCard),
+            latestPrimarySignal,
+            latestSignalOverall,
+            decision = MapDecision(decisionForCard, latestPrediction, latestSignal),
             latestDecision = latestDecision?.DecisionId == decisionForCard?.DecisionId
                 ? null
-                : MapDecision(latestDecision),
+                : MapDecision(latestDecision, latestPrediction, latestSignalOverall),
+            primaryTimeframe,
             mlPrediction = latestPrediction
         });
     });
 
-    app.MapGet("/api/signals/history", async (ISignalRepository repo, IExecutedTradeRepository executedTradeRepository, int? limit, int? page, CancellationToken ct) =>
+    app.MapGet("/api/signals/history", async (
+        ISignalHistoryService historyService,
+        int? limit,
+        int? page,
+        string? source,
+        string? timeframe,
+        string? direction,
+        string? outcome,
+        DateOnly? from,
+        DateOnly? to,
+        string? sort,
+        string? sortDir,
+        CancellationToken ct) =>
     {
         var pageNum = Math.Max(1, page ?? 1);
         var pageSize = Math.Clamp(limit ?? 50, 1, 500);
-        var signals = await repo.GetSignalHistoryWithOutcomesAsync(symbol, pageSize, (pageNum - 1) * pageSize, ct);
-        var executionBySignal = await executedTradeRepository.GetLatestBySourceSignalsAsync(
-            signals.Select(s => s.Signal.SignalId).ToArray(),
-            SignalExecutionSourceType.Recommended,
-            ct);
-        var total = await repo.GetSignalCountAsync(symbol);
-        return Results.Ok(new
-        {
-            signals = signals.Select(item => new
-            {
-                signal = item.Signal,
-                outcome = item.Outcome,
-                execution = executionBySignal.TryGetValue(item.Signal.SignalId, out var execution) ? execution : null
-            }),
-            total,
-            page = pageNum,
-            pageSize
-        });
-    });
 
-    app.MapGet("/api/blocked-signals/history", async (
-        IBlockedSignalHistoryService blockedSignalHistory,
-        IExecutedTradeRepository executedTradeRepository,
-        int? limit,
-        int? page,
-        CancellationToken ct) =>
-    {
-        var pageNum = Math.Max(1, page ?? 1);
-        var pageSize = Math.Clamp(limit ?? 50, 1, 2000);
-        var result = await blockedSignalHistory.GetHistoryAsync(symbol, pageSize, (pageNum - 1) * pageSize, ct);
-        var executionBySignal = await executedTradeRepository.GetLatestBySourceSignalsAsync(
-            result.Signals.Select(s => s.Signal.SignalId).ToArray(),
-            SignalExecutionSourceType.Blocked,
-            ct);
-        return Results.Ok(new
+        SignalExecutionSourceType? sourceType = null;
+        if (!string.IsNullOrWhiteSpace(source))
         {
-            signals = result.Signals.Select(item => new
-            {
-                signal = item.Signal,
-                outcome = item.Outcome,
-                execution = executionBySignal.TryGetValue(item.Signal.SignalId, out var execution) ? execution : null
-            }),
-            stats = result.Stats,
-            total = result.Total,
-            page = result.Page,
-            pageSize = result.PageSize
-        });
-    });
+            if (!Enum.TryParse<SignalExecutionSourceType>(source, true, out var parsedSource))
+                return Results.BadRequest(new { error = $"Invalid signal source: {source}" });
+            sourceType = parsedSource;
+        }
 
-    app.MapGet("/api/generated-signals/history", async (
-        IGeneratedSignalHistoryService generatedSignalHistory,
-        IExecutedTradeRepository executedTradeRepository,
-        int? limit,
-        int? page,
-        int? hours,
-        CancellationToken ct) =>
-    {
-        var pageNum = Math.Max(1, page ?? 1);
-        var pageSize = Math.Clamp(limit ?? 50, 1, 2000);
-        var result = await generatedSignalHistory.GetHistoryAsync(symbol, pageSize, (pageNum - 1) * pageSize, hours, ct);
-        var executionBySignal = await executedTradeRepository.GetLatestBySourceSignalsAsync(
-            result.Signals.Select(s => s.Signal.SignalId).ToArray(),
-            SignalExecutionSourceType.Generated,
-            ct);
-        return Results.Ok(new
+        SignalDirection? signalDirection = null;
+        if (!string.IsNullOrWhiteSpace(direction))
         {
-            signals = result.Signals.Select(item => new
-            {
-                signal = item.Signal,
-                outcome = item.Outcome,
-                execution = executionBySignal.TryGetValue(item.Signal.SignalId, out var execution) ? execution : null
-            }),
-            stats = result.Stats,
-            total = result.Total,
-            page = result.Page,
-            pageSize = result.PageSize
-        });
+            if (!Enum.TryParse<SignalDirection>(direction, true, out var parsedDirection))
+                return Results.BadRequest(new { error = $"Invalid signal direction: {direction}" });
+            signalDirection = parsedDirection;
+        }
+
+        var sortBy = (sort ?? "time").Trim().ToLowerInvariant() switch
+        {
+            "source" => SignalHistorySortColumn.Source,
+            "tf" => SignalHistorySortColumn.Timeframe,
+            "dir" => SignalHistorySortColumn.Direction,
+            "entry" => SignalHistorySortColumn.Entry,
+            "tp" => SignalHistorySortColumn.Tp,
+            "sl" => SignalHistorySortColumn.Sl,
+            "score" => SignalHistorySortColumn.Score,
+            "outcome" => SignalHistorySortColumn.Outcome,
+            "pnl" => SignalHistorySortColumn.Pnl,
+            _ => SignalHistorySortColumn.Time
+        };
+        var sortDirection = string.Equals(sortDir, "asc", StringComparison.OrdinalIgnoreCase)
+            ? SignalHistorySortDirection.Asc
+            : SignalHistorySortDirection.Desc;
+
+        var result = await historyService.GetHistoryAsync(new SignalHistoryQuery
+        {
+            Symbol = symbol,
+            SourceType = sourceType,
+            Timeframe = string.IsNullOrWhiteSpace(timeframe) ? null : timeframe.Trim(),
+            Direction = signalDirection,
+            Outcome = string.IsNullOrWhiteSpace(outcome) ? null : outcome.Trim(),
+            DateFrom = from,
+            DateTo = to,
+            SortBy = sortBy,
+            SortDirection = sortDirection,
+            Limit = pageSize,
+            Offset = (pageNum - 1) * pageSize
+        }, ct);
+
+        return Results.Ok(result);
     });
 
     app.MapGet("/api/executed-trades", async (
@@ -861,58 +912,25 @@ try
         return trade == null ? Results.NotFound() : Results.Ok(trade);
     });
 
-    app.MapPost("/api/executed-trades/execute-signal/{signalId:guid}", async (
+    app.MapPost("/api/executed-trades/execute-history/{sourceType}/{signalId:guid}", async (
+        string sourceType,
         Guid signalId,
         HttpContext ctx,
-        ISignalRepository signalRepository,
-        IExecutionCandidateMapper mapper,
+        ISignalHistoryService historyService,
         ITradeExecutionQueueService queueService,
         CancellationToken ct) =>
     {
         if (RejectIfNotLoopback(ctx) is { } reject) return reject;
-        var signal = await signalRepository.GetSignalByIdAsync(signalId, ct);
-        if (signal == null) return Results.NotFound(new { error = "Signal not found." });
-        var result = await queueService.EnqueueAsync(new TradeExecutionRequest
-        {
-            Candidate = mapper.FromRecommended(signal),
-            RequestedBy = "dashboard"
-        }, ct);
-        return result.Accepted ? Results.Ok(result) : Results.BadRequest(result);
-    });
+        if (!Enum.TryParse<SignalExecutionSourceType>(sourceType, true, out var parsedSourceType))
+            return Results.BadRequest(new { error = $"Invalid signal source: {sourceType}" });
 
-    app.MapPost("/api/executed-trades/execute-generated/{signalId:guid}", async (
-        Guid signalId,
-        HttpContext ctx,
-        IGeneratedSignalHistoryService generatedHistory,
-        IExecutionCandidateMapper mapper,
-        ITradeExecutionQueueService queueService,
-        CancellationToken ct) =>
-    {
-        if (RejectIfNotLoopback(ctx) is { } reject) return reject;
-        var signal = await generatedHistory.GetBySignalIdAsync(symbol, signalId, ct);
-        if (signal == null) return Results.NotFound(new { error = "Generated signal not found." });
-        var result = await queueService.EnqueueAsync(new TradeExecutionRequest
-        {
-            Candidate = mapper.FromGenerated(signal.Signal),
-            RequestedBy = "dashboard"
-        }, ct);
-        return result.Accepted ? Results.Ok(result) : Results.BadRequest(result);
-    });
+        var candidate = await historyService.GetExecutionCandidateAsync(symbol, parsedSourceType, signalId, ct);
+        if (candidate == null)
+            return Results.NotFound(new { error = $"{parsedSourceType} signal not found." });
 
-    app.MapPost("/api/executed-trades/execute-blocked/{signalId:guid}", async (
-        Guid signalId,
-        HttpContext ctx,
-        IBlockedSignalHistoryService blockedHistory,
-        IExecutionCandidateMapper mapper,
-        ITradeExecutionQueueService queueService,
-        CancellationToken ct) =>
-    {
-        if (RejectIfNotLoopback(ctx) is { } reject) return reject;
-        var signal = await blockedHistory.GetBySignalIdAsync(symbol, signalId, ct);
-        if (signal == null) return Results.NotFound(new { error = "Blocked signal not found." });
         var result = await queueService.EnqueueAsync(new TradeExecutionRequest
         {
-            Candidate = mapper.FromBlocked(signal.Signal),
+            Candidate = candidate,
             RequestedBy = "dashboard"
         }, ct);
         return result.Accepted ? Results.Ok(result) : Results.BadRequest(result);
@@ -2222,7 +2240,8 @@ try
             var active = await paramRepo.GetActiveAsync(EthSignal.Domain.Models.StrategyParameters.Default.StrategyVersion);
             if (active == null)
             {
-                var defaults = EthSignal.Domain.Models.StrategyParameters.Default;
+                var defaults = EthSignal.Domain.Models.StrategyParameters.Default
+                    .EnsureProductionSafeDefaults();
                 var hash = System.Security.Cryptography.SHA256.HashData(
                     System.Text.Encoding.UTF8.GetBytes(defaults.ToJson()));
                 var hashStr = Convert.ToHexString(hash)[..16].ToLowerInvariant();
@@ -2243,6 +2262,52 @@ try
             {
                 Log.Information("Active parameter set found: id={Id} hash={Hash} version={Version}",
                     active.Id, active.ParameterHash, active.StrategyVersion);
+
+                var repairedParameters = active.Parameters;
+                var repairNotes = new List<string>();
+
+                var normalizedParameters = repairedParameters.EnsureProductionSafeDefaults();
+                if (!string.Equals(normalizedParameters.ToJson(), repairedParameters.ToJson(), StringComparison.Ordinal))
+                {
+                    if (repairedParameters.DailyLossCapPercent != normalizedParameters.DailyLossCapPercent)
+                        repairNotes.Add("normalized legacy risk-cap defaults");
+                    if (repairedParameters.TimeframeProfiles.IsEffectivelyEmpty()
+                        && !normalizedParameters.TimeframeProfiles.IsEffectivelyEmpty())
+                        repairNotes.Add("hydrated recommended timeframe profiles");
+                    repairedParameters = normalizedParameters;
+                }
+
+                if (!string.Equals(repairedParameters.ToJson(), active.Parameters.ToJson(), StringComparison.Ordinal))
+                {
+                    var repairedHash = System.Security.Cryptography.SHA256.HashData(
+                        System.Text.Encoding.UTF8.GetBytes(repairedParameters.ToJson()));
+                    var repairedHashStr = Convert.ToHexString(repairedHash)[..16].ToLowerInvariant();
+                    var repairSummary = repairNotes.Count > 0
+                        ? string.Join("; ", repairNotes)
+                        : "startup parameter repair";
+                    var repairedId = await paramRepo.InsertAsync(new EthSignal.Domain.Models.StrategyParameterSet
+                    {
+                        StrategyVersion = repairedParameters.StrategyVersion,
+                        ParameterHash = repairedHashStr,
+                        Parameters = repairedParameters,
+                        Status = EthSignal.Domain.Models.ParameterSetStatus.Active,
+                        CreatedBy = "startup-repair",
+                        Notes = repairSummary,
+                        ParentParameterSetId = active.Id,
+                        ObjectiveFunctionVersion = active.ObjectiveFunctionVersion,
+                        CodeVersion = active.CodeVersion
+                    });
+                    await paramRepo.ActivateAsync(
+                        repairedId,
+                        active.Id,
+                        "startup-repair",
+                        repairSummary);
+                    Log.Warning(
+                        "Repaired active parameter set {OldId} -> {NewId}: {RepairSummary}",
+                        active.Id,
+                        repairedId,
+                        repairSummary);
+                }
             }
 
             await pp.RefreshAsync();

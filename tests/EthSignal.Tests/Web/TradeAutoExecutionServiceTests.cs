@@ -47,6 +47,7 @@ public sealed class TradeAutoExecutionServiceTests
             .ReturnsAsync(new TradeExecutionQueueResult
             {
                 Accepted = true,
+                CreatedNewEntry = true,
                 QueueEntryId = 1,
                 Status = TradeExecutionQueueStatus.Queued.ToString(),
                 Message = "ok"
@@ -115,6 +116,7 @@ public sealed class TradeAutoExecutionServiceTests
             .ReturnsAsync(new TradeExecutionQueueResult
             {
                 Accepted = true,
+                CreatedNewEntry = true,
                 QueueEntryId = 1,
                 Status = TradeExecutionQueueStatus.Queued.ToString(),
                 Message = "ok"
@@ -153,6 +155,27 @@ public sealed class TradeAutoExecutionServiceTests
         signalRepo.Setup(r => r.GetSignalHistoryAsync("ETHUSD", It.IsAny<int>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync([
                 CreateRecommendedSignal() with { Status = SignalStatus.CLOSED }
+            ]);
+
+        var queueService = new Mock<ITradeExecutionQueueService>();
+        var sut = CreateSut(
+            signalRepo: signalRepo,
+            queueService: queueService,
+            portalOverrides: new PortalOverrides { RecommendedSignalExecutionEnabled = true },
+            allowedSourceTypes: [SignalExecutionSourceType.Recommended]);
+
+        await sut.RunOnceAsync(CancellationToken.None);
+
+        queueService.Verify(s => s.EnqueueAsync(It.IsAny<TradeExecutionRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task RunOnceAsync_Skips_NonExecutable_Recommended_Scalp_Signals()
+    {
+        var signalRepo = new Mock<ISignalRepository>();
+        signalRepo.Setup(r => r.GetSignalHistoryAsync("ETHUSD", It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync([
+                CreateRecommendedSignal() with { Timeframe = "1m" }
             ]);
 
         var queueService = new Mock<ITradeExecutionQueueService>();
@@ -232,11 +255,60 @@ public sealed class TradeAutoExecutionServiceTests
         queueService.Verify(s => s.EnqueueAsync(It.IsAny<TradeExecutionRequest>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
+    [Fact]
+    public async Task RunOnceAsync_WhenQueueHasNoDispatchBudget_DoesNotEnqueueMoreSignals()
+    {
+        var blockedHistory = new Mock<IBlockedSignalHistoryService>();
+        blockedHistory.Setup(s => s.GetHistoryAsync("ETHUSD", 100, 0, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new BlockedSignalHistoryPage
+            {
+                Signals =
+                [
+                    new BlockedSignalWithOutcome
+                    {
+                        Signal = CreateBlockedSignal(),
+                        Outcome = CreateOutcome()
+                    }
+                ],
+                Stats = new PerformanceStats(),
+                Total = 1,
+                Page = 1,
+                PageSize = 100
+            });
+
+        var queueService = new Mock<ITradeExecutionQueueService>();
+
+        var sut = CreateSut(
+            blockedHistory: blockedHistory,
+            queueService: queueService,
+            queueSnapshot: new TradeExecutionQueueSnapshot
+            {
+                ServerTimeUtc = DateTimeOffset.UtcNow,
+                ActiveTradeCount = 3,
+                BrokerOpenTradeCount = 3,
+                PendingSubmissionCount = 0,
+                MaxConcurrentOpenTrades = 3,
+                QueueConcurrentRequestLimit = 3,
+                AvailableDispatchSlots = 0,
+                QueuedCount = 5,
+                ProcessingCount = 0,
+                CompletedCount = 0,
+                FailedCount = 0,
+                Entries = []
+            },
+            allowedSourceTypes: [SignalExecutionSourceType.Blocked]);
+
+        await sut.RunOnceAsync(CancellationToken.None);
+
+        queueService.Verify(s => s.EnqueueAsync(It.IsAny<TradeExecutionRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
     private static TradeAutoExecutionService CreateSut(
         Mock<ISignalRepository>? signalRepo = null,
         Mock<IGeneratedSignalHistoryService>? generatedHistory = null,
         Mock<IBlockedSignalHistoryService>? blockedHistory = null,
         Mock<ITradeExecutionQueueService>? queueService = null,
+        TradeExecutionQueueSnapshot? queueSnapshot = null,
         PortalOverrides? portalOverrides = null,
         IEnumerable<SignalExecutionSourceType>? allowedSourceTypes = null)
     {
@@ -264,6 +336,26 @@ public sealed class TradeAutoExecutionServiceTests
         var overridesRepo = new Mock<IPortalOverridesRepository>();
         overridesRepo.Setup(r => r.GetAsync(It.IsAny<CancellationToken>()))
             .ReturnsAsync(portalOverrides);
+
+        if (queueService != null)
+        {
+            queueService.Setup(s => s.GetSnapshotAsync(It.IsAny<int>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(queueSnapshot ?? new TradeExecutionQueueSnapshot
+                {
+                    ServerTimeUtc = DateTimeOffset.UtcNow,
+                    ActiveTradeCount = 0,
+                    BrokerOpenTradeCount = 0,
+                    PendingSubmissionCount = 0,
+                    MaxConcurrentOpenTrades = 3,
+                    QueueConcurrentRequestLimit = 3,
+                    AvailableDispatchSlots = 3,
+                    QueuedCount = 0,
+                    ProcessingCount = 0,
+                    CompletedCount = 0,
+                    FailedCount = 0,
+                    Entries = []
+                });
+        }
 
         return new TradeAutoExecutionService(
             config,

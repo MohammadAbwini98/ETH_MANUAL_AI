@@ -28,6 +28,7 @@ public sealed class TradeExecutionQueueServiceTests
         await waitTask;
 
         result.Accepted.Should().BeTrue();
+        result.CreatedNewEntry.Should().BeTrue();
         result.Status.Should().Be(TradeExecutionQueueStatus.Queued.ToString());
         queueRepository.GetEntries().Should().ContainSingle();
     }
@@ -47,8 +48,28 @@ public sealed class TradeExecutionQueueServiceTests
         }, CancellationToken.None);
 
         result.Accepted.Should().BeFalse();
+        result.CreatedNewEntry.Should().BeFalse();
         result.FailureReason.Should().Be("TimeframeNotAllowed");
         result.Status.Should().Be("Rejected");
+    }
+
+    [Fact]
+    public async Task EnqueueAsync_WhenSignalIsAlreadyQueued_ReturnsAcceptedWithoutCreatingNewEntry()
+    {
+        var queueRepository = new InMemoryQueueRepository();
+        await queueRepository.InsertAsync(CreateQueueEntry("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", 42, DateTimeOffset.UtcNow.AddMinutes(-1)));
+        var sut = CreateSut(queueRepository: queueRepository);
+
+        var result = await sut.EnqueueAsync(new TradeExecutionRequest
+        {
+            Candidate = CreateCandidate(SignalExecutionSourceType.Recommended, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+            RequestedBy = "test"
+        }, CancellationToken.None);
+
+        result.Accepted.Should().BeTrue();
+        result.CreatedNewEntry.Should().BeFalse();
+        result.QueueEntryId.Should().Be(42);
+        queueRepository.GetEntries().Should().ContainSingle();
     }
 
     [Fact]
@@ -259,6 +280,44 @@ public sealed class TradeExecutionQueueServiceTests
         entry.FailureReason.Should().Be("InvalidTpSl");
     }
 
+    [Fact]
+    public async Task DrainAsync_WhenCapacityIsFull_ExpiresQueuedSignalsThatBecameStale()
+    {
+        var queueRepository = new InMemoryQueueRepository();
+        await queueRepository.InsertAsync(CreateQueueEntry(
+            "cccccccc-cccc-cccc-cccc-cccccccccccc",
+            1,
+            DateTimeOffset.UtcNow.AddMinutes(-5),
+            signalTimeUtc: DateTimeOffset.UtcNow.AddMinutes(-31)));
+
+        var snapshotService = new Mock<IAccountSnapshotService>();
+        snapshotService.Setup(s => s.GetLatestAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new AccountSnapshot
+            {
+                AccountId = "demo-1",
+                AccountName = "DEMOAI",
+                Currency = "USD",
+                OpenPositions = 3,
+                IsDemo = true,
+                CapturedAtUtc = DateTimeOffset.UtcNow
+            });
+
+        var sut = CreateSut(
+            queueRepository: queueRepository,
+            snapshotService: snapshotService,
+            maxConcurrentOpenTrades: 3,
+            maxConcurrentRequests: 3);
+
+        var dispatched = await sut.DrainAsync(CancellationToken.None);
+
+        dispatched.Should().Be(0);
+        var entry = queueRepository.GetEntries().Single();
+        entry.Status.Should().Be(TradeExecutionQueueStatus.Completed);
+        entry.FailureReason.Should().Be("SignalStale");
+        entry.ErrorDetails.Should().Be("Signal became stale while waiting in execution queue.");
+        entry.ProcessedAtUtc.Should().NotBeNull();
+    }
+
     private static TradeExecutionQueueService CreateSut(
         InMemoryQueueRepository? queueRepository = null,
         Mock<IExecutedTradeRepository>? executedTradeRepository = null,
@@ -325,7 +384,11 @@ public sealed class TradeExecutionQueueServiceTests
             NullLogger<TradeExecutionQueueService>.Instance);
     }
 
-    private static QueuedTradeExecution CreateQueueEntry(string signalId, long queueEntryId = 1, DateTimeOffset? createdAtUtc = null) => new()
+    private static QueuedTradeExecution CreateQueueEntry(
+        string signalId,
+        long queueEntryId = 1,
+        DateTimeOffset? createdAtUtc = null,
+        DateTimeOffset? signalTimeUtc = null) => new()
     {
         QueueEntryId = queueEntryId,
         SignalId = Guid.Parse(signalId),
@@ -333,7 +396,11 @@ public sealed class TradeExecutionQueueServiceTests
         SourceType = SignalExecutionSourceType.Recommended,
         RequestedBy = "test",
         RequestedSize = 0.05m,
-        CandidateJson = System.Text.Json.JsonSerializer.Serialize(CreateCandidate(SignalExecutionSourceType.Recommended, signalId)),
+        CandidateJson = System.Text.Json.JsonSerializer.Serialize(
+            CreateCandidate(SignalExecutionSourceType.Recommended, signalId) with
+            {
+                SignalTimeUtc = signalTimeUtc ?? DateTimeOffset.UtcNow.AddMinutes(-1)
+            }),
         Status = TradeExecutionQueueStatus.Queued,
         CreatedAtUtc = createdAtUtc ?? DateTimeOffset.UtcNow,
         UpdatedAtUtc = createdAtUtc ?? DateTimeOffset.UtcNow
@@ -464,6 +531,36 @@ public sealed class TradeExecutionQueueServiceTests
                     _entries.Count(entry => entry.Status == TradeExecutionQueueStatus.Processing),
                     _entries.Count(entry => entry.Status == TradeExecutionQueueStatus.Completed),
                     _entries.Count(entry => entry.Status == TradeExecutionQueueStatus.Failed)));
+            }
+        }
+
+        public Task<int> ExpireStaleQueuedAsync(DateTimeOffset staleBeforeUtc, CancellationToken ct = default)
+        {
+            lock (_gate)
+            {
+                var expired = 0;
+                for (var index = 0; index < _entries.Count; index++)
+                {
+                    var entry = _entries[index];
+                    if (entry.Status != TradeExecutionQueueStatus.Queued)
+                        continue;
+
+                    var candidate = System.Text.Json.JsonSerializer.Deserialize<TradeExecutionCandidate>(entry.CandidateJson);
+                    if (candidate == null || candidate.SignalTimeUtc >= staleBeforeUtc)
+                        continue;
+
+                    _entries[index] = entry with
+                    {
+                        Status = TradeExecutionQueueStatus.Completed,
+                        FailureReason = "SignalStale",
+                        ErrorDetails = "Signal became stale while waiting in execution queue.",
+                        UpdatedAtUtc = DateTimeOffset.UtcNow,
+                        ProcessedAtUtc = DateTimeOffset.UtcNow
+                    };
+                    expired++;
+                }
+
+                return Task.FromResult(expired);
             }
         }
 

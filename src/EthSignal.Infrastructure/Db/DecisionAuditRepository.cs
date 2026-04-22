@@ -29,7 +29,7 @@ public sealed class DecisionAuditRepository : IDecisionAuditRepository
             INSERT INTO ""ETH"".signal_decision_audit
                 (id, symbol, decision_time_utc, bar_time_utc, timeframe,
                  decision_type, outcome_category, regime, regime_bar_time_utc,
-                 parameter_set_id, confidence_score, reason_codes_json,
+                 parameter_set_id, confidence_score, blended_confidence, effective_threshold, reason_codes_json,
                  reason_details_json, indicators_json, source_mode,
                  market_condition_class, adapted_parameters_json,
                  lifecycle_state, final_block_reason, origin,
@@ -37,21 +37,30 @@ public sealed class DecisionAuditRepository : IDecisionAuditRepository
                  created_at_utc)
             VALUES (@id, @symbol, @decisionTime, @barTime, @tf,
                     @decisionType, @outcomeCategory, @regime, @regimeBarTime,
-                    @paramSetId, @score, @reasonCodes,
+                    @paramSetId, @score, @blendedConfidence, @effectiveThreshold, @reasonCodes,
                     @reasonDetails, @indicators, @sourceMode,
                     @mcc, @adaptedJson,
                     @lifecycleState, @finalBlockReason, @origin,
                     @evaluationId, @effectiveParams, @candidateDirection,
                     NOW())
             ON CONFLICT (symbol, timeframe, bar_time_utc, source_mode) DO UPDATE SET
+                    decision_time_utc = EXCLUDED.decision_time_utc,
                     decision_type = EXCLUDED.decision_type,
                     outcome_category = EXCLUDED.outcome_category,
+                    regime = EXCLUDED.regime,
+                    regime_bar_time_utc = EXCLUDED.regime_bar_time_utc,
+                    parameter_set_id = EXCLUDED.parameter_set_id,
                     confidence_score = EXCLUDED.confidence_score,
+                    blended_confidence = EXCLUDED.blended_confidence,
+                    effective_threshold = EXCLUDED.effective_threshold,
                     reason_codes_json = EXCLUDED.reason_codes_json,
                     reason_details_json = EXCLUDED.reason_details_json,
                     indicators_json = EXCLUDED.indicators_json,
+                    market_condition_class = EXCLUDED.market_condition_class,
                     lifecycle_state = EXCLUDED.lifecycle_state,
                     final_block_reason = EXCLUDED.final_block_reason,
+                    origin = EXCLUDED.origin,
+                    evaluation_id = EXCLUDED.evaluation_id,
                     effective_runtime_parameters_json = EXCLUDED.effective_runtime_parameters_json,
                     adapted_parameters_json = EXCLUDED.adapted_parameters_json,
                     candidate_direction = EXCLUDED.candidate_direction;", conn);
@@ -67,6 +76,8 @@ public sealed class DecisionAuditRepository : IDecisionAuditRepository
         cmd.Parameters.AddWithValue("regimeBarTime", (object?)decision.UsedRegimeTimestamp ?? DBNull.Value);
         cmd.Parameters.AddWithValue("paramSetId", (object?)decision.ParameterSetId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("score", decision.ConfidenceScore);
+        cmd.Parameters.AddWithValue("blendedConfidence", (object?)decision.BlendedConfidence ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("effectiveThreshold", (object?)decision.EffectiveThreshold ?? DBNull.Value);
         cmd.Parameters.Add(new NpgsqlParameter("reasonCodes", NpgsqlDbType.Jsonb)
         { Value = decision.ReasonCodesJson });
         cmd.Parameters.Add(new NpgsqlParameter("reasonDetails", NpgsqlDbType.Jsonb)
@@ -115,7 +126,7 @@ public sealed class DecisionAuditRepository : IDecisionAuditRepository
         await using var cmd = new NpgsqlCommand(@"
             SELECT id, symbol, decision_time_utc, bar_time_utc, timeframe,
                    decision_type, outcome_category, regime, regime_bar_time_utc,
-                   parameter_set_id, confidence_score, reason_codes_json,
+                   parameter_set_id, confidence_score, blended_confidence, effective_threshold, reason_codes_json,
                    reason_details_json, indicators_json, source_mode,
                    market_condition_class, adapted_parameters_json,
                    lifecycle_state, final_block_reason, origin,
@@ -137,7 +148,7 @@ public sealed class DecisionAuditRepository : IDecisionAuditRepository
         await using var cmd = new NpgsqlCommand(@"
             SELECT id, symbol, decision_time_utc, bar_time_utc, timeframe,
                    decision_type, outcome_category, regime, regime_bar_time_utc,
-                   parameter_set_id, confidence_score, reason_codes_json,
+                   parameter_set_id, confidence_score, blended_confidence, effective_threshold, reason_codes_json,
                    reason_details_json, indicators_json, source_mode,
                    market_condition_class, adapted_parameters_json,
                    lifecycle_state, final_block_reason, origin,
@@ -162,7 +173,7 @@ public sealed class DecisionAuditRepository : IDecisionAuditRepository
         await using var cmd = new NpgsqlCommand(@"
             SELECT id, symbol, decision_time_utc, bar_time_utc, timeframe,
                    decision_type, outcome_category, regime, regime_bar_time_utc,
-                   parameter_set_id, confidence_score, reason_codes_json,
+                   parameter_set_id, confidence_score, blended_confidence, effective_threshold, reason_codes_json,
                    reason_details_json, indicators_json, source_mode,
                    market_condition_class, adapted_parameters_json,
                    lifecycle_state, final_block_reason, origin,
@@ -306,9 +317,9 @@ public sealed class DecisionAuditRepository : IDecisionAuditRepository
 
     private static SignalDecision ReadDecision(NpgsqlDataReader r)
     {
-        var reasonCodesRaw = r.GetString(11);
-        var reasonDetailsRaw = r.GetString(12);
-        var indicatorsRaw = r.GetString(13);
+        var reasonCodesRaw = r.GetString(13);
+        var reasonDetailsRaw = r.GetString(14);
+        var indicatorsRaw = r.GetString(15);
         var regimeStr = r.IsDBNull(7) ? null : r.GetString(7);
 
         return new SignalDecision
@@ -324,19 +335,21 @@ public sealed class DecisionAuditRepository : IDecisionAuditRepository
             UsedRegimeTimestamp = r.IsDBNull(8) ? null : r.GetFieldValue<DateTimeOffset>(8),
             ParameterSetId = r.IsDBNull(9) ? null : r.GetString(9),
             ConfidenceScore = r.GetInt32(10),
+            BlendedConfidence = r.IsDBNull(11) ? null : r.GetInt32(11),
+            EffectiveThreshold = r.IsDBNull(12) ? null : r.GetInt32(12),
             ReasonCodes = ParseReasonCodes(reasonCodesRaw),
             ReasonDetails = JsonSerializer.Deserialize<List<string>>(reasonDetailsRaw) ?? [],
             IndicatorSnapshot = JsonSerializer.Deserialize<Dictionary<string, decimal>>(indicatorsRaw)
                                 ?? new Dictionary<string, decimal>(),
-            SourceMode = Enum.Parse<SourceMode>(r.GetString(14)),
-            MarketConditionClass = r.IsDBNull(15) ? null : r.GetString(15),
-            AdaptedParametersJson = r.IsDBNull(16) ? null : r.GetString(16),
-            LifecycleState = r.IsDBNull(17) ? SignalLifecycleState.EVALUATED : Enum.Parse<SignalLifecycleState>(r.GetString(17)),
-            FinalBlockReason = r.IsDBNull(18) ? null : r.GetString(18),
-            Origin = r.IsDBNull(19) ? DecisionOrigin.CLOSED_BAR : Enum.Parse<DecisionOrigin>(r.GetString(19)),
-            EvaluationId = r.IsDBNull(20) ? Guid.Empty : r.GetGuid(20),
-            EffectiveRuntimeParametersJson = r.IsDBNull(21) ? null : r.GetString(21),
-            CandidateDirection = r.IsDBNull(22) ? null : Enum.Parse<SignalDirection>(r.GetString(22))
+            SourceMode = Enum.Parse<SourceMode>(r.GetString(16)),
+            MarketConditionClass = r.IsDBNull(17) ? null : r.GetString(17),
+            AdaptedParametersJson = r.IsDBNull(18) ? null : r.GetString(18),
+            LifecycleState = r.IsDBNull(19) ? SignalLifecycleState.EVALUATED : Enum.Parse<SignalLifecycleState>(r.GetString(19)),
+            FinalBlockReason = r.IsDBNull(20) ? null : r.GetString(20),
+            Origin = r.IsDBNull(21) ? DecisionOrigin.CLOSED_BAR : Enum.Parse<DecisionOrigin>(r.GetString(21)),
+            EvaluationId = r.IsDBNull(22) ? Guid.Empty : r.GetGuid(22),
+            EffectiveRuntimeParametersJson = r.IsDBNull(23) ? null : r.GetString(23),
+            CandidateDirection = r.IsDBNull(24) ? null : Enum.Parse<SignalDirection>(r.GetString(24))
         };
     }
 
